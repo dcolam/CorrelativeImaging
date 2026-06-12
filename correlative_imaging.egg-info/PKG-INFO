@@ -1,0 +1,35 @@
+Metadata-Version: 2.4
+Name: correlative-imaging
+Version: 0.1.0
+Summary: Modern Python pipeline for correlative microscopy image analysis
+Requires-Python: >=3.11
+Requires-Dist: numpy>=1.26
+Requires-Dist: scipy>=1.11
+Requires-Dist: scikit-image>=0.22
+Requires-Dist: pandas>=2.1
+Requires-Dist: bioio>=1.1
+Requires-Dist: bioio-tifffile
+Requires-Dist: bioio-ome-tiff
+Requires-Dist: bioio-czi
+Requires-Dist: bioio-lif
+Requires-Dist: bioio-nd2
+Requires-Dist: bioio-imageio
+Requires-Dist: bioio-ome-zarr
+Requires-Dist: tifffile>=2023.9
+Requires-Dist: roifile>=2023.5
+Requires-Dist: pyarrow>=14.0
+Requires-Dist: pyyaml>=6.0
+Requires-Dist: click>=8.1
+Requires-Dist: rich>=13.0
+Requires-Dist: tqdm>=4.66
+Provides-Extra: viewer
+Requires-Dist: napari[all]>=0.4.19; extra == "viewer"
+Provides-Extra: gpu
+Requires-Dist: cupy-cuda12x; extra == "gpu"
+Requires-Dist: cucim-cu12; extra == "gpu"
+Provides-Extra: bioformats
+Requires-Dist: bioio-bioformats; extra == "bioformats"
+Provides-Extra: dev
+Requires-Dist: pytest>=7.4; extra == "dev"
+Requires-Dist: pytest-cov>=4.1; extra == "dev"
+Requires-Dist: ruff>=0.1; extra == "dev"

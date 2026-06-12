@@ -1,0 +1,2508 @@
+"""Napari-based guided GUI — folder picker, channel sidebar, multiple ROI selections, batch runner."""
+
+from __future__ import annotations
+
+import json
+import re
+import traceback
+from dataclasses import dataclass
+from pathlib import Path
+
+from qtpy.QtCore import Qt, QSettings, QThread, QTimer, Signal
+from qtpy.QtWidgets import (
+    QButtonGroup,
+    QCheckBox,
+    QComboBox,
+    QDoubleSpinBox,
+    QFileDialog,
+    QFormLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMessageBox,
+    QProgressBar,
+    QPushButton,
+    QRadioButton,
+    QScrollArea,
+    QSlider,
+    QSpinBox,
+    QSplitter,
+    QStackedWidget,
+    QTabWidget,
+    QTableWidget,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
+)
+
+from correlative_imaging.io import supported_extensions
+
+
+# ──────────────────────────────────────────────────────────────────
+# Advanced-tab form definitions
+# ──────────────────────────────────────────────────────────────────
+
+_STEP_FORMS: dict[str, list[tuple]] = {
+    "BackgroundSubtraction": [
+        ("channel", "int",                        "Channel index",   0,    (0, 32)),
+        ("radius",  "float",                      "Ball radius (px)", 50.0, (1.0, 500.0)),
+        ("method",  "choice:rolling_ball,tophat", "Method",          "rolling_ball", None),
+    ],
+    "GaussianBlur": [
+        ("channel", "int",   "Channel index", 0,   (0, 32)),
+        ("sigma",   "float", "Sigma (px)",    2.0, (0.1, 50.0)),
+    ],
+    "Normalize": [
+        ("channel",  "int",                      "Channel index",   0,    (0, 32)),
+        ("method",   "choice:minmax,percentile", "Method",          "minmax", None),
+        ("low_pct",  "float",                    "Low percentile",  1.0,  (0.0, 49.0)),
+        ("high_pct", "float",                    "High percentile", 99.0, (51.0, 100.0)),
+    ],
+    "ExtractROI": [
+        ("channel",    "int",                                "Channel index",  0,    (0, 32)),
+        ("blur_sigma", "float",                              "Blur sigma (px)", 20.0, (1.0, 200.0)),
+        ("method",     "choice:otsu,li,yen,triangle,isodata", "Threshold",    "otsu", None),
+        ("roi_name",   "str",                                "Mask key",       "roi", None),
+    ],
+    "LoadROI": [
+        ("path",     "str", "ROI file path", "", None),
+        ("roi_name", "str", "Mask key",      "roi", None),
+    ],
+    "AutoThreshold": [
+        ("channel",      "int",                                "Channel index",       0,  (0, 32)),
+        ("method",       "choice:otsu,li,yen,triangle,isodata", "Method",           "otsu", None),
+        ("z_projection", "choice:max,mean,sum",               "Z projection",        "max", None),
+        ("min_size",     "int",                               "Min object size (px)", 50,  (0, 100000)),
+    ],
+    "WatershedSplit": [
+        ("channel",      "int", "Channel index",     0, (0, 32)),
+        ("min_distance", "int", "Min distance (px)", 5, (1, 200)),
+    ],
+    "ParticleAnalysis": [
+        ("channel",         "int",                "Channel index",   0,      (0, 32)),
+        ("min_size_um2",    "float",              "Min size (µm²)",  0.5,    (0.0, 1e6)),
+        ("max_size_um2",    "float",              "Max size (µm²)",  5000.0, (0.0, 1e9)),
+        ("min_circularity", "float",              "Min circularity", 0.0,    (0.0, 1.0)),
+        ("z_projection",    "choice:max,mean,sum", "Z projection",   "max",  None),
+        ("roi_mask",        "str",                "ROI mask key",    "",     None),
+    ],
+    "IntensityMeasurement": [
+        ("channel",      "int",                "Channel index", 0,     (0, 32)),
+        ("z_projection", "choice:max,mean,sum", "Z projection", "max", None),
+        ("roi_mask",     "str",                "ROI mask key",  "",    None),
+    ],
+    "ColocalizationAnalysis": [
+        ("primary_channel",   "int",                "Primary channel",   0,   (0, 32)),
+        ("secondary_channel", "int",                "Secondary channel", 1,   (0, 32)),
+        ("dilation_um",       "float",              "Mask dilation (µm)", 0.0, (0.0, 20.0)),
+        ("z_projection",      "choice:max,mean,sum", "Z projection",     "max", None),
+        ("roi_mask",          "str",                "ROI mask key",      "",   None),
+    ],
+}
+
+
+# ──────────────────────────────────────────────────────────────────
+# Background workers
+# ──────────────────────────────────────────────────────────────────
+
+class _ScanWorker(QThread):
+    found  = Signal(list)
+    status = Signal(str)
+
+    def __init__(self, folder: Path):
+        super().__init__()
+        self.folder = folder
+
+    def run(self) -> None:
+        self.status.emit(f"Scanning {self.folder} …")
+        files = sorted(
+            str(p) for p in self.folder.rglob("*")
+            if p.is_file() and p.suffix.lower() in supported_extensions
+        )
+        self.found.emit(files)
+        self.status.emit(f"{len(files)} image(s) found.")
+
+
+class _LoadImageWorker(QThread):
+    loaded = Signal(object)
+    error  = Signal(str)
+
+    def __init__(self, path: Path):
+        super().__init__()
+        self.path = path
+
+    def run(self) -> None:
+        try:
+            from correlative_imaging.io import read_image
+            self.loaded.emit(read_image(self.path))
+        except Exception:
+            self.error.emit(traceback.format_exc())
+
+
+class _BatchWorker(QThread):
+    progress = Signal(int, int, str, object)
+    log_msg  = Signal(str)
+    finished = Signal(str)
+
+    def __init__(self, pipeline_dict: dict, input_dir: Path, output_dir: Path, experiment: str):
+        super().__init__()
+        self.pipeline_dict = pipeline_dict
+        self.input_dir  = input_dir
+        self.output_dir = output_dir
+        self.experiment = experiment
+        self._abort = False
+
+    def abort(self) -> None:
+        self._abort = True
+
+    def run(self) -> None:
+        try:
+            import os, tempfile
+            from correlative_imaging.pipeline import Pipeline
+            from correlative_imaging.batch import BatchRunner
+
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+                json.dump(self.pipeline_dict, f)
+                tmp = f.name
+            pl = Pipeline.load(tmp)
+            os.unlink(tmp)
+
+            runner = BatchRunner(pl, db_path=self.output_dir / "results.db", experiment=self.experiment)
+
+            def _cb(current, total, name, n_particles):
+                if self._abort:
+                    return
+                self.progress.emit(current, total, name, n_particles)
+                icon   = "✓" if n_particles is not None else "✗"
+                detail = f"({n_particles} particles)" if n_particles is not None else "(error)"
+                self.log_msg.emit(f"{icon}  {name}  {detail}")
+
+            runner.run_directory(self.input_dir, output_dir=self.output_dir, progress_fn=_cb)
+            self.finished.emit(str(self.output_dir / "results.db"))
+        except Exception:
+            self.log_msg.emit(traceback.format_exc())
+            self.finished.emit("")
+
+
+# ──────────────────────────────────────────────────────────────────
+# Tab 1 – Setup  (folder + sample loader only)
+# ──────────────────────────────────────────────────────────────────
+
+class SetupTab(QWidget):
+    channels_ready = Signal(list)   # list[str] raw channel names from the image file
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._scan_worker: _ScanWorker | None = None
+        self._load_worker: _LoadImageWorker | None = None
+        self._image_data = None
+        self._scan_timer = QTimer(self)
+        self._scan_timer.setSingleShot(True)
+        self._scan_timer.timeout.connect(self._start_scan)
+        self._build()
+
+    def _build(self) -> None:
+        lay = QVBoxLayout(self)
+
+        folder_box = QGroupBox("1. Select folders")
+        fl = QFormLayout(folder_box)
+        self._input_edit, r1  = _path_row("Input folder …",  is_dir=True)
+        self._output_edit, r2 = _path_row("Output folder …", is_dir=True)
+        self._exp_edit = QLineEdit()
+        self._exp_edit.setPlaceholderText("optional experiment label")
+        fl.addRow("Input folder:",  r1)
+        fl.addRow("Output folder:", r2)
+        fl.addRow("Experiment:",    self._exp_edit)
+        self._input_edit.textChanged.connect(self._on_input_changed)
+        lay.addWidget(folder_box)
+
+        img_box = QGroupBox("2. Images found")
+        il = QVBoxLayout(img_box)
+        self._scan_status = QLabel("No folder selected.")
+        il.addWidget(self._scan_status)
+        self._img_list = QListWidget()
+        self._img_list.setMaximumHeight(130)
+        il.addWidget(self._img_list)
+        self._load_btn = QPushButton("Load sample image → configure Channels & ROI tabs")
+        self._load_btn.setEnabled(False)
+        self._load_btn.clicked.connect(self._on_load_sample)
+        il.addWidget(self._load_btn)
+        lay.addWidget(img_box)
+
+        hint = QLabel(
+            "After loading a sample:\n"
+            "  • Channels tab — rename channels, set preprocessing & segmentation\n"
+            "  • ROI & Selections tab — define one or more analysis regions\n"
+            "  • Combine tab — colocalization pairs\n"
+            "  • Run tab — preview on sample, then batch"
+        )
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
+        lay.addStretch()
+
+    def _on_input_changed(self, text: str) -> None:
+        self._scan_timer.start(600)
+        if not self._output_edit.text():
+            p = Path(text)
+            if p.is_dir():
+                self._output_edit.setText(str(p / "output"))
+
+    def _start_scan(self) -> None:
+        folder = Path(self._input_edit.text())
+        if not folder.is_dir():
+            return
+        self._scan_status.setText("Scanning …")
+        self._img_list.clear()
+        self._load_btn.setEnabled(False)
+        if self._scan_worker and self._scan_worker.isRunning():
+            self._scan_worker.terminate()
+        self._scan_worker = _ScanWorker(folder)
+        self._scan_worker.found.connect(self._on_scan_done)
+        self._scan_worker.status.connect(self._scan_status.setText)
+        self._scan_worker.start()
+
+    def _on_scan_done(self, paths: list[str]) -> None:
+        self._img_list.clear()
+        folder = Path(self._input_edit.text())
+        for p in paths:
+            item = QListWidgetItem(str(Path(p).relative_to(folder)))
+            item.setData(Qt.UserRole, p)
+            self._img_list.addItem(item)
+        self._scan_status.setText(f"{len(paths)} image(s) found.")
+        self._load_btn.setEnabled(bool(paths))
+        if paths:
+            self._img_list.setCurrentRow(0)
+
+    def _on_load_sample(self) -> None:
+        item = self._img_list.currentItem() or self._img_list.item(0)
+        if item is None:
+            return
+        self._load_btn.setEnabled(False)
+        self._load_btn.setText("Loading …")
+        self._load_worker = _LoadImageWorker(Path(item.data(Qt.UserRole)))
+        self._load_worker.loaded.connect(self._on_image_loaded)
+        self._load_worker.error.connect(self._on_load_error)
+        self._load_worker.start()
+
+    def _on_load_error(self, msg: str) -> None:
+        QMessageBox.critical(self, "Load error", msg)
+        self._load_btn.setEnabled(True)
+        self._load_btn.setText("Load sample image → configure Channels & ROI tabs")
+
+    def _on_image_loaded(self, image_data) -> None:
+        self._image_data = image_data
+        self._load_btn.setEnabled(True)
+        self._load_btn.setText("Load sample image → configure Channels & ROI tabs")
+        self.channels_ready.emit(image_data.channel_names)
+
+    # ── Accessors ──────────────────────────────────────────────────
+
+    @property
+    def input_dir(self) -> Path | None:
+        p = Path(self._input_edit.text())
+        return p if p.is_dir() else None
+
+    @property
+    def output_dir(self) -> Path:
+        t = self._output_edit.text()
+        return Path(t) if t else (self.input_dir or Path(".")) / "output"
+
+    @property
+    def experiment(self) -> str:
+        return self._exp_edit.text().strip()
+
+    @property
+    def image_data(self):
+        return self._image_data
+
+    @property
+    def image_paths(self) -> list[Path]:
+        return [
+            Path(self._img_list.item(i).data(Qt.UserRole))
+            for i in range(self._img_list.count())
+        ]
+
+
+# ──────────────────────────────────────────────────────────────────
+# Tab 2 – Plate  (384-well grid, BF/FL scanner)
+# ──────────────────────────────────────────────────────────────────
+
+_PLATE_ROWS = list("ABCDEFGHIJKLMNOP")   # 16 rows
+_PLATE_COLS = list(range(1, 25))          # 24 columns
+
+_WELL_STATUS_COLORS = {
+    "empty":    "#4a4a4a",
+    "complete": "#4CAF50",
+    "bf_only":  "#FF9800",
+    "selected": "#2196F3",
+}
+
+# One napari colormap per pipeline step in the preview, cycling if there are more steps than colors.
+_STEP_COLORMAPS = ["green", "cyan", "magenta", "yellow", "red", "blue", "orange", "gray"]
+
+
+class _WellButton(QPushButton):
+    """Single cell in the plate grid."""
+
+    def __init__(self, well_id: str, parent=None):
+        super().__init__(parent)
+        self.well_id = well_id
+        self.setFixedSize(24, 24)
+        self.setToolTip(well_id)
+        self.setText("")
+        self._apply("empty")
+
+    def set_status(self, status: str) -> None:
+        self._apply(status)
+
+    def _apply(self, status: str) -> None:
+        c = _WELL_STATUS_COLORS.get(status, _WELL_STATUS_COLORS["empty"])
+        self.setStyleSheet(
+            f"background-color:{c}; border:1px solid #222; border-radius:2px;"
+        )
+
+
+class _PlateGrid(QWidget):
+    """16×24 clickable well grid."""
+
+    well_clicked = Signal(str)   # emits well_id
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._btns: dict[str, _WellButton] = {}
+        self._selected: str | None = None
+        self._prev_status: dict[str, str] = {}   # to restore colour on deselect
+        self._build()
+
+    def _build(self) -> None:
+        grid = QVBoxLayout(self)
+        grid.setSpacing(2)
+        grid.setContentsMargins(4, 4, 4, 4)
+
+        # Column header row
+        hdr = QHBoxLayout(); hdr.setSpacing(2)
+        lbl = QLabel(""); lbl.setFixedWidth(18)
+        hdr.addWidget(lbl)
+        for col in _PLATE_COLS:
+            l = QLabel(str(col)); l.setFixedWidth(24); l.setAlignment(Qt.AlignCenter)
+            l.setStyleSheet("font-size:9px; color:#aaa;")
+            hdr.addWidget(l)
+        grid.addLayout(hdr)
+
+        for row in _PLATE_ROWS:
+            row_lay = QHBoxLayout(); row_lay.setSpacing(2)
+            lbl = QLabel(row); lbl.setFixedWidth(18); lbl.setAlignment(Qt.AlignCenter)
+            lbl.setStyleSheet("font-size:9px; color:#aaa;")
+            row_lay.addWidget(lbl)
+            for col in _PLATE_COLS:
+                wid = f"{row}{col}"
+                btn = _WellButton(wid)
+                btn.clicked.connect(lambda _checked, w=wid: self._on_click(w))
+                self._btns[wid] = btn
+                row_lay.addWidget(btn)
+            grid.addLayout(row_lay)
+
+    def _on_click(self, well_id: str) -> None:
+        if self._selected and self._selected != well_id:
+            self._btns[self._selected].set_status(
+                self._prev_status.get(self._selected, "empty")
+            )
+        self._selected = well_id
+        self._prev_status[well_id] = self._prev_status.get(well_id, "empty")
+        self._btns[well_id].set_status("selected")
+        self.well_clicked.emit(well_id)
+
+    def set_well_status(self, well_id: str, status: str) -> None:
+        if well_id in self._btns:
+            self._prev_status[well_id] = status
+            if well_id != self._selected:
+                self._btns[well_id].set_status(status)
+
+    def clear_all(self) -> None:
+        self._selected = None
+        self._prev_status.clear()
+        for btn in self._btns.values():
+            btn.set_status("empty")
+
+
+class PlateTab(QWidget):
+    """Tab 1: folder setup + 384-well plate scanner + BF/FL pairing.
+
+    Replaces the old SetupTab — exposes the same interface (input_dir,
+    output_dir, experiment, image_data, image_paths, channels_ready) so
+    RunTab and CorrelativeImagingWidget work without changes.
+    """
+
+    channels_ready = Signal(list)   # list[str] channel names after sample load
+    well_selected  = Signal(object) # WellInfo when a well is clicked
+    view_requested = Signal(object, str)  # (WellInfo, "bf" | "fl")
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._wells: dict[str, object] = {}
+        self._image_data = None
+        self._load_worker: _LoadImageWorker | None = None
+        self._build()
+
+    def _build(self) -> None:
+        lay = QVBoxLayout(self)
+
+        # ── 1. Folders & experiment ──────────────────────────────────
+        folder_box = QGroupBox("1. Folders & experiment")
+        ff = QFormLayout(folder_box)
+
+        self._folder_edit, folder_row = _path_row("Input / plate folder …", is_dir=True)
+        self._folder_edit.textChanged.connect(self._on_folder_changed)
+        self._output_edit, output_row = _path_row("Output folder …", is_dir=True)
+        self._exp_edit = QLineEdit()
+        self._exp_edit.setPlaceholderText("optional experiment label")
+
+        ff.addRow("Input folder:",  folder_row)
+        ff.addRow("Output folder:", output_row)
+        ff.addRow("Experiment:",    self._exp_edit)
+        lay.addWidget(folder_box)
+
+        # ── 2. Plate scan options ────────────────────────────────────
+        scan_box = QGroupBox("2. Plate scan")
+        sl = QFormLayout(scan_box)
+
+        self._ext_edit = QLineEdit(".vsi")
+        sl.addRow("Extension:", self._ext_edit)
+
+        self._contains_edit = QLineEdit("")
+        self._contains_edit.setPlaceholderText("optional substring filter")
+        sl.addRow("Name contains:", self._contains_edit)
+
+        self._recursive_cb = QCheckBox("Search subfolders recursively")
+        sl.addRow(self._recursive_cb)
+
+        scan_btn = QPushButton("Scan folder")
+        scan_btn.clicked.connect(self._scan)
+        sl.addRow(scan_btn)
+
+        self._status_lbl = QLabel("")
+        self._status_lbl.setWordWrap(True)
+        sl.addRow(self._status_lbl)
+        lay.addWidget(scan_box)
+
+        # ── 3. Plate grid ────────────────────────────────────────────
+        grid_box = QGroupBox("3. Plate layout  (click a well to select)")
+        gl = QVBoxLayout(grid_box)
+
+        legend = QHBoxLayout()
+        for color, text in [
+            (_WELL_STATUS_COLORS["empty"],    "Empty"),
+            (_WELL_STATUS_COLORS["complete"], "BF + FL"),
+            (_WELL_STATUS_COLORS["bf_only"],  "BF only"),
+            (_WELL_STATUS_COLORS["selected"], "Selected"),
+        ]:
+            dot = QLabel("■"); dot.setStyleSheet(f"color:{color}; font-size:14px;")
+            legend.addWidget(dot)
+            lbl = QLabel(text); lbl.setStyleSheet("font-size:10px;")
+            legend.addWidget(lbl)
+            legend.addSpacing(6)
+        legend.addStretch()
+        gl.addLayout(legend)
+
+        scroll = QScrollArea(); scroll.setWidgetResizable(True)
+        self._grid = _PlateGrid()
+        self._grid.well_clicked.connect(self._on_well_clicked)
+        scroll.setWidget(self._grid)
+        scroll.setMinimumHeight(220)
+        gl.addWidget(scroll)
+        lay.addWidget(grid_box)
+
+        # ── 4. Selected well / load sample ───────────────────────────
+        detail_box = QGroupBox("4. Selected well")
+        dl = QFormLayout(detail_box)
+        self._d_well = QLabel("—")
+        self._d_bf   = QLabel("—"); self._d_bf.setWordWrap(True)
+        self._d_fl   = QLabel("—"); self._d_fl.setWordWrap(True)
+        self._d_roi  = QLabel("—"); self._d_roi.setWordWrap(True)
+        dl.addRow("Well:",      self._d_well)
+        dl.addRow("BF path:",   self._d_bf)
+        dl.addRow("FL path:",   self._d_fl)
+        dl.addRow("ROI files:", self._d_roi)
+
+        self._auto_roi_cb = QCheckBox(
+            "Auto-assign detected ROI files to ROI & Selections tab on well click"
+        )
+        self._auto_roi_cb.setChecked(True)
+        dl.addRow(self._auto_roi_cb)
+
+        view_row = QHBoxLayout()
+        self._view_bf_btn = QPushButton("Show BF in viewer")
+        self._view_fl_btn = QPushButton("Show FL in viewer")
+        self._view_bf_btn.setEnabled(False)
+        self._view_fl_btn.setEnabled(False)
+        self._view_bf_btn.clicked.connect(lambda: self._on_view("bf"))
+        self._view_fl_btn.clicked.connect(lambda: self._on_view("fl"))
+        view_row.addWidget(self._view_bf_btn)
+        view_row.addWidget(self._view_fl_btn)
+        dl.addRow(view_row)
+
+        self._load_btn = QPushButton(
+            "Load selected well as sample → configure Channels & ROI tabs"
+        )
+        self._load_btn.setEnabled(False)
+        self._load_btn.clicked.connect(self._on_load_sample)
+        dl.addRow(self._load_btn)
+        lay.addWidget(detail_box)
+
+        lay.addStretch()
+
+        # Restore saved paths/settings and wire auto-save
+        self._load_settings()
+        self._connect_persistence()
+
+    # ── Persistence ──────────────────────────────────────────────────
+
+    def _load_settings(self) -> None:
+        s = QSettings("CorrelativeImaging", "CorrelativeImaging")
+        s.beginGroup("plate")
+        # Restore output before input so _on_folder_changed won't auto-fill it
+        self._output_edit.setText(s.value("output_folder", ""))
+        self._folder_edit.setText(s.value("input_folder", ""))
+        self._exp_edit.setText(s.value("experiment", ""))
+        ext = s.value("extension", ".vsi")
+        self._ext_edit.setText(ext if ext else ".vsi")
+        self._contains_edit.setText(s.value("contains", ""))
+        self._recursive_cb.setChecked(s.value("recursive", False, type=bool))
+        s.endGroup()
+
+    def _save_settings(self) -> None:
+        s = QSettings("CorrelativeImaging", "CorrelativeImaging")
+        s.beginGroup("plate")
+        s.setValue("input_folder",  self._folder_edit.text())
+        s.setValue("output_folder", self._output_edit.text())
+        s.setValue("experiment",    self._exp_edit.text())
+        s.setValue("extension",     self._ext_edit.text())
+        s.setValue("contains",      self._contains_edit.text())
+        s.setValue("recursive",     self._recursive_cb.isChecked())
+        s.endGroup()
+
+    def _connect_persistence(self) -> None:
+        for w in (self._folder_edit, self._output_edit, self._exp_edit,
+                  self._ext_edit, self._contains_edit):
+            w.textChanged.connect(self._save_settings)
+        self._recursive_cb.toggled.connect(self._save_settings)
+
+    # ── Slots ────────────────────────────────────────────────────────
+
+    def _on_folder_changed(self, text: str) -> None:
+        p = Path(text)
+        if p.is_dir() and not self._output_edit.text():
+            self._output_edit.setText(str(p / "output"))
+
+    def _scan(self) -> None:
+        from correlative_imaging.io.plate import scan_plate_folder
+        folder = self._folder_edit.text().strip()
+        if not folder or not Path(folder).is_dir():
+            QMessageBox.warning(self, "No folder", "Set a valid input folder first.")
+            return
+        ext       = self._ext_edit.text().strip() or ".vsi"
+        contains  = self._contains_edit.text().strip()
+        recursive = self._recursive_cb.isChecked()
+        try:
+            wells = scan_plate_folder(folder, extension=ext,
+                                      contains=contains, recursive=recursive)
+        except Exception as exc:
+            QMessageBox.critical(self, "Scan failed", str(exc))
+            return
+
+        self._wells = {}
+        self._grid.clear_all()
+        for w in wells:
+            self._wells[w.well_id] = w
+            self._grid.set_well_status(w.well_id,
+                                       "complete" if w.is_complete else "bf_only")
+
+        n_complete = sum(1 for w in wells if w.is_complete)
+        n_roi      = sum(1 for w in wells if w.roi_paths)
+        msg = f"{len(wells)} wells found — {n_complete} complete BF+FL pairs"
+        if len(wells) > n_complete:
+            msg += f", {len(wells) - n_complete} BF only"
+        msg += f".  {n_roi} well(s) have ROI files." if n_roi else "."
+        self._status_lbl.setText(msg)
+
+    def _on_well_clicked(self, well_id: str) -> None:
+        w = self._wells.get(well_id)
+        if not w:
+            return
+        self._d_well.setText(w.well_id)
+        self._d_bf.setText(str(w.bf_path) if w.bf_path else "—")
+        self._d_fl.setText(str(w.fl_path) if w.fl_path else "—")
+        if w.roi_paths:
+            self._d_roi.setText("\n".join(p.name for p in w.roi_paths))
+        else:
+            self._d_roi.setText("none detected")
+        self._view_bf_btn.setEnabled(w.bf_path is not None)
+        self._view_fl_btn.setEnabled(w.fl_path is not None)
+        self._load_btn.setEnabled(True)
+        self.well_selected.emit(w)
+
+    def _on_view(self, which: str) -> None:
+        wid = self._grid._selected
+        w = self._wells.get(wid) if wid else None
+        if w:
+            self.view_requested.emit(w, which)
+
+    def _on_load_sample(self) -> None:
+        wid = self._grid._selected
+        w = self._wells.get(wid) if wid else None
+        if w is None:
+            return
+        path = w.fl_path or w.bf_path   # prefer FL for channel discovery
+        if path is None:
+            return
+        self._load_btn.setEnabled(False)
+        self._load_btn.setText("Loading …")
+        self._load_worker = _LoadImageWorker(path)
+        self._load_worker.loaded.connect(self._on_image_loaded)
+        self._load_worker.error.connect(self._on_load_error)
+        self._load_worker.start()
+
+    def _on_load_error(self, msg: str) -> None:
+        QMessageBox.critical(self, "Load error", msg)
+        self._load_btn.setEnabled(True)
+        self._load_btn.setText(
+            "Load selected well as sample → configure Channels & ROI tabs"
+        )
+
+    def _on_image_loaded(self, image_data) -> None:
+        self._image_data = image_data
+        self._load_btn.setEnabled(True)
+        self._load_btn.setText(
+            "Load selected well as sample → configure Channels & ROI tabs"
+        )
+        self.channels_ready.emit(image_data.channel_names)
+
+    # ── Accessors (same interface as old SetupTab) ───────────────────
+
+    def get_selected_well(self):
+        wid = self._grid._selected
+        return self._wells.get(wid) if wid else None
+
+    @property
+    def input_dir(self) -> Path | None:
+        p = Path(self._folder_edit.text())
+        return p if p.is_dir() else None
+
+    @property
+    def output_dir(self) -> Path:
+        t = self._output_edit.text().strip()
+        return Path(t) if t else (self.input_dir or Path(".")) / "output"
+
+    @property
+    def experiment(self) -> str:
+        return self._exp_edit.text().strip()
+
+    @property
+    def image_data(self):
+        return self._image_data
+
+    @property
+    def image_paths(self) -> list[Path]:
+        paths = []
+        for w in self._wells.values():
+            if w.fl_path:
+                paths.append(w.fl_path)
+            elif w.bf_path:
+                paths.append(w.bf_path)
+        return paths
+
+
+# ──────────────────────────────────────────────────────────────────
+# Tab 3 – BF Pipeline  (Ilastik ROI extraction from brightfield)
+# ──────────────────────────────────────────────────────────────────
+
+class BFPipelineTab(QWidget):
+    """Configure and run the brightfield Ilastik ROI pipeline across all plate wells."""
+
+    def __init__(self, viewer=None, parent=None):
+        super().__init__(parent)
+        self._viewer = viewer
+        self._worker = None
+        self._build()
+
+    def _build(self) -> None:
+        lay = QVBoxLayout(self)
+
+        # ── 1. Ilastik setup ─────────────────────────────────────────
+        il_box = QGroupBox("1. Ilastik")
+        fl = QFormLayout(il_box)
+
+        self._exe_edit, exe_row = _path_row("ilastik.exe / run_ilastik.sh …", is_dir=False)
+        self._exe_edit.setPlaceholderText("leave empty to auto-detect")
+        fl.addRow("Executable:", exe_row)
+
+        self._ilp_edit, ilp_row = _path_row("trained .ilp project …", is_dir=False)
+        fl.addRow("Project (.ilp):", ilp_row)
+
+        self._fg_spin = QSpinBox()
+        self._fg_spin.setRange(0, 9); self._fg_spin.setValue(1)
+        self._fg_spin.setToolTip("0-indexed output channel that Ilastik labels as foreground")
+        fl.addRow("Foreground class index:", self._fg_spin)
+
+        lay.addWidget(il_box)
+
+        # ── 2. Projection & ROI params ───────────────────────────────
+        param_box = QGroupBox("2. Parameters")
+        pfl = QFormLayout(param_box)
+
+        self._proj_combo = QComboBox()
+        self._proj_combo.addItems(["min", "max", "mean", "sum"])
+        self._proj_combo.setToolTip("Min projection works best for transmitted-light BF")
+        pfl.addRow("Z-projection:", self._proj_combo)
+
+        self._bf_ch_spin = QSpinBox()
+        self._bf_ch_spin.setRange(0, 15); self._bf_ch_spin.setValue(0)
+        pfl.addRow("BF channel index:", self._bf_ch_spin)
+
+        self._thresh_spin = QDoubleSpinBox()
+        self._thresh_spin.setRange(0.01, 0.99); self._thresh_spin.setValue(0.5)
+        self._thresh_spin.setSingleStep(0.05)
+        pfl.addRow("Probability threshold:", self._thresh_spin)
+
+        self._min_area_spin = QSpinBox()
+        self._min_area_spin.setRange(0, 1000000); self._min_area_spin.setValue(500)
+        self._min_area_spin.setSuffix(" px")
+        pfl.addRow("Min component area:", self._min_area_spin)
+
+        self._min_circ_spin = QDoubleSpinBox()
+        self._min_circ_spin.setRange(0.0, 1.0); self._min_circ_spin.setValue(0.1)
+        self._min_circ_spin.setSingleStep(0.05)
+        pfl.addRow("Min circularity:", self._min_circ_spin)
+
+        self._roi_name_edit = QLineEdit("roi")
+        pfl.addRow("ROI name:", self._roi_name_edit)
+
+        lay.addWidget(param_box)
+
+        # ── 3. Output ────────────────────────────────────────────────
+        out_box = QGroupBox("3. Output")
+        ofl = QFormLayout(out_box)
+
+        self._save_dir_edit, save_row = _path_row("same folder as images", is_dir=True)
+        self._save_dir_edit.setPlaceholderText("leave empty → save alongside each VSI")
+        ofl.addRow("Save ROIs to:", save_row)
+
+        lay.addWidget(out_box)
+
+        # ── 4. Run ───────────────────────────────────────────────────
+        run_box = QGroupBox("4. Run")
+        rl = QVBoxLayout(run_box)
+
+        btn_row = QHBoxLayout()
+        self._test_btn = QPushButton("Test on selected well")
+        self._test_btn.setToolTip("Run on the well currently selected in the plate grid")
+        self._test_btn.clicked.connect(self._on_test)
+        self._run_btn = QPushButton("Run on all scanned wells")
+        self._run_btn.setStyleSheet("font-weight:bold")
+        self._run_btn.clicked.connect(self._on_run)
+        self._abort_btn = QPushButton("Abort")
+        self._abort_btn.setEnabled(False)
+        self._abort_btn.clicked.connect(self._on_abort)
+        btn_row.addWidget(self._test_btn)
+        btn_row.addWidget(self._run_btn)
+        btn_row.addWidget(self._abort_btn)
+        rl.addLayout(btn_row)
+
+        self._bar = QProgressBar()
+        self._prog_lbl = QLabel("")
+        rl.addWidget(self._bar)
+        rl.addWidget(self._prog_lbl)
+
+        self._log_edit = QTextEdit()
+        self._log_edit.setReadOnly(True)
+        self._log_edit.setMaximumHeight(140)
+        self._log_edit.setStyleSheet("font-family:monospace; font-size:11px;")
+        rl.addWidget(self._log_edit)
+        lay.addWidget(run_box)
+
+        lay.addStretch()
+
+        # Restore saved paths/settings and wire auto-save
+        self._load_settings()
+        self._connect_persistence()
+
+    # ── Persistence ──────────────────────────────────────────────────
+
+    def _load_settings(self) -> None:
+        s = QSettings("CorrelativeImaging", "CorrelativeImaging")
+        s.beginGroup("bf")
+        self._exe_edit.setText(s.value("ilastik_exe", ""))
+        self._ilp_edit.setText(s.value("ilp_path", ""))
+        self._fg_spin.setValue(int(s.value("fg_channel", 1)))
+        idx = self._proj_combo.findText(s.value("z_method", "min"))
+        if idx >= 0:
+            self._proj_combo.setCurrentIndex(idx)
+        self._bf_ch_spin.setValue(int(s.value("bf_channel", 0)))
+        self._thresh_spin.setValue(float(s.value("threshold", 0.5)))
+        self._min_area_spin.setValue(int(s.value("min_area", 500)))
+        self._min_circ_spin.setValue(float(s.value("min_circularity", 0.1)))
+        roi = s.value("roi_name", "roi")
+        self._roi_name_edit.setText(roi if roi else "roi")
+        self._save_dir_edit.setText(s.value("save_dir", ""))
+        s.endGroup()
+
+    def _save_settings(self) -> None:
+        s = QSettings("CorrelativeImaging", "CorrelativeImaging")
+        s.beginGroup("bf")
+        s.setValue("ilastik_exe",    self._exe_edit.text())
+        s.setValue("ilp_path",       self._ilp_edit.text())
+        s.setValue("fg_channel",     self._fg_spin.value())
+        s.setValue("z_method",       self._proj_combo.currentText())
+        s.setValue("bf_channel",     self._bf_ch_spin.value())
+        s.setValue("threshold",      self._thresh_spin.value())
+        s.setValue("min_area",       self._min_area_spin.value())
+        s.setValue("min_circularity",self._min_circ_spin.value())
+        s.setValue("roi_name",       self._roi_name_edit.text())
+        s.setValue("save_dir",       self._save_dir_edit.text())
+        s.endGroup()
+
+    def _connect_persistence(self) -> None:
+        for w in (self._exe_edit, self._ilp_edit, self._roi_name_edit, self._save_dir_edit):
+            w.textChanged.connect(self._save_settings)
+        for w in (self._fg_spin, self._bf_ch_spin, self._min_area_spin):
+            w.valueChanged.connect(self._save_settings)
+        for w in (self._thresh_spin, self._min_circ_spin):
+            w.valueChanged.connect(self._save_settings)
+        self._proj_combo.currentTextChanged.connect(self._save_settings)
+
+    # ── Config accessors ─────────────────────────────────────────────
+
+    def get_config(self) -> dict:
+        return {
+            "ilastik_exe":     self._exe_edit.text().strip(),
+            "ilp_path":        self._ilp_edit.text().strip(),
+            "fg_channel":      self._fg_spin.value(),
+            "z_method":        self._proj_combo.currentText(),
+            "bf_channel":      self._bf_ch_spin.value(),
+            "threshold":       self._thresh_spin.value(),
+            "min_area_px":     self._min_area_spin.value(),
+            "min_circularity": self._min_circ_spin.value(),
+            "roi_name":        self._roi_name_edit.text().strip() or "roi",
+            "save_dir":        self._save_dir_edit.text().strip(),
+        }
+
+    # ── Run logic ────────────────────────────────────────────────────
+
+    def run_on_wells(self, wells: list, test_mode: bool = False) -> None:
+        """Called externally with the list of WellInfo from PlateTab."""
+        if not wells:
+            QMessageBox.information(self, "No wells", "Scan a plate folder first.")
+            return
+        cfg = self.get_config()
+        if not cfg["ilp_path"] or not Path(cfg["ilp_path"]).exists():
+            QMessageBox.warning(self, "No project", "Set a valid Ilastik .ilp project file.")
+            return
+        # Inject output dir from plate tab so worker can organise its outputs
+        plate = self._get_plate_tab()
+        if plate and not cfg["save_dir"]:
+            cfg["output_dir"] = str(plate.output_dir)
+
+        self._test_btn.setEnabled(False)
+        self._run_btn.setEnabled(False)
+        self._abort_btn.setEnabled(True)
+        self._bar.setRange(0, len(wells))
+        self._bar.setValue(0)
+        self._log_edit.clear()
+
+        self._worker = _BFWorker(wells, cfg, test_mode=test_mode)
+        self._worker.progress.connect(self._on_progress)
+        self._worker.log_msg.connect(self._log)
+        self._worker.finished.connect(self._on_finished)
+        if test_mode:
+            self._worker.result_ready.connect(self._show_test_result)
+        self._worker.start()
+
+    def _show_test_result(self, ch_vis, seg, masks: dict, well_id: str) -> None:
+        if self._viewer is None:
+            self._log("[napari] No viewer attached — cannot display result.")
+            return
+        self._viewer.layers.clear()
+        if ch_vis is not None:
+            self._viewer.add_image(ch_vis, name=f"BF proj/{well_id}", colormap="gray")
+        self._viewer.add_labels(seg, name=f"Segmentation/{well_id}", opacity=0.45)
+        for lbl, mask in masks.items():
+            if mask.max() > 0:
+                self._viewer.add_labels(
+                    mask.astype("int32") * lbl,
+                    name=f"ROI label{lbl}/{well_id}", opacity=0.5,
+                )
+        self._log(
+            f"  → napari: BF projection + segmentation map + {len(masks)} ROI(s) loaded."
+        )
+
+    def _get_plate_tab(self):
+        p = self.parent()
+        while p is not None:
+            if hasattr(p, "_plate_tab"):
+                return p._plate_tab
+            p = p.parent()
+        return None
+
+    def _on_test(self) -> None:
+        plate = self._get_plate_tab()
+        if plate is None:
+            QMessageBox.warning(self, "Not connected", "Cannot find plate scan results.")
+            return
+        well = plate.get_selected_well()
+        if well is None:
+            QMessageBox.information(self, "No well selected",
+                                    "Click a well in the plate grid first.")
+            return
+        self.run_on_wells([well], test_mode=True)
+
+    def _on_run(self) -> None:
+        plate = self._get_plate_tab()
+        if plate is None:
+            QMessageBox.warning(self, "Not connected", "Cannot find plate scan results.")
+            return
+        wells = list(plate._wells.values())
+        self.run_on_wells(wells, test_mode=False)
+
+    def _on_abort(self) -> None:
+        if self._worker:
+            self._worker.abort()
+
+    def _on_progress(self, current: int, total: int, msg: str) -> None:
+        self._bar.setValue(current)
+        self._prog_lbl.setText(f"{current}/{total}  {msg}")
+
+    def _on_finished(self, n_ok: int, n_err: int) -> None:
+        self._test_btn.setEnabled(True)
+        self._run_btn.setEnabled(True)
+        self._abort_btn.setEnabled(False)
+        self._log(f"Done — {n_ok} ROIs saved, {n_err} errors.")
+
+    def _log(self, msg: str) -> None:
+        self._log_edit.append(msg)
+
+
+class _BFWorker(QThread):
+    progress     = Signal(int, int, str)
+    log_msg      = Signal(str)
+    finished     = Signal(int, int)          # n_ok, n_err
+    result_ready = Signal(object, object, object, str)  # ch_u8, prob(H,W,C), masks{c:mask}, well_id
+
+    def __init__(self, wells: list, cfg: dict, test_mode: bool = False):
+        super().__init__()
+        self._wells     = wells
+        self._cfg       = cfg
+        self._abort     = False
+        self._test_mode = test_mode
+
+    def abort(self) -> None:
+        self._abort = True
+
+    def run(self) -> None:
+        import subprocess
+        import tempfile
+        import traceback as _tb
+
+        import h5py
+        import numpy as np
+        import tifffile
+
+        from correlative_imaging.io import read_image
+        from correlative_imaging.pipeline.ilastik import _find_ilastik_exe
+
+        cfg   = self._cfg
+        total = len(self._wells)
+        n_ok = n_err = 0
+
+        exe = cfg["ilastik_exe"] or _find_ilastik_exe()
+        if not exe:
+            self.log_msg.emit("ERROR: Ilastik executable not found.")
+            self.finished.emit(0, total)
+            return
+
+        ops = {"min": np.min, "max": np.max, "mean": np.mean, "sum": np.sum}
+        proj_fn = ops.get(cfg["z_method"], np.min)
+        ch = cfg["bf_channel"]
+
+        # ── Output directories ────────────────────────────────────────
+        if cfg.get("save_dir"):
+            out_root = Path(cfg["save_dir"])
+        elif cfg.get("output_dir"):
+            out_root = Path(cfg["output_dir"]) / "bf_pipeline"
+        else:
+            out_root = None
+
+        proj_dir = (out_root / "projections")  if out_root else None
+        seg_dir  = (out_root / "segmentation") if out_root else None
+        roi_dir  = (out_root / "rois")         if out_root else None
+        for d in (proj_dir, seg_dir, roi_dir):
+            if d:
+                d.mkdir(parents=True, exist_ok=True)
+
+        if out_root:
+            self.log_msg.emit(f"Output root: {out_root}")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp    = Path(tmpdir)
+            in_dir = tmp / "inputs";  in_dir.mkdir()
+            out_dir= tmp / "outputs"; out_dir.mkdir()
+
+            # ── Phase 1: load + project + write HDF5 for Ilastik ─────
+            # Critical: pass the original 16-bit (or whatever) pixel values —
+            # Ilastik was trained on those, not on uint8-normalised data.
+            # Shape matches what Fiji's ilastik4ij plugin sends: (t,z,c,y,x).
+            self.log_msg.emit("Phase 1/3 — loading and projecting BF images …")
+            well_map:   dict[str, object]     = {}
+            h5_stems:   list[str]             = []
+            h5_in_args: list[str]             = []
+            ch_vis_map: dict[str, np.ndarray] = {}  # uint8 display copies
+
+            for i, well in enumerate(self._wells):
+                if self._abort:
+                    self.log_msg.emit("Aborted.")
+                    self.finished.emit(n_ok, n_err)
+                    return
+
+                self.progress.emit(i, total * 3, f"loading {well.well_id}")
+
+                if well.bf_path is None:
+                    self.log_msg.emit(f"  ⚠ {well.well_id}: no BF — skipped")
+                    n_err += 1
+                    continue
+
+                try:
+                    img     = read_image(well.bf_path)
+                    ch_data = img.data[ch]          # (Z,H,W) or (H,W)
+                    if ch_data.ndim == 3:
+                        ch_data = proj_fn(ch_data, axis=0)   # → (H,W), original dtype
+
+                    stem = well.bf_path.stem
+                    well_map[stem] = well
+
+                    # HDF5 for Ilastik — original bit depth, tzcyx shape
+                    h5_in = in_dir / f"{stem}.h5"
+                    with h5py.File(h5_in, "w") as f:
+                        f.create_dataset(
+                            "data",
+                            data=ch_data[np.newaxis, np.newaxis, np.newaxis],
+                        )
+                    h5_stems.append(stem)
+                    h5_in_args.append(f"{h5_in}/data")
+
+                    # uint8 copy only for display / saved projection TIFF
+                    mn, mx = ch_data.min(), ch_data.max()
+                    ch_vis = ((ch_data - mn) / (mx - mn) * 255).astype(np.uint8) \
+                             if mx > mn else np.zeros_like(ch_data, dtype=np.uint8)
+                    ch_vis_map[stem] = ch_vis
+
+                    if proj_dir:
+                        proj_out = proj_dir / f"{well.well_id}_proj.tif"
+                        tifffile.imwrite(str(proj_out), ch_vis)
+                        self.log_msg.emit(
+                            f"  ✓ {well.well_id}: projected "
+                            f"(dtype={ch_data.dtype}) → {proj_out.name}"
+                        )
+                    else:
+                        self.log_msg.emit(
+                            f"  ✓ {well.well_id}: projected (dtype={ch_data.dtype})"
+                        )
+
+                except Exception:
+                    self.log_msg.emit(f"  ✗ {well.well_id}: {_tb.format_exc()}")
+                    n_err += 1
+
+            if not h5_in_args:
+                self.log_msg.emit("No images to process.")
+                self.finished.emit(n_ok, n_err)
+                return
+
+            # ── Phase 2: single Ilastik call ─────────────────────────
+            # Same flags as Fiji's ilastik4ij:
+            #   --input_axes=tzcyx  (matches our HDF5 shape)
+            #   --export_source=Simple Segmentation  (integer labels, no threshold needed)
+            self.log_msg.emit(
+                f"Phase 2/3 — running Ilastik on {len(h5_in_args)} images …"
+            )
+            self.progress.emit(total, total * 3, "Ilastik running …")
+
+            out_pattern = str(out_dir / "{nickname}.h5")
+            cmd = [
+                exe, "--headless",
+                f"--project={cfg['ilp_path']}",
+                "--export_source=Simple Segmentation",
+                "--output_format=hdf5",
+                "--output_axis_order=tzcyx",
+                "--input_axes=tzcyx",
+                "--readonly=1",
+                "--output_internal_path=exported_data",
+                f"--output_filename_format={out_pattern}",
+            ] + h5_in_args
+
+            res = subprocess.run(cmd, capture_output=True, text=True,
+                                 timeout=60 + 120 * len(h5_in_args))
+            if res.returncode != 0:
+                self.log_msg.emit(f"Ilastik failed:\n{res.stderr[-2000:]}")
+                self.finished.emit(n_ok, n_err + len(h5_in_args))
+                return
+            self.log_msg.emit("  Ilastik finished.")
+
+            # Map each well (in order) to its output HDF5.
+            # Don't reconstruct the filename — Ilastik's {nickname} derivation
+            # varies by version. Scan what's actually there and sort by name.
+            output_h5s = sorted(out_dir.glob("*.h5"))
+            self.log_msg.emit(
+                f"  Output files ({len(output_h5s)}): "
+                + ", ".join(f.name for f in output_h5s)
+            )
+            if len(output_h5s) != len(h5_stems):
+                self.log_msg.emit(
+                    f"  ERROR: expected {len(h5_stems)} output(s), "
+                    f"got {len(output_h5s)} — aborting Phase 3."
+                )
+                self.finished.emit(n_ok, n_err + len(h5_stems))
+                return
+
+            # ── Phase 3: read segmentation labels, save ROIs ──────────
+            # Simple Segmentation → integer label per pixel.
+            # Background = label with largest area.  Everything else = foreground ROI.
+            self.log_msg.emit("Phase 3/3 — extracting ROIs …")
+            for j, (stem, h5_out) in enumerate(zip(h5_stems, output_h5s)):
+                if self._abort:
+                    self.log_msg.emit("Aborted.")
+                    break
+
+                well = well_map[stem]
+                self.progress.emit(total * 2 + j, total * 3, well.well_id)
+
+                try:
+                    with h5py.File(h5_out, "r") as f:
+                        seg = f["exported_data"][()]
+                    seg = np.squeeze(seg).astype(np.int32)   # (H, W)
+
+                    unique_labels = [int(l) for l in np.unique(seg)]
+                    areas    = {l: int((seg == l).sum()) for l in unique_labels}
+                    total_px = seg.size
+                    bg_label = max(areas, key=lambda l: areas[l])
+
+                    info = ", ".join(
+                        f"lbl{l}={areas[l]/total_px*100:.1f}%"
+                        for l in unique_labels
+                    )
+                    self.log_msg.emit(
+                        f"  {well.well_id}: {info}  (bg=lbl{bg_label})"
+                    )
+
+                    # Save segmentation map for reference
+                    if seg_dir:
+                        seg_out = seg_dir / f"{well.well_id}_seg.tif"
+                        tifffile.imwrite(str(seg_out), seg.astype(np.uint8))
+                        self.log_msg.emit(f"    seg map → {seg_out.name}")
+
+                    masks: dict[int, np.ndarray] = {}
+                    well_ok = False
+                    for lbl in unique_labels:
+                        if lbl == bg_label:
+                            continue
+                        mask = (seg == lbl).astype(np.uint8)
+                        masks[lbl] = mask
+                        coverage = float(mask.mean()) * 100
+
+                        roi_path = (roi_dir / f"{well.well_id}_label{lbl}.roi") \
+                                   if roi_dir \
+                                   else well.bf_path.parent / f"{stem}_label{lbl}.roi"
+                        try:
+                            _save_roi(mask, roi_path)
+                            if roi_path not in well.roi_paths:
+                                well.roi_paths.append(roi_path)
+                            self.log_msg.emit(
+                                f"    label {lbl}: {coverage:.2f}% → {roi_path}"
+                            )
+                            well_ok = True
+                        except Exception as e:
+                            self.log_msg.emit(f"    label {lbl}: {e}")
+
+                    if well_ok:
+                        n_ok += 1
+                        self.log_msg.emit(f"  ✓ {well.well_id}")
+                    else:
+                        n_err += 1
+                        self.log_msg.emit(f"  ✗ {well.well_id}: no ROIs saved")
+
+                    if self._test_mode:
+                        self.result_ready.emit(
+                            ch_vis_map.get(stem), seg, masks, well.well_id
+                        )
+
+                except Exception:
+                    self.log_msg.emit(f"  ✗ {well.well_id}: {_tb.format_exc()}")
+                    n_err += 1
+
+        self.progress.emit(total * 3, total * 3, "done")
+        self.finished.emit(n_ok, n_err)
+
+
+def _find_ilastik_exe() -> str | None:
+    from correlative_imaging.pipeline.ilastik import _find_ilastik_exe as _f
+    return _f()
+
+
+def _save_roi(mask: np.ndarray, path: Path) -> None:
+    """Save a binary mask as an ImageJ .roi file (bounding-box + polygon outline).
+
+    Raises RuntimeError when the mask is empty so the caller can log it clearly.
+    """
+    if mask.max() == 0:
+        raise RuntimeError(
+            "Mask is empty — no foreground pixels after thresholding. "
+            "Try lowering the probability threshold or check the foreground "
+            "class index in the BF Pipeline tab."
+        )
+    try:
+        import roifile
+        from skimage.measure import find_contours
+        import numpy as np
+        # Pad with zeros so find_contours can trace masks that touch the image edge
+        padded = np.pad(mask, 1, mode="constant", constant_values=0)
+        contours = find_contours(padded, 0.5)
+        if not contours:
+            raise RuntimeError(
+                "No contour found in mask even after padding — mask may be degenerate."
+            )
+        # Take the longest contour and subtract the 1-px padding offset
+        coords = max(contours, key=len) - 1
+        # roifile expects (x, y) i.e. (col, row)
+        roi = roifile.ImagejRoi.frompoints(coords[:, ::-1])
+        roi.tofile(str(path))
+    except ImportError:
+        # roifile not installed — fall back to saving as a binary TIFF
+        import tifffile
+        tiff_path = path.with_suffix(".tif")
+        tifffile.imwrite(str(tiff_path), mask)
+        log.warning("roifile not installed — saved mask as TIFF: %s", tiff_path.name)
+
+
+# ──────────────────────────────────────────────────────────────────
+# Tab 4 – Channels  (sidebar list + per-channel settings panel)
+# ──────────────────────────────────────────────────────────────────
+
+class ChannelPanel(QWidget):
+    """Settings panel for one channel: name, preprocessing, segmentation, analysis."""
+
+    name_changed   = Signal(str)
+    copy_requested = Signal()   # emitted when user wants to copy settings to all channels
+
+    def __init__(self, ch_index: int, raw_name: str, parent=None):
+        super().__init__(parent)
+        self._ch_index = ch_index
+        self._build(raw_name)
+
+    def _build(self, raw_name: str) -> None:
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        inner = QWidget()
+        lay   = QVBoxLayout(inner)
+        lay.setSpacing(6)
+
+        # ── Name ───────────────────────────────────────────────────
+        id_box = QGroupBox("Channel identity")
+        ifl = QFormLayout(id_box)
+        self._name_edit = QLineEdit(raw_name)
+        self._name_edit.textChanged.connect(self.name_changed)
+        ifl.addRow("Display name:", self._name_edit)
+        copy_btn = QPushButton("Copy settings to all other channels")
+        copy_btn.clicked.connect(self.copy_requested)
+        ifl.addRow(copy_btn)
+        lay.addWidget(id_box)
+
+        # ── A. Preprocessing ───────────────────────────────────────
+        pre_box = QGroupBox("A.  Preprocessing  (runs once on the full image)")
+        pfl = QFormLayout(pre_box)
+        pfl.setLabelAlignment(Qt.AlignRight)
+
+        self._bg_en     = QCheckBox("Background subtraction")
+        self._bg_en.setChecked(True)
+        self._bg_method = QComboBox(); self._bg_method.addItems(["rolling_ball", "tophat"])
+        self._bg_radius = QDoubleSpinBox()
+        self._bg_radius.setRange(1, 500); self._bg_radius.setValue(50); self._bg_radius.setSuffix(" px")
+
+        self._blur_en    = QCheckBox("Gaussian blur")
+        self._blur_en.setChecked(True)
+        self._blur_sigma = QDoubleSpinBox()
+        self._blur_sigma.setRange(0.1, 50); self._blur_sigma.setValue(2); self._blur_sigma.setSuffix(" px")
+
+        self._norm_en     = QCheckBox("Normalize")
+        self._norm_method = QComboBox(); self._norm_method.addItems(["minmax", "percentile"])
+
+        pfl.addRow(self._bg_en)
+        pfl.addRow("  Method:",  self._bg_method)
+        pfl.addRow("  Radius:",  self._bg_radius)
+        pfl.addRow(self._blur_en)
+        pfl.addRow("  Sigma:",   self._blur_sigma)
+        pfl.addRow(self._norm_en)
+        pfl.addRow("  Method:",  self._norm_method)
+
+        self._bg_en.toggled.connect(lambda c: [self._bg_method.setEnabled(c), self._bg_radius.setEnabled(c)])
+        self._blur_en.toggled.connect(self._blur_sigma.setEnabled)
+        self._norm_en.toggled.connect(self._norm_method.setEnabled)
+        lay.addWidget(pre_box)
+
+        # ── B. Segmentation ────────────────────────────────────────
+        seg_box = QGroupBox("B.  Segmentation  (runs once, all ROIs share the same mask)")
+        sfl = QFormLayout(seg_box)
+        sfl.setLabelAlignment(Qt.AlignRight)
+
+        self._thresh = QComboBox(); self._thresh.addItems(["otsu", "li", "yen", "triangle", "isodata"])
+        self._z_proj = QComboBox(); self._z_proj.addItems(["max", "mean", "sum"])
+        self._min_obj = QSpinBox()
+        self._min_obj.setRange(0, 100000); self._min_obj.setValue(50); self._min_obj.setSuffix(" px")
+        self._ws_en   = QCheckBox("Watershed split")
+        self._ws_en.setChecked(True)
+        self._ws_dist = QSpinBox()
+        self._ws_dist.setRange(1, 200); self._ws_dist.setValue(5); self._ws_dist.setSuffix(" px")
+
+        sfl.addRow("Threshold:", self._thresh)
+        sfl.addRow("Z proj.:",   self._z_proj)
+        sfl.addRow("Min obj. size:", self._min_obj)
+        sfl.addRow(self._ws_en)
+        sfl.addRow("  Min distance:", self._ws_dist)
+
+        self._ws_en.toggled.connect(self._ws_dist.setEnabled)
+        lay.addWidget(seg_box)
+
+        # ── C. Particle analysis filters ───────────────────────────
+        an_box = QGroupBox("C.  Particle analysis filters  (applied per ROI selection)")
+        afl = QFormLayout(an_box)
+        afl.setLabelAlignment(Qt.AlignRight)
+
+        self._min_area = QDoubleSpinBox()
+        self._min_area.setRange(0, 1e6); self._min_area.setValue(0.5); self._min_area.setSuffix(" µm²")
+        self._max_area = QDoubleSpinBox()
+        self._max_area.setRange(0, 1e9); self._max_area.setValue(5000); self._max_area.setSuffix(" µm²")
+        self._min_circ = QDoubleSpinBox()
+        self._min_circ.setRange(0, 1); self._min_circ.setValue(0); self._min_circ.setSingleStep(0.05)
+        self._an_z_proj = QComboBox(); self._an_z_proj.addItems(["max", "mean", "sum"])
+        self._bulk_intensity = QCheckBox("Measure bulk intensity within ROI")
+        self._bulk_intensity.setChecked(True)
+        self._bulk_intensity.setToolTip(
+            "Records mean / sum / std of all pixels in the ROI for this channel —\n"
+            "independent of particle detection."
+        )
+
+        afl.addRow("Min area:", self._min_area)
+        afl.addRow("Max area:", self._max_area)
+        afl.addRow("Min circularity:", self._min_circ)
+        afl.addRow("Z proj.:", self._an_z_proj)
+        afl.addRow(self._bulk_intensity)
+        lay.addWidget(an_box)
+
+        lay.addStretch()
+        scroll.setWidget(inner)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(scroll)
+
+    def apply_from(self, other: "ChannelPanel") -> None:
+        """Copy all settings (except display name) from *other* into this panel."""
+        self._bg_en.setChecked(other._bg_en.isChecked())
+        self._bg_method.setCurrentText(other._bg_method.currentText())
+        self._bg_radius.setValue(other._bg_radius.value())
+        self._blur_en.setChecked(other._blur_en.isChecked())
+        self._blur_sigma.setValue(other._blur_sigma.value())
+        self._norm_en.setChecked(other._norm_en.isChecked())
+        self._norm_method.setCurrentText(other._norm_method.currentText())
+        self._thresh.setCurrentText(other._thresh.currentText())
+        self._z_proj.setCurrentText(other._z_proj.currentText())
+        self._min_obj.setValue(other._min_obj.value())
+        self._ws_en.setChecked(other._ws_en.isChecked())
+        self._ws_dist.setValue(other._ws_dist.value())
+        self._min_area.setValue(other._min_area.value())
+        self._max_area.setValue(other._max_area.value())
+        self._min_circ.setValue(other._min_circ.value())
+        self._an_z_proj.setCurrentText(other._an_z_proj.currentText())
+        self._bulk_intensity.setChecked(other._bulk_intensity.isChecked())
+
+    # ── Step generators ────────────────────────────────────────────
+
+    @property
+    def display_name(self) -> str:
+        t = self._name_edit.text().strip()
+        return t if t else f"ch{self._ch_index}"
+
+    def get_preprocess_steps(self) -> list[dict]:
+        steps: list[dict] = []
+        if self._bg_en.isChecked():
+            steps.append({"type": "BackgroundSubtraction", "channel": self._ch_index,
+                          "radius": self._bg_radius.value(), "method": self._bg_method.currentText()})
+        if self._blur_en.isChecked():
+            steps.append({"type": "GaussianBlur", "channel": self._ch_index,
+                          "sigma": self._blur_sigma.value()})
+        if self._norm_en.isChecked():
+            steps.append({"type": "Normalize", "channel": self._ch_index,
+                          "method": self._norm_method.currentText()})
+        return steps
+
+    def get_segment_steps(self) -> list[dict]:
+        steps = [{"type": "AutoThreshold", "channel": self._ch_index,
+                  "method": self._thresh.currentText(), "z_projection": self._z_proj.currentText(),
+                  "min_size": self._min_obj.value()}]
+        if self._ws_en.isChecked():
+            steps.append({"type": "WatershedSplit", "channel": self._ch_index,
+                          "min_distance": self._ws_dist.value()})
+        return steps
+
+    def get_analysis_steps(self, roi_mask_key: str) -> list[dict]:
+        steps = [{"type": "ParticleAnalysis", "channel": self._ch_index,
+                  "min_size_um2": self._min_area.value(), "max_size_um2": self._max_area.value(),
+                  "min_circularity": self._min_circ.value(), "z_projection": self._an_z_proj.currentText(),
+                  "roi_mask": roi_mask_key}]
+        if self._bulk_intensity.isChecked():
+            steps.append({"type": "IntensityMeasurement", "channel": self._ch_index,
+                          "z_projection": self._an_z_proj.currentText(), "roi_mask": roi_mask_key})
+        return steps
+
+
+class ChannelsTab(QWidget):
+    """Sidebar: list of channels on the left, settings panel on the right."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._panels: list[ChannelPanel] = []
+        self._build()
+
+    def _build(self) -> None:
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setHandleWidth(4)
+
+        # Left: channel list
+        left = QWidget()
+        ll = QVBoxLayout(left)
+        ll.setContentsMargins(4, 8, 0, 4)
+        ll.addWidget(QLabel("Channels:"))
+        self._ch_list = QListWidget()
+        self._ch_list.setFixedWidth(130)
+        self._ch_list.currentRowChanged.connect(self._on_row_changed)
+        ll.addWidget(self._ch_list)
+
+        # Right: stacked panels
+        self._stack = QStackedWidget()
+        placeholder = QLabel("Load a sample image in the Setup tab first.")
+        placeholder.setAlignment(Qt.AlignCenter)
+        self._stack.addWidget(placeholder)
+
+        splitter.addWidget(left)
+        splitter.addWidget(self._stack)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        disable_btn = QPushButton("Disable all steps (all channels)")
+        disable_btn.clicked.connect(self._disable_all_steps)
+        root.addWidget(disable_btn)
+        root.addWidget(splitter)
+
+    def _on_row_changed(self, row: int) -> None:
+        if 0 <= row < len(self._panels):
+            self._stack.setCurrentWidget(self._panels[row])
+
+    def set_channels(self, raw_names: list[str]) -> None:
+        for panel in self._panels:
+            self._stack.removeWidget(panel)
+        self._panels.clear()
+        self._ch_list.clear()
+
+        for i, name in enumerate(raw_names):
+            panel = ChannelPanel(i, name)
+            panel.name_changed.connect(lambda text, idx=i: self._update_label(idx, text))
+            panel.copy_requested.connect(lambda p=panel: self._copy_to_all(p))
+            self._panels.append(panel)
+            self._stack.addWidget(panel)
+            self._ch_list.addItem(name)
+
+        if self._panels:
+            self._ch_list.setCurrentRow(0)
+            self._stack.setCurrentWidget(self._panels[0])
+
+    def _update_label(self, idx: int, text: str) -> None:
+        item = self._ch_list.item(idx)
+        if item:
+            item.setText(text or f"ch{idx}")
+
+    def _copy_to_all(self, source: ChannelPanel) -> None:
+        for panel in self._panels:
+            if panel is not source:
+                panel.apply_from(source)
+
+    def _disable_all_steps(self) -> None:
+        for panel in self._panels:
+            panel._bg_en.setChecked(False)
+            panel._blur_en.setChecked(False)
+            panel._norm_en.setChecked(False)
+            panel._ws_en.setChecked(False)
+            panel._bulk_intensity.setChecked(False)
+
+    def get_panels(self) -> list[ChannelPanel]:
+        return self._panels
+
+    def get_channel_names(self) -> list[str]:
+        return [p.display_name for p in self._panels]
+
+
+# ──────────────────────────────────────────────────────────────────
+# Tab 4 – ROI & Selections  (master-detail: multiple ROI configs)
+# ──────────────────────────────────────────────────────────────────
+
+@dataclass
+class _ROISel:
+    """Data object holding one ROI selection's configuration."""
+    label: str     = "Whole image"
+    source: str    = "whole"        # "whole" | "auto" | "file"
+    channel: int   = 0
+    blur: float    = 20.0
+    method: str    = "otsu"
+    path: str      = ""
+    fill_holes: bool = True
+    dilation_um: float = 0.0
+
+    @property
+    def mask_key(self) -> str:
+        """Unique key used in context.masks. Empty string = no restriction."""
+        if self.source == "whole":
+            return ""
+        slug = re.sub(r"[^a-z0-9_]", "", self.label.lower().replace(" ", "_"))
+        return f"roi_{slug}" if slug else "roi"
+
+    def list_label(self) -> str:
+        src = {"whole": "whole image",
+               "auto":  f"auto ch{self.channel}",
+               "file":  Path(self.path).name if self.path else "(no file)"}.get(self.source, self.source)
+        return f"{self.label}  [{src}]"
+
+    def get_roi_step(self) -> dict | None:
+        if self.source == "whole":
+            return None
+        if self.source == "auto":
+            return {"type": "ExtractROI", "channel": self.channel,
+                    "blur_sigma": self.blur, "method": self.method, "roi_name": self.mask_key}
+        if self.source == "file" and self.path:
+            return {"type": "LoadROI", "path": self.path, "roi_name": self.mask_key}
+        return None
+
+
+class ROISelectionsTab(QWidget):
+    """Add / remove ROI selections; each is run across all channels."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._sels: list[_ROISel] = []
+        self._channel_names: list[str] = []
+        self._viewer = None
+        self._loading = False   # suppress form-change callbacks while loading
+        self._build()
+        # Default: one "Whole image" selection
+        self._add_sel(_ROISel("Whole image", "whole"))
+
+    # ── Public API ─────────────────────────────────────────────────
+
+    def set_channels(self, names: list[str]) -> None:
+        self._channel_names = names
+        self._ch_combo.clear()
+        self._ch_combo.addItems([f"{i}: {n}" for i, n in enumerate(names)])
+
+    def set_viewer(self, v) -> None:
+        self._viewer = v
+
+    def get_selections(self) -> list[_ROISel]:
+        return list(self._sels)
+
+    def load_detected_rois(self, roi_paths: list) -> None:
+        """Replace any existing file-based selections with the detected ROI paths."""
+        # Remove existing file-based selections (keep whole/auto ones)
+        to_remove = [i for i, s in enumerate(self._sels) if s.source == "file"]
+        for i in reversed(to_remove):
+            self._sels.pop(i)
+            self._sel_list.takeItem(i)
+        # Add one selection per detected file
+        for path in roi_paths:
+            self._add_sel(_ROISel(
+                label=Path(path).stem,
+                source="file",
+                path=str(path),
+            ))
+
+    # ── Build ──────────────────────────────────────────────────────
+
+    def _build(self) -> None:
+        lay = QVBoxLayout(self)
+
+        # ── List + buttons ─────────────────────────────────────────
+        list_box = QGroupBox("Selections  (each is analyzed independently on all channels)")
+        lb = QVBoxLayout(list_box)
+        self._sel_list = QListWidget()
+        self._sel_list.setMaximumHeight(100)
+        self._sel_list.currentRowChanged.connect(self._on_row_changed)
+        lb.addWidget(self._sel_list)
+
+        btn_row = QHBoxLayout()
+        add_btn = QPushButton("+ Add selection")
+        add_btn.clicked.connect(self._on_add_clicked)
+        rm_btn  = QPushButton("− Remove")
+        rm_btn.clicked.connect(self._on_remove_clicked)
+        btn_row.addWidget(add_btn)
+        btn_row.addWidget(rm_btn)
+        lb.addLayout(btn_row)
+        lay.addWidget(list_box)
+
+        # ── Settings form (detail panel) ───────────────────────────
+        self._detail = QGroupBox("Settings for selected")
+        dfl = QFormLayout(self._detail)
+        dfl.setLabelAlignment(Qt.AlignRight)
+
+        self._lbl_edit = QLineEdit()
+        dfl.addRow("Name:", self._lbl_edit)
+
+        # Source radios
+        self._src_grp  = QButtonGroup(self)
+        self._rb_whole = QRadioButton("Whole image  (no restriction)")
+        self._rb_auto  = QRadioButton("Auto-detect from channel")
+        self._rb_file  = QRadioButton("Import from file  (.roi / .zip / .tif)")
+        self._rb_whole.setChecked(True)
+        for rb in [self._rb_whole, self._rb_auto, self._rb_file]:
+            self._src_grp.addButton(rb)
+            dfl.addRow(rb)
+
+        # Auto-detect sub-group
+        self._auto_grp = QGroupBox("Auto-detect options")
+        afl = QFormLayout(self._auto_grp)
+        self._ch_combo  = QComboBox()
+        self._blur_spin = QDoubleSpinBox()
+        self._blur_spin.setRange(1, 500); self._blur_spin.setValue(20); self._blur_spin.setSuffix(" px")
+        self._thresh_cb = QComboBox(); self._thresh_cb.addItems(["otsu", "li", "yen", "triangle", "isodata"])
+        afl.addRow("Reference channel:", self._ch_combo)
+        afl.addRow("Blur sigma:",        self._blur_spin)
+        afl.addRow("Threshold method:",  self._thresh_cb)
+        self._auto_grp.setVisible(False)
+        dfl.addRow(self._auto_grp)
+
+        # File sub-group
+        self._file_grp = QGroupBox("File import")
+        ffl = QFormLayout(self._file_grp)
+        self._path_edit, path_row = _path_row("Select .roi / .zip / .tif …", is_dir=False)
+        ffl.addRow("ROI file:", path_row)
+        note = QLabel("Same file used for all images in batch.")
+        note.setWordWrap(True)
+        ffl.addRow(note)
+        self._file_grp.setVisible(False)
+        dfl.addRow(self._file_grp)
+
+        # Post-processing
+        self._fill_cb   = QCheckBox("Fill holes in mask")
+        self._fill_cb.setChecked(True)
+        self._dil_spin  = QDoubleSpinBox()
+        self._dil_spin.setRange(-50, 50); self._dil_spin.setValue(0); self._dil_spin.setSuffix(" µm")
+        self._dil_spin.setToolTip("Positive = dilate outward,  negative = erode inward")
+        dfl.addRow(self._fill_cb)
+        dfl.addRow("Dilation / erosion:", self._dil_spin)
+
+        self._detail.setEnabled(False)
+        lay.addWidget(self._detail)
+        lay.addStretch()
+
+        # Wire visibility toggles
+        self._rb_auto.toggled.connect(self._auto_grp.setVisible)
+        self._rb_file.toggled.connect(self._file_grp.setVisible)
+
+        # Wire auto-save on any field change
+        for sig in [
+            self._lbl_edit.textChanged,
+            self._ch_combo.currentIndexChanged,
+            self._blur_spin.valueChanged,
+            self._thresh_cb.currentIndexChanged,
+            self._path_edit.textChanged,
+            self._fill_cb.toggled,
+            self._dil_spin.valueChanged,
+        ]:
+            sig.connect(self._on_form_changed)
+        self._src_grp.buttonToggled.connect(self._on_form_changed)
+
+    # ── Slots ──────────────────────────────────────────────────────
+
+    def _on_row_changed(self, row: int) -> None:
+        if 0 <= row < len(self._sels):
+            self._load_form(self._sels[row])
+            self._detail.setEnabled(True)
+        else:
+            self._detail.setEnabled(False)
+
+    def _on_add_clicked(self) -> None:
+        n = len(self._sels) + 1
+        self._add_sel(_ROISel(label=f"Selection {n}", source="whole"))
+
+    def _on_remove_clicked(self) -> None:
+        row = self._sel_list.currentRow()
+        if row < 0:
+            return
+        if len(self._sels) == 1:
+            QMessageBox.information(self, "Cannot remove", "At least one selection is required.")
+            return
+        self._sels.pop(row)
+        self._sel_list.takeItem(row)
+        self._sel_list.setCurrentRow(min(row, len(self._sels) - 1))
+
+    def _on_form_changed(self, *_) -> None:
+        if self._loading:
+            return
+        row = self._sel_list.currentRow()
+        if 0 <= row < len(self._sels):
+            self._save_form(self._sels[row])
+            self._sel_list.item(row).setText(self._sels[row].list_label())
+
+    # ── Internal helpers ───────────────────────────────────────────
+
+    def _add_sel(self, sel: _ROISel) -> None:
+        self._sels.append(sel)
+        self._sel_list.addItem(sel.list_label())
+        self._sel_list.setCurrentRow(len(self._sels) - 1)
+
+    def _load_form(self, sel: _ROISel) -> None:
+        self._loading = True
+        self._lbl_edit.setText(sel.label)
+        rb_map = {"whole": self._rb_whole, "auto": self._rb_auto, "file": self._rb_file}
+        rb_map.get(sel.source, self._rb_whole).setChecked(True)
+        self._auto_grp.setVisible(sel.source == "auto")
+        self._file_grp.setVisible(sel.source == "file")
+        idx = min(sel.channel, self._ch_combo.count() - 1) if self._ch_combo.count() else 0
+        self._ch_combo.setCurrentIndex(idx)
+        self._blur_spin.setValue(sel.blur)
+        self._thresh_cb.setCurrentText(sel.method)
+        self._path_edit.setText(sel.path)
+        self._fill_cb.setChecked(sel.fill_holes)
+        self._dil_spin.setValue(sel.dilation_um)
+        self._loading = False
+
+    def _save_form(self, sel: _ROISel) -> None:
+        sel.label  = self._lbl_edit.text().strip() or sel.label
+        sel.source = ("whole" if self._rb_whole.isChecked() else
+                      "auto"  if self._rb_auto.isChecked()  else "file")
+        sel.channel    = self._ch_combo.currentIndex()
+        sel.blur       = self._blur_spin.value()
+        sel.method     = self._thresh_cb.currentText()
+        sel.path       = self._path_edit.text().strip()
+        sel.fill_holes = self._fill_cb.isChecked()
+        sel.dilation_um = self._dil_spin.value()
+
+
+# ──────────────────────────────────────────────────────────────────
+# Tab 5 – Combine  (colocalization pairs)
+# ──────────────────────────────────────────────────────────────────
+
+class CombineTab(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._channel_names: list[str] = []
+        self._build()
+
+    def set_channels(self, names: list[str]) -> None:
+        self._channel_names = names
+        for row in range(self._table.rowCount()):
+            for col in [0, 1]:
+                combo = self._table.cellWidget(row, col)
+                if isinstance(combo, QComboBox):
+                    prev = combo.currentIndex()
+                    combo.clear()
+                    combo.addItems([f"{i}: {n}" for i, n in enumerate(names)])
+                    combo.setCurrentIndex(min(prev, len(names) - 1))
+
+    def _build(self) -> None:
+        lay = QVBoxLayout(self)
+        box = QGroupBox("Colocalization pairs")
+        cl  = QVBoxLayout(box)
+
+        self._table = QTableWidget(0, 4)
+        self._table.setHorizontalHeaderLabels(["Primary ch.", "Secondary ch.", "Dilation (µm)", "Z proj."])
+        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self._table.setMinimumHeight(120)
+        cl.addWidget(self._table)
+
+        btn_row = QHBoxLayout()
+        add_btn = QPushButton("+ Add pair")
+        add_btn.clicked.connect(self._add_pair)
+        rm_btn  = QPushButton("− Remove selected")
+        rm_btn.clicked.connect(self._remove_pair)
+        btn_row.addWidget(add_btn)
+        btn_row.addWidget(rm_btn)
+        cl.addLayout(btn_row)
+        lay.addWidget(box)
+
+        note = QLabel(
+            "Each pair computes Manders M1 & M2, Pearson r, 90° rotation control, "
+            "and per-particle overlap fraction.\n"
+            "Colocalization is run independently for each ROI selection defined in the "
+            "ROI & Selections tab. Results are tagged with the ROI name in the database."
+        )
+        note.setWordWrap(True)
+        lay.addWidget(note)
+        lay.addStretch()
+
+    def _add_pair(self) -> None:
+        r      = self._table.rowCount()
+        labels = [f"{i}: {n}" for i, n in enumerate(self._channel_names)] or ["0", "1"]
+        self._table.insertRow(r)
+        primary   = QComboBox(); primary.addItems(labels)
+        secondary = QComboBox(); secondary.addItems(labels); secondary.setCurrentIndex(min(1, len(labels) - 1))
+        dilation  = QDoubleSpinBox(); dilation.setRange(0, 20); dilation.setValue(0.5); dilation.setSuffix(" µm")
+        z_proj    = QComboBox(); z_proj.addItems(["max", "mean", "sum"])
+        self._table.setCellWidget(r, 0, primary)
+        self._table.setCellWidget(r, 1, secondary)
+        self._table.setCellWidget(r, 2, dilation)
+        self._table.setCellWidget(r, 3, z_proj)
+
+    def _remove_pair(self) -> None:
+        row = self._table.currentRow()
+        if row >= 0:
+            self._table.removeRow(row)
+
+    def auto_populate(self, channel_names: list[str]) -> None:
+        self._table.setRowCount(0)
+        for i in range(len(channel_names) - 1):
+            self._add_pair()
+            n = self._table.rowCount() - 1
+            for col, idx in [(0, i), (1, i + 1)]:
+                c = self._table.cellWidget(n, col)
+                if isinstance(c, QComboBox):
+                    c.setCurrentIndex(idx)
+
+    def get_coloc_steps(self, roi_mask_key: str = "") -> list[dict]:
+        steps = []
+        for row in range(self._table.rowCount()):
+            p  = self._table.cellWidget(row, 0)
+            s  = self._table.cellWidget(row, 1)
+            d  = self._table.cellWidget(row, 2)
+            zp = self._table.cellWidget(row, 3)
+            if isinstance(p, QComboBox) and isinstance(s, QComboBox):
+                steps.append({"type": "ColocalizationAnalysis",
+                               "primary_channel":   p.currentIndex(),
+                               "secondary_channel": s.currentIndex(),
+                               "dilation_um":       d.value() if isinstance(d, QDoubleSpinBox) else 0.5,
+                               "z_projection":      zp.currentText() if isinstance(zp, QComboBox) else "max",
+                               "roi_mask":          roi_mask_key})
+        return steps
+
+
+# ──────────────────────────────────────────────────────────────────
+# Tab 5 – Advanced  (manual step builder)
+# ──────────────────────────────────────────────────────────────────
+
+class AdvancedPipelineTab(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._steps: list[dict] = []
+        self._enabled: list[bool] = []   # parallel to _steps; False = skipped at run time
+        self._get_guided_pipeline = None   # set by CorrelativeImagingWidget
+        self._build()
+
+    def _build(self) -> None:
+        lay = QVBoxLayout(self)
+
+        top = QHBoxLayout()
+        imp_btn  = QPushButton("Import from guided tabs")
+        imp_btn.clicked.connect(self._import_guided)
+        load_btn = QPushButton("Load JSON …")
+        load_btn.clicked.connect(self._load_json)
+        top.addWidget(imp_btn)
+        top.addWidget(load_btn)
+        lay.addLayout(top)
+
+        splitter = QSplitter(Qt.Horizontal)
+
+        left = QWidget(); ll = QVBoxLayout(left); ll.setContentsMargins(0, 0, 0, 0)
+        ll.addWidget(QLabel("Steps (check to enable):"))
+        self._step_list = QListWidget()
+        self._step_list.currentRowChanged.connect(self._on_selected)
+        self._step_list.itemChanged.connect(self._on_item_changed)
+        ll.addWidget(self._step_list)
+        btn_row = QHBoxLayout()
+        for label, fn in [("↑", lambda: self._move(-1)), ("↓", lambda: self._move(1)), ("✕", self._remove), ("✕ All", self._clear_all)]:
+            b = QPushButton(label); b.clicked.connect(fn); btn_row.addWidget(b)
+        ll.addLayout(btn_row)
+        en_row = QHBoxLayout()
+        en_btn  = QPushButton("✓ Enable all"); en_btn.clicked.connect(lambda: self._set_all_enabled(True))
+        dis_btn = QPushButton("○ Disable all"); dis_btn.clicked.connect(lambda: self._set_all_enabled(False))
+        en_row.addWidget(en_btn); en_row.addWidget(dis_btn)
+        ll.addLayout(en_row)
+        splitter.addWidget(left)
+
+        right = QWidget(); rl = QVBoxLayout(right); rl.setContentsMargins(0, 0, 0, 0)
+        rl.addWidget(QLabel("Add / edit step:"))
+        tr = QHBoxLayout(); tr.addWidget(QLabel("Type:"))
+        self._type_combo = QComboBox(); self._type_combo.addItems(sorted(_STEP_FORMS.keys()))
+        self._type_combo.currentTextChanged.connect(self._refresh_form)
+        tr.addWidget(self._type_combo); rl.addLayout(tr)
+        self._form_container = QWidget()
+        self._form_layout = QFormLayout(self._form_container)
+        self._form_widgets: dict[str, QWidget] = {}
+        sc = QScrollArea(); sc.setWidgetResizable(True); sc.setWidget(self._form_container)
+        rl.addWidget(sc)
+        add_b = QPushButton("Add step ↓"); add_b.clicked.connect(self._add_step); rl.addWidget(add_b)
+        splitter.addWidget(right)
+        lay.addWidget(splitter)
+
+        bot = QHBoxLayout()
+        bot.addWidget(QLabel("Name:"))
+        self._name_edit = QLineEdit("pipeline")
+        bot.addWidget(self._name_edit)
+        save_btn = QPushButton("Save JSON …"); save_btn.clicked.connect(self._save_json); bot.addWidget(save_btn)
+        lay.addLayout(bot)
+        self._refresh_form(self._type_combo.currentText())
+
+    def _clear_form(self) -> None:
+        while self._form_layout.rowCount(): self._form_layout.removeRow(0)
+        self._form_widgets.clear()
+
+    def _refresh_form(self, step_type: str) -> None:
+        self._clear_form()
+        for param, wtype, label, default, extra in _STEP_FORMS.get(step_type, []):
+            w = _make_widget(wtype, default, extra)
+            self._form_widgets[param] = w
+            self._form_layout.addRow(label + ":", w)
+
+    def _read_form(self) -> dict:
+        st = self._type_combo.currentText()
+        d: dict = {"type": st}
+        for param, wtype, *_ in _STEP_FORMS.get(st, []):
+            d[param] = _read_widget(self._form_widgets[param], wtype)
+        return d
+
+    def _add_step(self) -> None:
+        self._steps.append(self._read_form())
+        self._enabled.append(True)
+        self._refresh_list()
+
+    def _remove(self) -> None:
+        r = self._step_list.currentRow()
+        if 0 <= r < len(self._steps):
+            self._steps.pop(r); self._enabled.pop(r); self._refresh_list()
+
+    def _clear_all(self) -> None:
+        self._steps.clear(); self._enabled.clear(); self._refresh_list()
+
+    def _move(self, delta: int) -> None:
+        r = self._step_list.currentRow(); n = r + delta
+        if 0 <= n < len(self._steps):
+            self._steps[r], self._steps[n] = self._steps[n], self._steps[r]
+            self._enabled[r], self._enabled[n] = self._enabled[n], self._enabled[r]
+            self._refresh_list(); self._step_list.setCurrentRow(n)
+
+    def _on_item_changed(self, item) -> None:
+        from qtpy.QtCore import Qt as _Qt
+        row = self._step_list.row(item)
+        if 0 <= row < len(self._enabled):
+            self._enabled[row] = (item.checkState() == _Qt.Checked)
+
+    def _set_all_enabled(self, state: bool) -> None:
+        self._enabled = [state] * len(self._steps)
+        self._refresh_list()
+
+    def _on_selected(self, row: int) -> None:
+        if 0 <= row < len(self._steps):
+            s = self._steps[row]
+            self._type_combo.setCurrentText(s["type"]); self._refresh_form(s["type"])
+            for param, wtype, *_ in _STEP_FORMS.get(s["type"], []):
+                if param in s and param in self._form_widgets:
+                    _set_widget(self._form_widgets[param], wtype, s[param])
+
+    def _refresh_list(self) -> None:
+        from qtpy.QtCore import Qt as _Qt
+        self._step_list.blockSignals(True)
+        self._step_list.clear()
+        for i, s in enumerate(self._steps):
+            params = "  ".join(f"{k}={v}" for k, v in s.items() if k != "type")
+            item = QListWidgetItem(f"{i+1}. {s['type']}  {params}")
+            item.setFlags(item.flags() | _Qt.ItemIsUserCheckable)
+            en = self._enabled[i] if i < len(self._enabled) else True
+            item.setCheckState(_Qt.Checked if en else _Qt.Unchecked)
+            self._step_list.addItem(item)
+        self._step_list.blockSignals(False)
+
+    def _import_guided(self) -> None:
+        if self._get_guided_pipeline is None:
+            QMessageBox.information(self, "Not available", "No guided pipeline connected."); return
+        pl = self._get_guided_pipeline()
+        self._steps = pl.get("steps", [])
+        self._enabled = [True] * len(self._steps)
+        self._name_edit.setText(pl.get("name", "pipeline"))
+        self._refresh_list()
+
+    def _save_json(self) -> None:
+        if not self._steps: QMessageBox.information(self, "Empty", "Add steps first."); return
+        path, _ = QFileDialog.getSaveFileName(self, "Save pipeline JSON", "", "JSON (*.json)")
+        if path:
+            Path(path).write_text(json.dumps({"name": self._name_edit.text(), "steps": self._steps}, indent=2))
+
+    def _load_json(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Load pipeline JSON", "", "JSON (*.json)")
+        if path:
+            data = json.loads(Path(path).read_text())
+            self._name_edit.setText(data.get("name", "pipeline"))
+            self._steps = data.get("steps", [])
+            self._enabled = [True] * len(self._steps)
+            self._refresh_list()
+
+    def get_pipeline_dict(self) -> dict:
+        active = [s for s, en in zip(self._steps, self._enabled) if en]
+        return {"name": self._name_edit.text(), "steps": active}
+
+    def set_channel_names(self, names: list[str]) -> None:
+        pass   # kept for API compatibility
+
+
+# ──────────────────────────────────────────────────────────────────
+# Tab 6 – Run
+# ──────────────────────────────────────────────────────────────────
+
+class RunTab(QWidget):
+    def __init__(self, get_setup, get_pipeline_dict, napari_viewer=None, parent=None):
+        super().__init__(parent)
+        self._get_setup         = get_setup
+        self._get_pipeline_dict = get_pipeline_dict
+        self._viewer            = napari_viewer
+        self._worker: _BatchWorker | None = None
+        self._build()
+
+    def _build(self) -> None:
+        lay = QVBoxLayout(self)
+
+        prev_box = QGroupBox("Preview on sample image")
+        pl = QVBoxLayout(prev_box)
+        self._preview_btn = QPushButton("Run pipeline on sample image (shows in napari)")
+        self._preview_btn.clicked.connect(self._on_preview)
+        pl.addWidget(self._preview_btn)
+        layer_row = QHBoxLayout()
+        show_all_btn = QPushButton("Show all layers")
+        show_all_btn.clicked.connect(lambda: self._set_all_layers_visible(True))
+        hide_all_btn = QPushButton("Hide all layers")
+        hide_all_btn.clicked.connect(lambda: self._set_all_layers_visible(False))
+        layer_row.addWidget(show_all_btn)
+        layer_row.addWidget(hide_all_btn)
+        pl.addLayout(layer_row)
+
+        gamma_row = QHBoxLayout()
+        gamma_row.addWidget(QLabel("Gamma (display):"))
+        self._gamma_slider = QSlider(Qt.Horizontal)
+        self._gamma_slider.setRange(10, 300)   # represents 0.10 – 3.00
+        self._gamma_slider.setValue(100)        # 1.00 = no correction
+        self._gamma_slider.setTickInterval(10)
+        self._gamma_lbl = QLabel("1.00")
+        self._gamma_lbl.setFixedWidth(32)
+        self._gamma_slider.valueChanged.connect(self._on_gamma_changed)
+        gamma_row.addWidget(self._gamma_slider)
+        gamma_row.addWidget(self._gamma_lbl)
+        pl.addLayout(gamma_row)
+        lay.addWidget(prev_box)
+
+        exp_box = QGroupBox("Pipeline JSON")
+        el = QHBoxLayout(exp_box)
+        show_btn = QPushButton("Show JSON")
+        show_btn.clicked.connect(self._on_show_json)
+        save_btn = QPushButton("Save JSON …")
+        save_btn.clicked.connect(self._on_save_json)
+        el.addWidget(show_btn)
+        el.addWidget(save_btn)
+        lay.addWidget(exp_box)
+
+        batch_box = QGroupBox("Batch run")
+        bl = QVBoxLayout(batch_box)
+        ctrl = QHBoxLayout()
+        self._run_btn   = QPushButton("Run batch"); self._run_btn.setStyleSheet("font-weight:bold")
+        self._run_btn.clicked.connect(self._on_run)
+        self._abort_btn = QPushButton("Abort"); self._abort_btn.setEnabled(False)
+        self._abort_btn.clicked.connect(self._on_abort)
+        ctrl.addWidget(self._run_btn); ctrl.addWidget(self._abort_btn)
+        bl.addLayout(ctrl)
+        self._bar   = QProgressBar()
+        self._prog_lbl = QLabel("")
+        bl.addWidget(self._bar); bl.addWidget(self._prog_lbl)
+        lay.addWidget(batch_box)
+
+        log_box = QGroupBox("Log")
+        ll = QVBoxLayout(log_box)
+        self._log_edit = QTextEdit(); self._log_edit.setReadOnly(True)
+        self._log_edit.setStyleSheet("font-family:monospace; font-size:11px;")
+        ll.addWidget(self._log_edit)
+        lay.addWidget(log_box)
+
+    def _set_all_layers_visible(self, visible: bool) -> None:
+        if self._viewer is None:
+            return
+        for layer in self._viewer.layers:
+            layer.visible = visible
+
+    def _on_gamma_changed(self, value: int) -> None:
+        gamma = value / 100.0
+        self._gamma_lbl.setText(f"{gamma:.2f}")
+        if self._viewer is None:
+            return
+        from napari.layers import Image
+        for layer in self._viewer.layers:
+            if isinstance(layer, Image):
+                layer.gamma = gamma
+
+    def _on_preview(self) -> None:
+        setup    = self._get_setup()
+        img_data = setup.image_data
+        if img_data is None:
+            QMessageBox.information(self, "No image", "Load a sample image in the Setup tab first.")
+            return
+        pl_dict = self._get_pipeline_dict()
+        if not pl_dict.get("steps"):
+            QMessageBox.information(self, "Empty pipeline",
+                "Load a sample image and configure at least one channel.")
+            return
+        try:
+            import os, tempfile
+            from correlative_imaging.pipeline import Pipeline
+            from correlative_imaging.pipeline.base import PipelineContext
+            from napari.qt.threading import thread_worker
+
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+                json.dump(pl_dict, f); tmp = f.name
+            pl = Pipeline.load(tmp); os.unlink(tmp)
+
+            if self._viewer is not None:
+                self._viewer.layers.clear()
+                from correlative_imaging.viewer.napari_viewer import NapariViewer
+                nv = NapariViewer.__new__(NapariViewer); nv._viewer = self._viewer
+                nv.show_image(img_data, group="raw")
+
+            context = PipelineContext(channel_names=img_data.channel_names,
+                                      pixel_size_um=img_data.pixel_size_um,
+                                      z_step_um=img_data.z_step_um)
+            self._preview_btn.setEnabled(False); self._preview_btn.setText("Running …")
+
+            step_counter = [0]   # mutable so the closure can increment it
+
+            @thread_worker
+            def _run():
+                current = img_data.data.copy()
+                for step in pl.steps:
+                    result = step.process(current, context)
+                    if result.image is not None: current = result.image.copy()
+                    context.masks.update(result.masks)
+                    yield step.name, step, result, current.copy()
+
+            def _on_step(args):
+                step_name, step_obj, result, current_image = args
+                if self._viewer is None: return
+                px   = img_data.pixel_size_um
+                scale = [px, px]
+                cmap  = _STEP_COLORMAPS[step_counter[0] % len(_STEP_COLORMAPS)]
+                step_counter[0] += 1
+                mip = current_image.max(axis=1) if current_image.ndim == 4 else current_image
+                if result.image is not None:
+                    step_ch = getattr(step_obj, "channel", None)
+                    if step_ch is not None:
+                        # Per-channel step — only show the channel it actually modified
+                        ch = img_data.channel_names[step_ch]
+                        self._viewer.add_image(
+                            mip[step_ch], name=f"{step_name}/{ch}",
+                            visible=False, blending="additive",
+                            colormap=cmap, scale=scale,
+                        )
+                    else:
+                        # Multi-channel step — show all channels
+                        for i, ch in enumerate(img_data.channel_names):
+                            self._viewer.add_image(
+                                mip[i], name=f"{step_name}/{ch}",
+                                visible=False, blending="additive",
+                                colormap=cmap, scale=scale,
+                            )
+                for mk, mask in result.masks.items():
+                    if int(mask.max()) > 1:
+                        self._viewer.add_labels(
+                            mask.astype(int), name=f"{step_name}/{mk}", scale=scale,
+                        )
+                    elif mk.startswith("roi"):
+                        lyr = self._viewer.add_labels(
+                            mask.astype(int), name=f"{step_name}/{mk}", scale=scale,
+                        )
+                        lyr.contour = 1
+                    else:
+                        self._viewer.add_image(
+                            mask.astype(float), name=f"{step_name}/{mk}",
+                            colormap=cmap, blending="additive", opacity=0.4, scale=scale,
+                        )
+                self._log(f"  ✓ {step_name}")
+
+            def _on_done():
+                self._preview_btn.setEnabled(True)
+                self._preview_btn.setText("Run pipeline on sample image (shows in napari)")
+                self._log("Preview complete.")
+
+            def _on_err(exc_info):
+                self._preview_btn.setEnabled(True)
+                self._preview_btn.setText("Run pipeline on sample image (shows in napari)")
+                msg = str(exc_info[1]) if isinstance(exc_info, tuple) else str(exc_info)
+                self._log(f"Error: {msg}")
+
+            worker = _run()
+            worker.yielded.connect(_on_step)
+            worker.finished.connect(_on_done)
+            worker.errored.connect(_on_err); worker.start()
+        except Exception:
+            self._log(traceback.format_exc())
+            self._preview_btn.setEnabled(True)
+            self._preview_btn.setText("Run pipeline on sample image (shows in napari)")
+
+    def _on_show_json(self) -> None:
+        pl = self._get_pipeline_dict()
+        dlg = QMessageBox(self); dlg.setWindowTitle("Pipeline JSON")
+        dlg.setText(f"{len(pl.get('steps', []))} steps"); dlg.setDetailedText(json.dumps(pl, indent=2))
+        dlg.exec_()
+
+    def _on_save_json(self) -> None:
+        pl = self._get_pipeline_dict()
+        if not pl.get("steps"): QMessageBox.information(self, "Empty", "Configure channels first."); return
+        path, _ = QFileDialog.getSaveFileName(self, "Save pipeline JSON", "", "JSON (*.json)")
+        if path:
+            Path(path).write_text(json.dumps(pl, indent=2)); self._log(f"Saved → {path}")
+
+    def _on_run(self) -> None:
+        setup = self._get_setup()
+        if setup.input_dir is None:
+            QMessageBox.warning(self, "No folder", "Select an input folder in the Setup tab."); return
+        pl_dict = self._get_pipeline_dict()
+        if not pl_dict.get("steps"):
+            QMessageBox.warning(self, "No pipeline", "Configure channels first."); return
+        setup.output_dir.mkdir(parents=True, exist_ok=True)
+        self._bar.setValue(0); self._run_btn.setEnabled(False); self._abort_btn.setEnabled(True)
+        self._log("Starting batch …")
+        self._worker = _BatchWorker(pl_dict, setup.input_dir, setup.output_dir, setup.experiment)
+        self._worker.progress.connect(self._on_progress)
+        self._worker.log_msg.connect(self._log)
+        self._worker.finished.connect(self._on_finished)
+        self._worker.start()
+
+    def _on_abort(self) -> None:
+        if self._worker: self._worker.abort(); self._log("Abort requested …")
+
+    def _on_progress(self, current: int, total: int, name: str, _) -> None:
+        self._bar.setValue(int(100 * current / max(total, 1)))
+        self._prog_lbl.setText(f"{current}/{total}  —  {name}")
+
+    def _on_finished(self, db_path: str) -> None:
+        self._run_btn.setEnabled(True); self._abort_btn.setEnabled(False)
+        self._bar.setValue(100)
+        self._log(f"Done ✓   Results → {db_path}" if db_path else "Finished (with errors).")
+        self._prog_lbl.setText("Finished." if db_path else "Finished (with errors).")
+
+    def _log(self, msg: str) -> None:
+        self._log_edit.append(str(msg))
+        self._log_edit.verticalScrollBar().setValue(self._log_edit.verticalScrollBar().maximum())
+
+
+# ──────────────────────────────────────────────────────────────────
+# Main container
+# ──────────────────────────────────────────────────────────────────
+
+class CorrelativeImagingWidget(QWidget):
+    def __init__(self, napari_viewer=None, parent=None):
+        super().__init__(parent)
+        self._viewer = napari_viewer
+        self._tabs   = QTabWidget()
+
+        self._plate_tab    = PlateTab()
+        self._bf_tab       = BFPipelineTab(viewer=napari_viewer)
+        self._channels_tab = ChannelsTab()
+        self._roi_tab      = ROISelectionsTab()
+        self._combine_tab  = CombineTab()
+        self._advanced_tab = AdvancedPipelineTab()
+        self._run_tab      = RunTab(
+            get_setup         = lambda: self._plate_tab,
+            get_pipeline_dict = self.build_pipeline_dict,
+            napari_viewer     = napari_viewer,
+        )
+
+        self._roi_tab.set_viewer(napari_viewer)
+        self._advanced_tab._get_guided_pipeline = self.build_pipeline_dict
+
+        self._tabs.addTab(self._plate_tab,    "Setup")
+        self._tabs.addTab(self._bf_tab,       "BF Pipeline")
+        self._tabs.addTab(self._channels_tab, "Channels")
+        self._tabs.addTab(self._roi_tab,      "ROI & Selections")
+        self._tabs.addTab(self._combine_tab,  "Combine")
+        self._tabs.addTab(self._advanced_tab, "Advanced")
+        self._tabs.addTab(self._run_tab,      "Run")
+
+        self._plate_tab.channels_ready.connect(self._on_channels_ready)
+        self._plate_tab.well_selected.connect(self._on_well_selected)
+        self._plate_tab.view_requested.connect(self._on_view_requested)
+
+        self._view_cache: dict[tuple, object] = {}  # (well_id, "bf"/"fl") → image_data
+        self._view_worker = None
+
+        root = QVBoxLayout(self)
+        root.addWidget(self._tabs)
+        self.setMinimumWidth(420)
+
+    def _show_in_viewer(self, image_data, label: str) -> None:
+        self._viewer.layers.clear()
+        try:
+            from correlative_imaging.viewer.napari_viewer import NapariViewer
+            nv = NapariViewer.__new__(NapariViewer); nv._viewer = self._viewer
+            nv.show_image(image_data, group=label)
+        except Exception:
+            px = image_data.pixel_size_um; scale = [px, px]
+            mip = image_data.max_project()
+            for i, ch in enumerate(image_data.channel_names):
+                self._viewer.add_image(mip[i], name=f"{label}/{ch}",
+                                       blending="additive", scale=scale)
+
+    def _on_view_requested(self, well, which: str) -> None:
+        if self._viewer is None:
+            return
+        path = well.bf_path if which == "bf" else well.fl_path
+        if path is None:
+            return
+        label = which.upper()
+        cache_key = (well.well_id, which)
+
+        if cache_key in self._view_cache:
+            self._show_in_viewer(self._view_cache[cache_key], label)
+            return
+
+        def _loaded(image_data):
+            self._view_cache[cache_key] = image_data
+            self._show_in_viewer(image_data, label)
+
+        self._view_worker = _LoadImageWorker(path)
+        self._view_worker.loaded.connect(_loaded)
+        self._view_worker.error.connect(lambda msg: None)
+        self._view_worker.start()
+        self._viewer.status = f"Loading {label} for well {well.well_id} …"
+
+    def _on_well_selected(self, well) -> None:
+        if self._plate_tab._auto_roi_cb.isChecked() and well.roi_paths:
+            self._roi_tab.load_detected_rois(well.roi_paths)
+
+    def _on_channels_ready(self, channel_names: list[str]) -> None:
+        img = self._plate_tab.image_data
+        if img is not None and self._viewer is not None:
+            try:
+                from correlative_imaging.viewer.napari_viewer import NapariViewer
+                v = NapariViewer.__new__(NapariViewer); v._viewer = self._viewer
+                self._viewer.layers.clear()
+                v.show_image(img, group="sample")
+            except Exception:
+                pass
+
+        self._channels_tab.set_channels(channel_names)
+        self._roi_tab.set_channels(channel_names)
+        self._combine_tab.set_channels(channel_names)
+        self._combine_tab.auto_populate(channel_names)
+        self._advanced_tab.set_channel_names(channel_names)
+        self._tabs.setCurrentWidget(self._channels_tab)
+
+    def build_pipeline_dict(self) -> dict:
+        """
+        Pipeline order:
+          1. Preprocessing   — once per channel  (BGSub, Blur, Normalize)
+          2. Segmentation    — once per channel  (AutoThreshold, WatershedSplit)
+          3. Per ROI selection:
+               a. ROI extraction (ExtractROI or LoadROI) — skipped for "whole image"
+               b. ParticleAnalysis per channel, restricted to that ROI
+               c. ColocalizationAnalysis per pair, restricted to that ROI
+        """
+        panels = self._channels_tab.get_panels()
+        sels   = self._roi_tab.get_selections()
+        steps: list[dict] = []
+
+        # ── 1. Preprocessing ──
+        for p in panels:
+            steps.extend(p.get_preprocess_steps())
+
+        # ── 2. Segmentation ──
+        for p in panels:
+            steps.extend(p.get_segment_steps())
+
+        # ── 3. Per ROI selection: ROI mask + particle analysis + colocalization ──
+        for sel in sels:
+            roi_step = sel.get_roi_step()
+            if roi_step:
+                steps.append(roi_step)
+            for p in panels:
+                steps.extend(p.get_analysis_steps(sel.mask_key))
+            for coloc in self._combine_tab.get_coloc_steps(sel.mask_key):
+                steps.append(coloc)
+
+        return {"name": "pipeline", "steps": steps}
+
+
+# ──────────────────────────────────────────────────────────────────
+# Widget / form helpers
+# ──────────────────────────────────────────────────────────────────
+
+def _path_row(placeholder: str, is_dir: bool) -> tuple[QLineEdit, QHBoxLayout]:
+    row  = QHBoxLayout()
+    edit = QLineEdit(); edit.setPlaceholderText(placeholder)
+    btn  = QPushButton("…"); btn.setFixedWidth(28)
+
+    def _browse():
+        p = (QFileDialog.getExistingDirectory(None, placeholder)
+             if is_dir
+             else QFileDialog.getOpenFileName(None, placeholder, "", "All files (*)")[0])
+        if p: edit.setText(p)
+
+    btn.clicked.connect(_browse)
+    row.addWidget(edit); row.addWidget(btn)
+    return edit, row
+
+
+def _make_widget(wtype: str, default, extra) -> QWidget:
+    if wtype == "int":
+        w = QSpinBox(); lo, hi = extra or (0, 100000); w.setRange(lo, hi); w.setValue(int(default)); return w
+    if wtype == "float":
+        w = QDoubleSpinBox(); lo, hi = extra or (0.0, 1e9); w.setRange(lo, hi)
+        w.setDecimals(3); w.setValue(float(default)); return w
+    if wtype.startswith("choice:"):
+        choices = wtype.split(":", 1)[1].split(",")
+        w = QComboBox(); w.addItems(choices)
+        if default in choices: w.setCurrentText(str(default))
+        return w
+    if wtype == "bool":
+        w = QCheckBox(); w.setChecked(bool(default)); return w
+    return QLineEdit(str(default))
+
+
+def _read_widget(w: QWidget, wtype: str):
+    if isinstance(w, QSpinBox):       return w.value()
+    if isinstance(w, QDoubleSpinBox): return w.value()
+    if isinstance(w, QComboBox):      return w.currentText()
+    if isinstance(w, QCheckBox):      return w.isChecked()
+    if isinstance(w, QLineEdit):
+        v = w.text()
+        if wtype == "int":   return int(v)   if v.strip() else 0
+        if wtype == "float": return float(v) if v.strip() else 0.0
+        return v
+    return None
+
+
+def _set_widget(w: QWidget, wtype: str, value) -> None:
+    if isinstance(w, (QSpinBox, QDoubleSpinBox)): w.setValue(value)
+    elif isinstance(w, QComboBox):                w.setCurrentText(str(value))
+    elif isinstance(w, QCheckBox):                w.setChecked(bool(value))
+    elif isinstance(w, QLineEdit):                w.setText(str(value))
+
+
+# ──────────────────────────────────────────────────────────────────
+# Entry point
+# ──────────────────────────────────────────────────────────────────
+
+def launch_gui() -> None:
+    import napari
+    viewer = napari.Viewer(title="Correlative Imaging")
+    widget = CorrelativeImagingWidget(napari_viewer=viewer)
+    viewer.window.add_dock_widget(widget, name="Correlative Imaging", area="right")
+    napari.run()
