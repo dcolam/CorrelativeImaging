@@ -1,0 +1,64 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "correlative-imaging"
+version = "0.1.0"
+description = "Modern Python pipeline for correlative microscopy image analysis"
+requires-python = ">=3.11"
+dependencies = [
+    # Core image processing
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "scikit-image>=0.22",
+    "pandas>=2.1",
+    # Multi-format microscopy I/O
+    "bioio>=1.1",
+    "bioio-tifffile",       # TIFF, BigTIFF
+    "bioio-ome-tiff",       # OME-TIFF
+    "bioio-czi",            # Zeiss CZI
+    "bioio-lif",            # Leica LIF
+    "bioio-nd2",            # Nikon ND2
+    "bioio-imageio",        # PNG, JPG, BMP, etc.
+    "bioio-ome-zarr",       # OME-Zarr (cloud-native)
+    "tifffile>=2023.9",     # direct TIFF access + writing
+    "roifile>=2023.5",      # ImageJ .roi file compat
+    # Data & storage
+    "pyarrow>=14.0",        # parquet export
+    # Config
+    "pyyaml>=6.0",
+    # CLI
+    "click>=8.1",
+    "rich>=13.0",
+    "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+viewer = [
+    "napari[all]>=0.4.19",
+]
+gpu = [
+    # drop-in GPU replacements — install only if CUDA available
+    "cupy-cuda12x",
+    "cucim-cu12",
+]
+bioformats = [
+    # requires Java; covers VSI, SCN, ICS, AFM, etc.
+    "bioio-bioformats",
+]
+dev = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+    "ruff>=0.1",
+]
+
+[project.scripts]
+ci = "correlative_imaging.cli:cli"
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
