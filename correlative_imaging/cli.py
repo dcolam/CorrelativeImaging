@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import sys
 from pathlib import Path
 
 import click
@@ -184,7 +183,7 @@ def batch(
 ) -> None:
     """Run PIPELINE on all images in INPUT_DIR."""
     from correlative_imaging.pipeline import Pipeline
-    from batch import BatchRunner
+    from correlative_imaging.batch import BatchRunner
 
     pl = Pipeline.load(pipeline)
     output_dir = output or input_dir / "output"

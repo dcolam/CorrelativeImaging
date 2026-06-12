@@ -98,9 +98,8 @@ class ParticleAnalysis(Step):
         df["area_um2"] = df["area"] * px ** 2
 
         # Rename centroid columns for clarity
-        df.rename(
+        df = df.rename(
             columns={"centroid-0": "centroid_row", "centroid-1": "centroid_col"},
-            inplace=True,
         )
 
         # Filtering

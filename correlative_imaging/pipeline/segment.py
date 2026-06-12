@@ -266,7 +266,7 @@ class LoadROI(Step):
                     mask[rr, cc] = True
                     continue
             except Exception:
-                pass
+                pass  # polygon coords unavailable — fall through to bounding-box
             # Fallback: use bounding box attributes
             try:
                 r1 = max(0, int(roi.top))
@@ -275,7 +275,7 @@ class LoadROI(Step):
                 c2 = min(w, int(roi.right))
                 mask[r1:r2, c1:c2] = True
             except Exception:
-                pass
+                pass  # ROI has neither polygon coords nor a valid bounding box — skip
 
         return mask
 
