@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -14,6 +16,52 @@ import numpy as np
 log = logging.getLogger(__name__)
 
 _java_configured = False
+
+# jpype's native bridge (used by scyjava/bffile to embed the JVM) lags behind
+# the newest JDK releases — brand-new majors (e.g. 21+) have been observed to
+# crash the process with no traceback (native access restrictions tightened
+# each release; see JEP 472). Stick to well-established LTS versions.
+_JAVA_MIN_COMPATIBLE = 8
+_JAVA_MAX_COMPATIBLE = 17
+
+
+def _java_major_version(java_exe: str) -> int | None:
+    try:
+        out = subprocess.run(
+            [java_exe, "-version"], capture_output=True, text=True, timeout=5
+        ).stderr
+    except OSError:
+        return None
+    m = re.search(r'version "1\.(\d+)', out) or re.search(r'version "(\d+)', out)
+    return int(m.group(1)) if m else None
+
+
+def _find_compatible_java() -> str | None:
+    """Search PATH and common Windows install roots for a Java known to work
+    with jpype, preferring the newest version within the compatible range.
+    """
+    exe_name = "java.exe" if os.name == "nt" else "java"
+    search_dirs = list(dict.fromkeys(os.environ.get("PATH", "").split(os.pathsep)))
+    for root in (r"C:\Program Files", r"C:\Program Files (x86)"):
+        try:
+            search_dirs += [str(p / "bin") for p in Path(root).iterdir() if p.is_dir()]
+        except OSError:
+            pass
+
+    seen: set[str] = set()
+    best: tuple[int, str] | None = None
+    for d in search_dirs:
+        exe = str(Path(d) / exe_name)
+        if exe in seen or not Path(exe).exists():
+            continue
+        seen.add(exe)
+        major = _java_major_version(exe)
+        if major is None:
+            continue
+        if _JAVA_MIN_COMPATIBLE <= major <= _JAVA_MAX_COMPATIBLE:
+            if best is None or major > best[0]:
+                best = (major, exe)
+    return best[1] if best else None
 
 
 def _ensure_java_for_bioformats() -> None:
@@ -32,10 +80,18 @@ def _ensure_java_for_bioformats() -> None:
         return
     _java_configured = True
 
-    if "JAVA_HOME" not in os.environ:
+    java_exe = _find_compatible_java()
+    if java_exe:
+        # java.exe normally lives at <JAVA_HOME>/bin/java(.exe)
+        java_home = Path(java_exe).resolve().parent.parent
+        os.environ["JAVA_HOME"] = str(java_home)
+        # Some Java-discovery paths (e.g. jgo) scan PATH rather than
+        # JAVA_HOME — put our chosen version first so it wins either way.
+        os.environ["PATH"] = str(java_home / "bin") + os.pathsep + os.environ.get("PATH", "")
+        log.debug("Using compatible Java at %s", java_home)
+    elif "JAVA_HOME" not in os.environ:
         java_exe = shutil.which("java")
         if java_exe:
-            # java.exe normally lives at <JAVA_HOME>/bin/java(.exe)
             java_home = Path(java_exe).resolve().parent.parent
             os.environ["JAVA_HOME"] = str(java_home)
             log.debug("JAVA_HOME not set — using detected Java at %s", java_home)
