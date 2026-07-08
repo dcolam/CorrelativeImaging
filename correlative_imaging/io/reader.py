@@ -235,13 +235,22 @@ class ImageData:
             idx = self.channel_names.index(idx)
         return self.data[idx]
 
-    def max_project(self, channel: int | str | None = None) -> np.ndarray:
-        """Max-intensity projection along Z.  Returns (C, Y, X) or (Y, X)."""
+    def project(self, method: str = "max", channel: int | str | None = None) -> np.ndarray:
+        """Z-projection using the given method.  Returns (C, Y, X) or (Y, X).
+
+        method: 'min' | 'max' | 'mean' | 'sum'  (no-op if not a Z-stack).
+        """
         if not self.is_zstack:
             return self.data if channel is None else self.channel(channel)
+        ops = {"min": np.min, "max": np.max, "mean": np.mean, "sum": np.sum}
+        fn = ops.get(method, np.max)
         if channel is None:
-            return self.data.max(axis=1)
-        return self.channel(channel).max(axis=0)
+            return fn(self.data, axis=1)
+        return fn(self.channel(channel), axis=0)
+
+    def max_project(self, channel: int | str | None = None) -> np.ndarray:
+        """Max-intensity projection along Z.  Returns (C, Y, X) or (Y, X)."""
+        return self.project("max", channel)
 
 
 def read_image(path: str | Path, scene: int = 0) -> ImageData:

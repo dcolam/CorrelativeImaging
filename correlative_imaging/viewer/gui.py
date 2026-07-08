@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import traceback
 from dataclasses import dataclass
@@ -40,6 +41,9 @@ from qtpy.QtWidgets import (
 )
 
 from correlative_imaging.io import supported_extensions
+from correlative_imaging.viewer.napari_viewer import auto_contrast_limits
+
+log = logging.getLogger(__name__)
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -143,6 +147,25 @@ class _LoadImageWorker(QThread):
             self.error.emit(traceback.format_exc())
 
 
+class _LoadWellWorker(QThread):
+    """Load a well's BF and FL images together (for the combined overview)."""
+    loaded = Signal(object, object)  # (bf_data | None, fl_data | None)
+    error  = Signal(str)
+
+    def __init__(self, well):
+        super().__init__()
+        self._well = well
+
+    def run(self) -> None:
+        try:
+            from correlative_imaging.io import read_image
+            bf = read_image(self._well.bf_path) if self._well.bf_path else None
+            fl = read_image(self._well.fl_path) if self._well.fl_path else None
+            self.loaded.emit(bf, fl)
+        except Exception:
+            self.error.emit(traceback.format_exc())
+
+
 class _BatchWorker(QThread):
     progress = Signal(int, int, str, object)
     log_msg  = Signal(str)
@@ -183,6 +206,78 @@ class _BatchWorker(QThread):
 
             runner.run_directory(self.input_dir, output_dir=self.output_dir, progress_fn=_cb)
             self.finished.emit(str(self.output_dir / "results.db"))
+        except Exception:
+            self.log_msg.emit(traceback.format_exc())
+            self.finished.emit("")
+
+
+class _WellBatchWorker(QThread):
+    """Batch runner for plate wells: reuse-or-generate each well's BF-pipeline
+    hole ROI, then run the FL analysis pipeline per well (see WellBatchRunner
+    in correlative_imaging.batch).
+
+    ``pipeline_dict_fn`` must be safe to call from this background thread —
+    build it with ``CorrelativeImagingWidget.make_well_pipeline_dict_fn()``,
+    which snapshots all Qt-widget-derived config on the main thread first.
+    """
+    progress = Signal(int, int, str, object)
+    log_msg  = Signal(str)
+    finished = Signal(str)
+
+    def __init__(self, wells: list, pipeline_dict_fn, bf_cfg: dict | None,
+                 output_dir: Path, experiment: str):
+        super().__init__()
+        self._wells = wells
+        self._pipeline_dict_fn = pipeline_dict_fn
+        self._bf_cfg = bf_cfg
+        self._output_dir = Path(output_dir)
+        self._experiment = experiment
+        self._abort = False
+
+    def abort(self) -> None:
+        self._abort = True
+
+    def run(self) -> None:
+        try:
+            from correlative_imaging.batch import WellBatchRunner
+
+            total = len(self._wells)
+
+            # ── Ensure a hole ROI exists for every well, reusing from disk ──
+            if self._bf_cfg:
+                missing = [w for w in self._wells if _find_well_roi(w, "hole") is None]
+                if missing:
+                    self.log_msg.emit(
+                        f"Generating hole ROI for {len(missing)}/{total} well(s) "
+                        f"({total - len(missing)} reused from disk) …"
+                    )
+                    bf_worker = _BFWorker(missing, self._bf_cfg, test_mode=False)
+                    bf_worker.log_msg.connect(lambda m: self.log_msg.emit(f"[BF] {m}"))
+                    bf_worker.run()   # synchronous call — reuses its logic on this thread
+                else:
+                    self.log_msg.emit(f"All {total} well(s) already have a hole ROI on disk.")
+
+            if self._abort:
+                self.log_msg.emit("Aborted before FL analysis.")
+                self.finished.emit("")
+                return
+
+            db_path = self._output_dir / "results.db"
+            runner = WellBatchRunner(db_path=db_path, experiment=self._experiment)
+
+            def _cb(current, total_, name, n_particles):
+                self.progress.emit(current, total_, name, n_particles)
+                icon   = "✓" if n_particles is not None else "✗"
+                detail = f"({n_particles} particles)" if n_particles is not None else "(error)"
+                self.log_msg.emit(f"{icon}  {name}  {detail}")
+
+            runner.run_wells(
+                self._wells,
+                pipeline_dict_fn=self._pipeline_dict_fn,
+                progress_fn=_cb,
+                should_abort=lambda: self._abort,
+            )
+            self.finished.emit("" if self._abort else str(db_path))
         except Exception:
             self.log_msg.emit(traceback.format_exc())
             self.finished.emit("")
@@ -345,6 +440,9 @@ _WELL_STATUS_COLORS = {
 _STEP_COLORMAPS = ["green", "cyan", "magenta", "yellow", "red", "blue", "orange", "gray"]
 
 
+_ROI_BADGE_COLOR = "#FFEB3B"  # border color marking a well with ROI file(s)
+
+
 class _WellButton(QPushButton):
     """Single cell in the plate grid."""
 
@@ -354,15 +452,20 @@ class _WellButton(QPushButton):
         self.setFixedSize(24, 24)
         self.setToolTip(well_id)
         self.setText("")
+        self._has_roi = False
         self._apply("empty")
 
-    def set_status(self, status: str) -> None:
+    def set_status(self, status: str, has_roi: bool | None = None) -> None:
+        if has_roi is not None:
+            self._has_roi = has_roi
         self._apply(status)
+        self.setToolTip(f"{self.well_id}  (has ROI)" if self._has_roi else self.well_id)
 
     def _apply(self, status: str) -> None:
         c = _WELL_STATUS_COLORS.get(status, _WELL_STATUS_COLORS["empty"])
+        border = f"2px solid {_ROI_BADGE_COLOR}" if self._has_roi else "1px solid #222"
         self.setStyleSheet(
-            f"background-color:{c}; border:1px solid #222; border-radius:2px;"
+            f"background-color:{c}; border:{border}; border-radius:2px;"
         )
 
 
@@ -376,6 +479,7 @@ class _PlateGrid(QWidget):
         self._btns: dict[str, _WellButton] = {}
         self._selected: str | None = None
         self._prev_status: dict[str, str] = {}   # to restore colour on deselect
+        self._has_roi: dict[str, bool] = {}
         self._build()
 
     def _build(self) -> None:
@@ -409,22 +513,25 @@ class _PlateGrid(QWidget):
     def _on_click(self, well_id: str) -> None:
         if self._selected and self._selected != well_id:
             self._btns[self._selected].set_status(
-                self._prev_status.get(self._selected, "empty")
+                self._prev_status.get(self._selected, "empty"),
+                self._has_roi.get(self._selected, False),
             )
         self._selected = well_id
         self._prev_status[well_id] = self._prev_status.get(well_id, "empty")
-        self._btns[well_id].set_status("selected")
+        self._btns[well_id].set_status("selected", self._has_roi.get(well_id, False))
         self.well_clicked.emit(well_id)
 
-    def set_well_status(self, well_id: str, status: str) -> None:
+    def set_well_status(self, well_id: str, status: str, has_roi: bool = False) -> None:
         if well_id in self._btns:
             self._prev_status[well_id] = status
+            self._has_roi[well_id] = has_roi
             if well_id != self._selected:
-                self._btns[well_id].set_status(status)
+                self._btns[well_id].set_status(status, has_roi)
 
     def clear_all(self) -> None:
         self._selected = None
         self._prev_status.clear()
+        self._has_roi.clear()
         for btn in self._btns.values():
             btn.set_status("empty")
 
@@ -439,7 +546,8 @@ class PlateTab(QWidget):
 
     channels_ready = Signal(list)   # list[str] channel names after sample load
     well_selected  = Signal(object) # WellInfo when a well is clicked
-    view_requested = Signal(object, str)  # (WellInfo, "bf" | "fl")
+    view_requested = Signal(object, str, str)  # (WellInfo, "bf" | "fl", projection)
+    overview_requested = Signal(object, str)  # (WellInfo, projection) — BF + FL + ROI
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -505,6 +613,11 @@ class PlateTab(QWidget):
             lbl = QLabel(text); lbl.setStyleSheet("font-size:10px;")
             legend.addWidget(lbl)
             legend.addSpacing(6)
+        roi_dot = QLabel("▢")
+        roi_dot.setStyleSheet(f"color:{_ROI_BADGE_COLOR}; font-size:14px; font-weight:bold;")
+        legend.addWidget(roi_dot)
+        roi_lbl = QLabel("Has ROI"); roi_lbl.setStyleSheet("font-size:10px;")
+        legend.addWidget(roi_lbl)
         legend.addStretch()
         gl.addLayout(legend)
 
@@ -534,16 +647,32 @@ class PlateTab(QWidget):
         self._auto_roi_cb.setChecked(True)
         dl.addRow(self._auto_roi_cb)
 
+        proj_row = QHBoxLayout()
+        proj_row.addWidget(QLabel("Projection:"))
+        self._view_proj_combo = QComboBox()
+        self._view_proj_combo.addItems(["max", "min", "mean", "sum"])
+        self._view_proj_combo.setToolTip(
+            "Z-projection method used when showing images below (no effect on 2-D images)."
+        )
+        proj_row.addWidget(self._view_proj_combo)
+        proj_row.addStretch()
+        dl.addRow(proj_row)
+
         view_row = QHBoxLayout()
-        self._view_bf_btn = QPushButton("Show BF in viewer")
-        self._view_fl_btn = QPushButton("Show FL in viewer")
+        self._view_bf_btn  = QPushButton("Show BF in viewer")
+        self._view_fl_btn  = QPushButton("Show FL in viewer")
+        self._view_all_btn = QPushButton("Show BF + FL + ROI overview")
+        self._view_all_btn.setStyleSheet("font-weight:bold")
         self._view_bf_btn.setEnabled(False)
         self._view_fl_btn.setEnabled(False)
+        self._view_all_btn.setEnabled(False)
         self._view_bf_btn.clicked.connect(lambda: self._on_view("bf"))
         self._view_fl_btn.clicked.connect(lambda: self._on_view("fl"))
+        self._view_all_btn.clicked.connect(self._on_view_all)
         view_row.addWidget(self._view_bf_btn)
         view_row.addWidget(self._view_fl_btn)
         dl.addRow(view_row)
+        dl.addRow(self._view_all_btn)
 
         self._load_btn = QPushButton(
             "Load selected well as sample → configure Channels & ROI tabs"
@@ -607,9 +736,11 @@ class PlateTab(QWidget):
         ext       = self._ext_edit.text().strip() or ".vsi"
         contains  = self._contains_edit.text().strip()
         recursive = self._recursive_cb.isChecked()
+        bf_roi_dir = self.output_dir / "bf_pipeline" / "rois"
         try:
             wells = scan_plate_folder(folder, extension=ext,
-                                      contains=contains, recursive=recursive)
+                                      contains=contains, recursive=recursive,
+                                      extra_roi_dirs=[bf_roi_dir])
         except Exception as exc:
             QMessageBox.critical(self, "Scan failed", str(exc))
             return
@@ -619,7 +750,8 @@ class PlateTab(QWidget):
         for w in wells:
             self._wells[w.well_id] = w
             self._grid.set_well_status(w.well_id,
-                                       "complete" if w.is_complete else "bf_only")
+                                       "complete" if w.is_complete else "bf_only",
+                                       has_roi=bool(w.roi_paths))
 
         n_complete = sum(1 for w in wells if w.is_complete)
         n_roi      = sum(1 for w in wells if w.roi_paths)
@@ -642,6 +774,7 @@ class PlateTab(QWidget):
             self._d_roi.setText("none detected")
         self._view_bf_btn.setEnabled(w.bf_path is not None)
         self._view_fl_btn.setEnabled(w.fl_path is not None)
+        self._view_all_btn.setEnabled(w.bf_path is not None or w.fl_path is not None)
         self._load_btn.setEnabled(True)
         self.well_selected.emit(w)
 
@@ -649,7 +782,13 @@ class PlateTab(QWidget):
         wid = self._grid._selected
         w = self._wells.get(wid) if wid else None
         if w:
-            self.view_requested.emit(w, which)
+            self.view_requested.emit(w, which, self._view_proj_combo.currentText())
+
+    def _on_view_all(self) -> None:
+        wid = self._grid._selected
+        w = self._wells.get(wid) if wid else None
+        if w:
+            self.overview_requested.emit(w, self._view_proj_combo.currentText())
 
     def _on_load_sample(self) -> None:
         wid = self._grid._selected
@@ -686,6 +825,9 @@ class PlateTab(QWidget):
     def get_selected_well(self):
         wid = self._grid._selected
         return self._wells.get(wid) if wid else None
+
+    def get_all_wells(self) -> list:
+        return list(self._wells.values())
 
     @property
     def input_dir(self) -> Path | None:
@@ -929,11 +1071,11 @@ class BFPipelineTab(QWidget):
         if ch_vis is not None:
             self._viewer.add_image(ch_vis, name=f"BF proj/{well_id}", colormap="gray")
         self._viewer.add_labels(seg, name=f"Segmentation/{well_id}", opacity=0.45)
-        for lbl, mask in masks.items():
+        for i, (kind, mask) in enumerate(masks.items(), start=1):
             if mask.max() > 0:
                 self._viewer.add_labels(
-                    mask.astype("int32") * lbl,
-                    name=f"ROI label{lbl}/{well_id}", opacity=0.5,
+                    mask.astype("int32") * i,
+                    name=f"{kind}/{well_id}", opacity=0.5,
                 )
         self._log(
             f"  → napari: BF projection + segmentation map + {len(masks)} ROI(s) loaded."
@@ -980,6 +1122,16 @@ class BFPipelineTab(QWidget):
         self._run_btn.setEnabled(True)
         self._abort_btn.setEnabled(False)
         self._log(f"Done — {n_ok} ROIs saved, {n_err} errors.")
+
+        # Refresh the plate grid's ROI badge immediately, without requiring a rescan.
+        plate = self._get_plate_tab()
+        if plate is not None and self._worker is not None:
+            for well in self._worker._wells:
+                plate._grid.set_well_status(
+                    well.well_id,
+                    "complete" if well.is_complete else "bf_only",
+                    has_roi=bool(well.roi_paths),
+                )
 
     def _log(self, msg: str) -> None:
         self._log_edit.append(msg)
@@ -1165,10 +1317,19 @@ class _BFWorker(QThread):
                 self.finished.emit(n_ok, n_err + len(h5_stems))
                 return
 
-            # ── Phase 3: read segmentation labels, save ROIs ──────────
-            # Simple Segmentation → integer label per pixel.
-            # Background = label with largest area.  Everything else = foreground ROI.
-            self.log_msg.emit("Phase 3/3 — extracting ROIs …")
+            # ── Phase 3: read segmentation labels, pick the hole by roundness ──
+            # Simple Segmentation → integer label per pixel. The hole is the
+            # single most circular, sufficiently large connected component
+            # across ALL non-zero labels — not "whichever label isn't the
+            # largest" (a large round hole can legitimately be the majority
+            # class and would otherwise be misclassified as background).
+            # Everything outside the hole becomes the background ROI.
+            from skimage.measure import label as _cc_label, regionprops as _regionprops
+
+            min_area = cfg["min_area_px"]
+            min_circ = cfg["min_circularity"]
+
+            self.log_msg.emit("Phase 3/3 — extracting hole/background ROIs …")
             for j, (stem, h5_out) in enumerate(zip(h5_stems, output_h5s)):
                 if self._abort:
                     self.log_msg.emit("Aborted.")
@@ -1182,17 +1343,41 @@ class _BFWorker(QThread):
                         seg = f["exported_data"][()]
                     seg = np.squeeze(seg).astype(np.int32)   # (H, W)
 
-                    unique_labels = [int(l) for l in np.unique(seg)]
-                    areas    = {l: int((seg == l).sum()) for l in unique_labels}
-                    total_px = seg.size
-                    bg_label = max(areas, key=lambda l: areas[l])
+                    unique_labels = [int(l) for l in np.unique(seg) if l != 0]
 
-                    info = ", ".join(
-                        f"lbl{l}={areas[l]/total_px*100:.1f}%"
-                        for l in unique_labels
-                    )
+                    best_mask  = None
+                    best_label = None
+                    best_score = -1.0
+                    for lbl in unique_labels:
+                        comps = _regionprops(_cc_label(seg == lbl))
+                        if not comps:
+                            continue
+                        comp = max(comps, key=lambda p: p.area)
+                        if comp.area < min_area or comp.perimeter <= 0:
+                            continue
+                        circ = 4 * np.pi * comp.area / comp.perimeter ** 2
+                        if circ < min_circ:
+                            continue
+                        score = comp.area * circ
+                        if score > best_score:
+                            best_score = score
+                            best_label = lbl
+                            best_mask = (_cc_label(seg == lbl) == comp.label)
+
+                    if best_mask is None:
+                        self.log_msg.emit(
+                            f"  ✗ {well.well_id}: no component passed the "
+                            f"area (≥{min_area}px) / circularity (≥{min_circ}) filters"
+                        )
+                        n_err += 1
+                        continue
+
+                    hole_mask = best_mask.astype(np.uint8)
+                    background_mask = (1 - hole_mask).astype(np.uint8)
+                    coverage = float(hole_mask.mean()) * 100
                     self.log_msg.emit(
-                        f"  {well.well_id}: {info}  (bg=lbl{bg_label})"
+                        f"  {well.well_id}: hole=label{best_label} "
+                        f"coverage={coverage:.2f}% score={best_score:.1f}"
                     )
 
                     # Save segmentation map for reference
@@ -1201,28 +1386,32 @@ class _BFWorker(QThread):
                         tifffile.imwrite(str(seg_out), seg.astype(np.uint8))
                         self.log_msg.emit(f"    seg map → {seg_out.name}")
 
-                    masks: dict[int, np.ndarray] = {}
+                    masks = {"hole": hole_mask, "background": background_mask}
                     well_ok = False
-                    for lbl in unique_labels:
-                        if lbl == bg_label:
-                            continue
-                        mask = (seg == lbl).astype(np.uint8)
-                        masks[lbl] = mask
-                        coverage = float(mask.mean()) * 100
-
-                        roi_path = (roi_dir / f"{well.well_id}_label{lbl}.roi") \
-                                   if roi_dir \
-                                   else well.bf_path.parent / f"{stem}_label{lbl}.roi"
+                    for kind, mask in masks.items():
+                        # The hole is a single round blob — a simple ImageJ
+                        # polygon represents it fine. The background is the
+                        # hole's complement (the frame with the hole punched
+                        # out): that has an outer contour AND an inner one,
+                        # which a single simple polygon can't represent (it
+                        # would silently save the full-frame rectangle and
+                        # lose the hole). Save it as a binary mask instead.
+                        if kind == "hole":
+                            fname = _roi_filename_for_well(well, kind, ext=".roi")
+                            roi_path = (roi_dir / fname) if roi_dir else well.bf_path.parent / fname
+                            save_fn = _save_roi
+                        else:
+                            fname = _roi_filename_for_well(well, kind, ext=".tif")
+                            roi_path = (roi_dir / fname) if roi_dir else well.bf_path.parent / fname
+                            save_fn = _save_binary_mask
                         try:
-                            _save_roi(mask, roi_path)
+                            save_fn(mask, roi_path)
                             if roi_path not in well.roi_paths:
                                 well.roi_paths.append(roi_path)
-                            self.log_msg.emit(
-                                f"    label {lbl}: {coverage:.2f}% → {roi_path}"
-                            )
+                            self.log_msg.emit(f"    {kind} → {roi_path}")
                             well_ok = True
                         except Exception as e:
-                            self.log_msg.emit(f"    label {lbl}: {e}")
+                            self.log_msg.emit(f"    {kind}: {e}")
 
                     if well_ok:
                         n_ok += 1
@@ -1247,6 +1436,57 @@ class _BFWorker(QThread):
 def _find_ilastik_exe() -> str | None:
     from correlative_imaging.pipeline.ilastik import _find_ilastik_exe as _f
     return _f()
+
+
+def _roi_filename_for_well(well, kind: str, ext: str = ".roi") -> str:
+    """Build an ROI filename that embeds the well coordinate so
+    ``io.plate._WELL_COORD_RE`` can find it on a fresh plate scan.
+    """
+    return f"_{well.row}{well.col}-{well.field}_{kind}{ext}"
+
+
+def _classify_roi_path(path: Path) -> str:
+    """Classify a well's ROI file by its BF-pipeline-owned suffix.
+
+    Returns ``"hole"`` / ``"background"`` for files saved by the BF Pipeline
+    tab (see ``_roi_filename_for_well``), or ``"existing"`` for anything else
+    (pre-existing ROI files from other tools / prior projects).
+    """
+    stem = Path(path).stem
+    if stem.endswith("_hole"):
+        return "hole"
+    if stem.endswith("_background"):
+        return "background"
+    return "existing"
+
+
+def _find_well_roi(well, kind: str) -> Path | None:
+    """Return the first of a well's ROI files classified as *kind*
+    (``"hole"``, ``"background"``, or ``"existing"``), or ``None``.
+    """
+    for p in well.roi_paths:
+        if _classify_roi_path(p) == kind:
+            return p
+    return None
+
+
+def _load_roi_mask(path: Path, h: int, w: int) -> np.ndarray | None:
+    """Load an ROI file as a boolean (h, w) mask for viewer overlay, reusing
+    LoadROI's own format handling. Returns None (logged) on failure rather
+    than raising, since this is a best-effort display overlay.
+    """
+    from correlative_imaging.pipeline.segment import LoadROI
+
+    path = Path(path)
+    try:
+        suffix = path.suffix.lower()
+        if suffix in {".roi", ".zip"}:
+            return LoadROI._from_imagej(path, h, w)
+        if suffix in {".tif", ".tiff", ".png", ".bmp"}:
+            return LoadROI._from_image(path, h, w)
+    except Exception:
+        log.warning("Could not load ROI overlay %s", path, exc_info=True)
+    return None
 
 
 def _save_roi(mask: np.ndarray, path: Path) -> None:
@@ -1282,6 +1522,20 @@ def _save_roi(mask: np.ndarray, path: Path) -> None:
         tiff_path = path.with_suffix(".tif")
         tifffile.imwrite(str(tiff_path), mask)
         log.warning("roifile not installed — saved mask as TIFF: %s", tiff_path.name)
+
+
+def _save_binary_mask(mask: np.ndarray, path: Path) -> None:
+    """Save a binary mask as a plain TIFF (0/255).
+
+    Used for masks that a single simple ImageJ polygon can't represent —
+    e.g. the background ROI (the frame with the hole punched out) has an
+    outer contour *and* an inner one; ``_save_roi``'s single-polygon
+    approach would silently save just the outer (full-frame) rectangle.
+    """
+    import tifffile
+    if mask.max() == 0:
+        raise RuntimeError("Mask is empty — no foreground pixels.")
+    tifffile.imwrite(str(path), (mask.astype("uint8") * 255))
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -1559,7 +1813,8 @@ class ChannelsTab(QWidget):
 class _ROISel:
     """Data object holding one ROI selection's configuration."""
     label: str     = "Whole image"
-    source: str    = "whole"        # "whole" | "auto" | "file"
+    # "whole" | "auto" | "file" | "well_hole" | "well_existing"
+    source: str    = "whole"
     channel: int   = 0
     blur: float    = 20.0
     method: str    = "otsu"
@@ -1576,12 +1831,24 @@ class _ROISel:
         return f"roi_{slug}" if slug else "roi"
 
     def list_label(self) -> str:
-        src = {"whole": "whole image",
-               "auto":  f"auto ch{self.channel}",
-               "file":  Path(self.path).name if self.path else "(no file)"}.get(self.source, self.source)
+        src = {"whole":        "whole image",
+               "auto":         f"auto ch{self.channel}",
+               "file":         Path(self.path).name if self.path else "(no file)",
+               "well_hole":    "BF-pipeline hole ROI (per well)",
+               "well_existing":"existing project ROI (per well)"}.get(self.source, self.source)
         return f"{self.label}  [{src}]"
 
-    def get_roi_step(self) -> dict | None:
+    def get_roi_step(self, well=None) -> dict | None:
+        """Build this selection's ROI-extraction step dict.
+
+        ``well`` resolves the two per-well-dynamic sources against that
+        well's ``roi_paths`` (see ``_find_well_roi``). It's ``None`` during
+        single-image preview, or when a well genuinely has no matching ROI —
+        in both cases this returns ``None`` and the caller (see
+        ``CorrelativeImagingWidget.build_pipeline_dict``) skips this
+        selection's analysis steps entirely rather than silently analyzing
+        the whole image under a mask_key that implies it's ROI-restricted.
+        """
         if self.source == "whole":
             return None
         if self.source == "auto":
@@ -1589,6 +1856,15 @@ class _ROISel:
                     "blur_sigma": self.blur, "method": self.method, "roi_name": self.mask_key}
         if self.source == "file" and self.path:
             return {"type": "LoadROI", "path": self.path, "roi_name": self.mask_key}
+        if self.source in ("well_hole", "well_existing") and well is not None:
+            kind = "hole" if self.source == "well_hole" else "existing"
+            resolved = _find_well_roi(well, kind)
+            if resolved is not None:
+                return {"type": "LoadROI", "path": str(resolved), "roi_name": self.mask_key}
+            log.warning(
+                "ROI selection '%s': no %s ROI found for well %s — skipped",
+                self.label, kind, getattr(well, "well_id", "?"),
+            )
         return None
 
 
@@ -1669,10 +1945,23 @@ class ROISelectionsTab(QWidget):
         self._rb_whole = QRadioButton("Whole image  (no restriction)")
         self._rb_auto  = QRadioButton("Auto-detect from channel")
         self._rb_file  = QRadioButton("Import from file  (.roi / .zip / .tif)")
+        self._rb_well_hole = QRadioButton("BF-pipeline hole ROI  (per well, batch only)")
+        self._rb_well_existing = QRadioButton("Existing project ROI  (per well, batch only)")
         self._rb_whole.setChecked(True)
-        for rb in [self._rb_whole, self._rb_auto, self._rb_file]:
+        for rb in [self._rb_whole, self._rb_auto, self._rb_file,
+                   self._rb_well_hole, self._rb_well_existing]:
             self._src_grp.addButton(rb)
             dfl.addRow(rb)
+        note2 = QLabel(
+            "The two “per well” sources are resolved separately for each "
+            "well during a batch run (BF-pipeline hole ROI is reused from disk "
+            "if present, else generated on the fly; existing project ROI is "
+            "matched by well coordinate). During single-image preview they "
+            "contribute no restriction."
+        )
+        note2.setWordWrap(True)
+        note2.setStyleSheet("color: gray; font-size: 10px;")
+        dfl.addRow(note2)
 
         # Auto-detect sub-group
         self._auto_grp = QGroupBox("Auto-detect options")
@@ -1770,7 +2059,10 @@ class ROISelectionsTab(QWidget):
     def _load_form(self, sel: _ROISel) -> None:
         self._loading = True
         self._lbl_edit.setText(sel.label)
-        rb_map = {"whole": self._rb_whole, "auto": self._rb_auto, "file": self._rb_file}
+        rb_map = {
+            "whole": self._rb_whole, "auto": self._rb_auto, "file": self._rb_file,
+            "well_hole": self._rb_well_hole, "well_existing": self._rb_well_existing,
+        }
         rb_map.get(sel.source, self._rb_whole).setChecked(True)
         self._auto_grp.setVisible(sel.source == "auto")
         self._file_grp.setVisible(sel.source == "file")
@@ -1785,8 +2077,11 @@ class ROISelectionsTab(QWidget):
 
     def _save_form(self, sel: _ROISel) -> None:
         sel.label  = self._lbl_edit.text().strip() or sel.label
-        sel.source = ("whole" if self._rb_whole.isChecked() else
-                      "auto"  if self._rb_auto.isChecked()  else "file")
+        sel.source = ("whole"         if self._rb_whole.isChecked() else
+                      "auto"          if self._rb_auto.isChecked()  else
+                      "well_hole"     if self._rb_well_hole.isChecked() else
+                      "well_existing" if self._rb_well_existing.isChecked() else
+                      "file")
         sel.channel    = self._ch_combo.currentIndex()
         sel.blur       = self._blur_spin.value()
         sel.method     = self._thresh_cb.currentText()
@@ -2064,12 +2359,15 @@ class AdvancedPipelineTab(QWidget):
 # ──────────────────────────────────────────────────────────────────
 
 class RunTab(QWidget):
-    def __init__(self, get_setup, get_pipeline_dict, napari_viewer=None, parent=None):
+    def __init__(self, get_setup, get_pipeline_dict, get_bf_config=None,
+                 make_well_pipeline_dict_fn=None, napari_viewer=None, parent=None):
         super().__init__(parent)
         self._get_setup         = get_setup
         self._get_pipeline_dict = get_pipeline_dict
+        self._get_bf_config     = get_bf_config
+        self._make_well_pipeline_dict_fn = make_well_pipeline_dict_fn
         self._viewer            = napari_viewer
-        self._worker: _BatchWorker | None = None
+        self._worker: _BatchWorker | _WellBatchWorker | None = None
         self._build()
 
     def _build(self) -> None:
@@ -2101,6 +2399,28 @@ class RunTab(QWidget):
         gamma_row.addWidget(self._gamma_slider)
         gamma_row.addWidget(self._gamma_lbl)
         pl.addLayout(gamma_row)
+
+        contrast_row = QHBoxLayout()
+        contrast_row.addWidget(QLabel("Contrast min/max:"))
+        self._contrast_min = QDoubleSpinBox()
+        self._contrast_max = QDoubleSpinBox()
+        for spin in (self._contrast_min, self._contrast_max):
+            spin.setRange(-1e9, 1e9)
+            spin.setDecimals(2)
+        self._contrast_max.setValue(1.0)
+        auto_contrast_btn = QPushButton("Auto")
+        auto_contrast_btn.setToolTip(
+            "Reset to a 1st–99.5th percentile stretch, computed from the "
+            "current layer's data (same default used when layers are added)."
+        )
+        auto_contrast_btn.clicked.connect(self._on_auto_contrast)
+        apply_contrast_btn = QPushButton("Apply")
+        apply_contrast_btn.clicked.connect(self._on_apply_contrast)
+        contrast_row.addWidget(self._contrast_min)
+        contrast_row.addWidget(self._contrast_max)
+        contrast_row.addWidget(auto_contrast_btn)
+        contrast_row.addWidget(apply_contrast_btn)
+        pl.addLayout(contrast_row)
         lay.addWidget(prev_box)
 
         exp_box = QGroupBox("Pipeline JSON")
@@ -2149,6 +2469,38 @@ class RunTab(QWidget):
         for layer in self._viewer.layers:
             if isinstance(layer, Image):
                 layer.gamma = gamma
+
+    def _on_auto_contrast(self) -> None:
+        """Reset every visible Image layer to a percentile-stretched
+        contrast range and reflect the (first layer's) values in the spinboxes.
+        """
+        if self._viewer is None:
+            return
+        from napari.layers import Image
+        from correlative_imaging.viewer.napari_viewer import auto_contrast_limits
+
+        first = True
+        for layer in self._viewer.layers:
+            if isinstance(layer, Image):
+                lo, hi = auto_contrast_limits(layer.data)
+                layer.contrast_limits = (lo, hi)
+                if first:
+                    self._contrast_min.setValue(lo)
+                    self._contrast_max.setValue(hi)
+                    first = False
+
+    def _on_apply_contrast(self) -> None:
+        """Apply the spinbox min/max to every Image layer currently in the viewer."""
+        if self._viewer is None:
+            return
+        lo, hi = self._contrast_min.value(), self._contrast_max.value()
+        if hi <= lo:
+            QMessageBox.information(self, "Invalid range", "Max must be greater than min.")
+            return
+        from napari.layers import Image
+        for layer in self._viewer.layers:
+            if isinstance(layer, Image):
+                layer.contrast_limits = (lo, hi)
 
     def _on_preview(self) -> None:
         setup    = self._get_setup()
@@ -2210,6 +2562,7 @@ class RunTab(QWidget):
                             mip[step_ch], name=f"{step_name}/{ch}",
                             visible=False, blending="additive",
                             colormap=cmap, scale=scale,
+                            contrast_limits=auto_contrast_limits(mip[step_ch]),
                         )
                     else:
                         # Multi-channel step — show all channels
@@ -2218,6 +2571,7 @@ class RunTab(QWidget):
                                 mip[i], name=f"{step_name}/{ch}",
                                 visible=False, blending="additive",
                                 colormap=cmap, scale=scale,
+                                contrast_limits=auto_contrast_limits(mip[i]),
                             )
                 for mk, mask in result.masks.items():
                     if int(mask.max()) > 1:
@@ -2230,9 +2584,11 @@ class RunTab(QWidget):
                         )
                         lyr.contour = 1
                     else:
+                        mask_f = mask.astype(float)
                         self._viewer.add_image(
-                            mask.astype(float), name=f"{step_name}/{mk}",
+                            mask_f, name=f"{step_name}/{mk}",
                             colormap=cmap, blending="additive", opacity=0.4, scale=scale,
+                            contrast_limits=auto_contrast_limits(mask_f),
                         )
                 self._log(f"  ✓ {step_name}")
 
@@ -2279,7 +2635,21 @@ class RunTab(QWidget):
         setup.output_dir.mkdir(parents=True, exist_ok=True)
         self._bar.setValue(0); self._run_btn.setEnabled(False); self._abort_btn.setEnabled(True)
         self._log("Starting batch …")
-        self._worker = _BatchWorker(pl_dict, setup.input_dir, setup.output_dir, setup.experiment)
+
+        wells = setup.get_all_wells() if hasattr(setup, "get_all_wells") else []
+        if wells and self._make_well_pipeline_dict_fn is not None:
+            pipeline_dict_fn, needs_hole_roi = self._make_well_pipeline_dict_fn()
+            bf_cfg = self._get_bf_config() if (needs_hole_roi and self._get_bf_config) else None
+            if bf_cfg and not bf_cfg.get("save_dir"):
+                # Mirror BFPipelineTab.run_on_wells: without this, a missing
+                # "Save ROIs to" falls back to writing ROI files next to the
+                # source BF image — often a read-only/slow network data share.
+                bf_cfg["output_dir"] = str(setup.output_dir)
+            self._worker = _WellBatchWorker(
+                wells, pipeline_dict_fn, bf_cfg, setup.output_dir, setup.experiment,
+            )
+        else:
+            self._worker = _BatchWorker(pl_dict, setup.input_dir, setup.output_dir, setup.experiment)
         self._worker.progress.connect(self._on_progress)
         self._worker.log_msg.connect(self._log)
         self._worker.finished.connect(self._on_finished)
@@ -2322,6 +2692,8 @@ class CorrelativeImagingWidget(QWidget):
         self._run_tab      = RunTab(
             get_setup         = lambda: self._plate_tab,
             get_pipeline_dict = self.build_pipeline_dict,
+            get_bf_config     = self._bf_tab.get_config,
+            make_well_pipeline_dict_fn = self.make_well_pipeline_dict_fn,
             napari_viewer     = napari_viewer,
         )
 
@@ -2339,6 +2711,7 @@ class CorrelativeImagingWidget(QWidget):
         self._plate_tab.channels_ready.connect(self._on_channels_ready)
         self._plate_tab.well_selected.connect(self._on_well_selected)
         self._plate_tab.view_requested.connect(self._on_view_requested)
+        self._plate_tab.overview_requested.connect(self._on_overview_requested)
 
         self._view_cache: dict[tuple, object] = {}  # (well_id, "bf"/"fl") → image_data
         self._view_worker = None
@@ -2347,20 +2720,58 @@ class CorrelativeImagingWidget(QWidget):
         root.addWidget(self._tabs)
         self.setMinimumWidth(420)
 
-    def _show_in_viewer(self, image_data, label: str) -> None:
-        self._viewer.layers.clear()
+    def _add_image_layers(self, image_data, label: str, projection: str) -> None:
         try:
             from correlative_imaging.viewer.napari_viewer import NapariViewer
             nv = NapariViewer.__new__(NapariViewer); nv._viewer = self._viewer
-            nv.show_image(image_data, group=label)
+            nv.show_image(image_data, group=label, projection=projection)
         except Exception:
             px = image_data.pixel_size_um; scale = [px, px]
-            mip = image_data.max_project()
+            # ImageData.data always keeps the channel axis first (C,Y,X) or
+            # (C,Z,Y,X) per its contract, so .project() always returns (C,Y,X).
+            mip = image_data.project(projection)
             for i, ch in enumerate(image_data.channel_names):
                 self._viewer.add_image(mip[i], name=f"{label}/{ch}",
-                                       blending="additive", scale=scale)
+                                       blending="additive", scale=scale,
+                                       contrast_limits=auto_contrast_limits(mip[i]))
 
-    def _on_view_requested(self, well, which: str) -> None:
+    def _add_roi_overlays(self, well, shape_yx: tuple) -> None:
+        # Separate Labels layers per ROI kind — napari's own layer-visibility
+        # checkboxes double as the "toggle one ROI type vs another" control,
+        # so no extra UI is needed to switch between them.
+        if well is None or not well.roi_paths:
+            return
+        h, w = shape_yx
+        for p in well.roi_paths:
+            mask = _load_roi_mask(p, h, w)
+            if mask is None or not mask.any():
+                continue
+            kind = _classify_roi_path(p)
+            lyr = self._viewer.add_labels(
+                mask.astype(int), name=f"roi_{kind}/{well.well_id}",
+                opacity=0.4, visible=(kind == "hole"),
+            )
+            lyr.contour = 1
+
+    def _show_in_viewer(self, image_data, label: str, well=None, projection: str = "max") -> None:
+        self._viewer.layers.clear()
+        self._add_image_layers(image_data, label, projection)
+        if well is not None:
+            self._add_roi_overlays(well, image_data.data.shape[-2:])
+
+    def _show_well_overview(self, well, bf_data, fl_data, projection: str) -> None:
+        self._viewer.layers.clear()
+        shape_yx = None
+        if bf_data is not None:
+            self._add_image_layers(bf_data, "BF", projection)
+            shape_yx = bf_data.data.shape[-2:]
+        if fl_data is not None:
+            self._add_image_layers(fl_data, "FL", projection)
+            shape_yx = shape_yx or fl_data.data.shape[-2:]
+        if shape_yx is not None:
+            self._add_roi_overlays(well, shape_yx)
+
+    def _on_view_requested(self, well, which: str, projection: str = "max") -> None:
         if self._viewer is None:
             return
         path = well.bf_path if which == "bf" else well.fl_path
@@ -2370,18 +2781,48 @@ class CorrelativeImagingWidget(QWidget):
         cache_key = (well.well_id, which)
 
         if cache_key in self._view_cache:
-            self._show_in_viewer(self._view_cache[cache_key], label)
+            self._show_in_viewer(self._view_cache[cache_key], label, well, projection)
             return
 
         def _loaded(image_data):
             self._view_cache[cache_key] = image_data
-            self._show_in_viewer(image_data, label)
+            self._show_in_viewer(image_data, label, well, projection)
 
         self._view_worker = _LoadImageWorker(path)
         self._view_worker.loaded.connect(_loaded)
         self._view_worker.error.connect(lambda msg: None)
         self._view_worker.start()
         self._viewer.status = f"Loading {label} for well {well.well_id} …"
+
+    def _on_overview_requested(self, well, projection: str = "max") -> None:
+        """Show BF + FL + this well's ROI(s) together, for the Setup tab's
+        combined "Show BF + FL + ROI overview" button.
+        """
+        if self._viewer is None:
+            return
+        bf_key, fl_key = (well.well_id, "bf"), (well.well_id, "fl")
+        cached_bf = self._view_cache.get(bf_key)
+        cached_fl = self._view_cache.get(fl_key)
+        bf_ready = well.bf_path is None or cached_bf is not None
+        fl_ready = well.fl_path is None or cached_fl is not None
+        if bf_ready and fl_ready:
+            self._show_well_overview(well, cached_bf, cached_fl, projection)
+            return
+
+        def _loaded(bf_data, fl_data):
+            if bf_data is not None:
+                self._view_cache[bf_key] = bf_data
+            if fl_data is not None:
+                self._view_cache[fl_key] = fl_data
+            self._show_well_overview(well, bf_data, fl_data, projection)
+
+        self._view_worker = _LoadWellWorker(well)
+        self._view_worker.loaded.connect(_loaded)
+        self._view_worker.error.connect(
+            lambda msg: QMessageBox.critical(self, "Load error", msg)
+        )
+        self._view_worker.start()
+        self._viewer.status = f"Loading BF + FL for well {well.well_id} …"
 
     def _on_well_selected(self, well) -> None:
         if self._plate_tab._auto_roi_cb.isChecked() and well.roi_paths:
@@ -2405,7 +2846,7 @@ class CorrelativeImagingWidget(QWidget):
         self._advanced_tab.set_channel_names(channel_names)
         self._tabs.setCurrentWidget(self._channels_tab)
 
-    def build_pipeline_dict(self) -> dict:
+    def build_pipeline_dict(self, well=None) -> dict:
         """
         Pipeline order:
           1. Preprocessing   — once per channel  (BGSub, Blur, Normalize)
@@ -2414,6 +2855,13 @@ class CorrelativeImagingWidget(QWidget):
                a. ROI extraction (ExtractROI or LoadROI) — skipped for "whole image"
                b. ParticleAnalysis per channel, restricted to that ROI
                c. ColocalizationAnalysis per pair, restricted to that ROI
+
+        ``well`` resolves per-well-dynamic ROI selections ("BF-pipeline hole
+        ROI" / "existing project ROI") against that well's own ROI files —
+        pass it when building a pipeline for one specific well in a batch
+        run. Leave it ``None`` for single-image preview, where those two
+        selections can't resolve and are skipped entirely (not run
+        unrestricted) so they never produce misleadingly-labeled results.
         """
         panels = self._channels_tab.get_panels()
         sels   = self._roi_tab.get_selections()
@@ -2429,7 +2877,9 @@ class CorrelativeImagingWidget(QWidget):
 
         # ── 3. Per ROI selection: ROI mask + particle analysis + colocalization ──
         for sel in sels:
-            roi_step = sel.get_roi_step()
+            roi_step = sel.get_roi_step(well)
+            if sel.source != "whole" and roi_step is None:
+                continue  # per-well or file source didn't resolve — skip this selection
             if roi_step:
                 steps.append(roi_step)
             for p in panels:
@@ -2438,6 +2888,51 @@ class CorrelativeImagingWidget(QWidget):
                 steps.append(coloc)
 
         return {"name": "pipeline", "steps": steps}
+
+    def make_well_pipeline_dict_fn(self):
+        """Snapshot the current Channels/ROI/Combine config into a plain,
+        thread-safe closure ``(well) -> pipeline dict``.
+
+        Returns ``(fn, needs_hole_roi)`` — ``needs_hole_roi`` is True iff at
+        least one selection uses the "BF-pipeline hole ROI" source, so the
+        caller only bothers running Ilastik hole-detection when it's
+        actually needed.
+
+        ``_WellBatchWorker`` calls ``fn`` once per well from a background
+        QThread — it must not touch any QWidget. This method reads all
+        Qt-widget-derived config *here*, on the calling (main GUI) thread,
+        and captures only plain dicts / ``_ROISel`` dataclasses / ``WellInfo``
+        dataclasses, which are safe to read from any thread.
+        """
+        panels = self._channels_tab.get_panels()
+        preprocess_steps: list[dict] = []
+        segment_steps: list[dict] = []
+        for p in panels:
+            preprocess_steps.extend(p.get_preprocess_steps())
+            segment_steps.extend(p.get_segment_steps())
+
+        sels = list(self._roi_tab.get_selections())
+        needs_hole_roi = any(s.source == "well_hole" for s in sels)
+        per_sel_tail: list[tuple] = []
+        for sel in sels:
+            tail: list[dict] = []
+            for p in panels:
+                tail.extend(p.get_analysis_steps(sel.mask_key))
+            tail.extend(self._combine_tab.get_coloc_steps(sel.mask_key))
+            per_sel_tail.append((sel, tail))
+
+        def _fn(well) -> dict:
+            steps = list(preprocess_steps) + list(segment_steps)
+            for sel, tail in per_sel_tail:
+                roi_step = sel.get_roi_step(well)
+                if sel.source != "whole" and roi_step is None:
+                    continue
+                if roi_step:
+                    steps.append(roi_step)
+                steps.extend(tail)
+            return {"name": "pipeline", "steps": steps}
+
+        return _fn, needs_hole_roi
 
 
 # ──────────────────────────────────────────────────────────────────

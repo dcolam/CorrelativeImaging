@@ -18,6 +18,26 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
+def auto_contrast_limits(data: np.ndarray, low: float = 1.0, high: float = 99.5) -> tuple[float, float]:
+    """Robust percentile-based display range for an image layer.
+
+    napari's own default (min/max of the data at add-time) is easily skewed
+    dim by a handful of outlier hot/saturated pixels — common in microscopy
+    images with a stray calibration mark or thumbnail artifact. A percentile
+    stretch is far more representative of the actual signal. Display-only;
+    does not modify the underlying data.
+    """
+    finite = data[np.isfinite(data)] if np.issubdtype(data.dtype, np.floating) else data.ravel()
+    if finite.size == 0:
+        return (0.0, 1.0)
+    lo, hi = (float(v) for v in np.percentile(finite, [low, high]))
+    if hi <= lo:
+        lo, hi = float(finite.min()), float(finite.max())
+        if hi <= lo:
+            hi = lo + 1.0
+    return (lo, hi)
+
+
 def _require_napari():
     try:
         import napari
@@ -50,12 +70,15 @@ class NapariViewer:
     # Layer helpers
     # ------------------------------------------------------------------
 
-    def show_image(self, image_data: ImageData, group: str = "raw") -> None:
-        """Add every channel as a separate napari Image layer."""
+    def show_image(self, image_data: ImageData, group: str = "raw", projection: str = "max") -> None:
+        """Add every channel as a separate napari Image layer.
+
+        projection: 'min' | 'max' | 'mean' | 'sum'  (Z-projection method; no-op for 2-D images).
+        """
         from napari.utils.colormaps import ensure_colormap
 
         colormaps = ["gray", "green", "red", "cyan", "magenta", "yellow"]
-        mip = image_data.max_project()   # (C, Y, X) or (Y, X)
+        mip = image_data.project(projection)   # (C, Y, X) or (Y, X)
         if mip.ndim == 2:
             mip = mip[np.newaxis]        # ensure (C, Y, X) shape
 
@@ -67,6 +90,7 @@ class NapariViewer:
                 colormap=cmap,
                 blending="additive",
                 scale=[image_data.pixel_size_um, image_data.pixel_size_um],
+                contrast_limits=auto_contrast_limits(mip[i]),
             )
 
     def show_mask(
@@ -85,13 +109,15 @@ class NapariViewer:
         if is_labels:
             self._viewer.add_labels(mask.astype(int), name=name, scale=scale)
         else:
+            data = mask.astype(float)
             self._viewer.add_image(
-                mask.astype(float),
+                data,
                 name=name,
                 colormap="red",
                 blending="additive",
                 opacity=0.4,
                 scale=scale,
+                contrast_limits=auto_contrast_limits(data),
             )
 
     def show_measurements(
@@ -150,6 +176,7 @@ class NapariViewer:
                         visible=False,
                         blending="additive",
                         scale=[image_data.pixel_size_um, image_data.pixel_size_um],
+                        contrast_limits=auto_contrast_limits(mip[i]),
                     )
             for mask_name, mask in result.masks.items():
                 self.show_mask(

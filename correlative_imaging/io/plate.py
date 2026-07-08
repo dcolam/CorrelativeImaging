@@ -89,6 +89,7 @@ def scan_plate_folder(
     extension: str = ".vsi",
     contains: str = "",
     recursive: bool = False,
+    extra_roi_dirs: list[str | Path] | None = None,
 ) -> list[WellInfo]:
     """Discover and pair BF/FL files in *folder*.
 
@@ -98,6 +99,9 @@ def scan_plate_folder(
     extension:  File extension to match (leading dot optional, case-insensitive).
     contains:   Optional substring that must appear in each filename.
     recursive:  When True, search subdirectories as well.
+    extra_roi_dirs: Additional folders to search (non-recursively) for ROI
+                    files, e.g. a BF-pipeline output ``rois/`` folder that
+                    lives outside the plate/data folder.
 
     Returns
     -------
@@ -162,6 +166,16 @@ def scan_plate_folder(
     roi_files: list[Path] = []
     for ext in (".roi", ".zip"):
         roi_files.extend(sorted(glob_fn(f"*{ext}")))
+    for extra_dir in extra_roi_dirs or []:
+        extra_dir = Path(extra_dir)
+        if extra_dir.is_dir():
+            # .tif/.tiff included here (but not in the main data-folder glob
+            # above) because extra_roi_dirs is a dedicated ROI output folder
+            # (e.g. the BF pipeline's rois/ dir) — never a folder containing
+            # raw acquisition images, so there's no risk of misclassifying
+            # a plate image as an ROI mask.
+            for ext in (".roi", ".zip", ".tif", ".tiff"):
+                roi_files.extend(sorted(extra_dir.glob(f"*{ext}")))
     if contains:
         roi_files = [f for f in roi_files if contains in f.name]
 
