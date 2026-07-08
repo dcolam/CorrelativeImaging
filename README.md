@@ -29,7 +29,7 @@ Optional extras:
 
 ```bash
 pip install -e ".[gpu]"         # CUDA-accelerated array ops (requires a matching CUDA toolkit)
-pip install -e ".[bioformats]"  # Bio-Formats support for VSI/SCN/ICS/etc. (requires Java)
+pip install -e ".[bioformats]"  # Bio-Formats support for VSI/SCN/ICS/etc. — bundles its own JDK (jdk4py), no system Java required
 pip install -e ".[dev]"         # pytest, ruff
 ```
 

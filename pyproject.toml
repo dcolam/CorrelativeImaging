@@ -44,8 +44,12 @@ gpu = [
     "cucim-cu12",
 ]
 bioformats = [
-    # requires Java; covers VSI, SCN, ICS, AFM, etc.
+    # covers VSI, SCN, ICS, AFM, etc.
     "bioio-bioformats",
+    # Bundled JDK 17 so Bio-Formats doesn't depend on (or fight with) whatever
+    # Java happens to be on the host. Pinned to the 17.x line: bffile requires
+    # >=11, but jpype's native bridge has had crashes on very new JDKs (21+).
+    "jdk4py>=17.0.0,<18",
 ]
 dev = [
     "pytest>=7.4",

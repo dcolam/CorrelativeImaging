@@ -64,37 +64,49 @@ def _find_compatible_java() -> str | None:
     return best[1] if best else None
 
 
+def _select_java_home() -> Path | None:
+    """Pick a JAVA_HOME, preferring the bundled jdk4py JDK (self-contained,
+    version-pinned, same wheel-install mechanism as PyQt6/numpy) over
+    whatever happens to be installed on the host.
+    """
+    try:
+        from jdk4py import JAVA_HOME as bundled_home
+        return Path(bundled_home)
+    except ImportError:
+        pass
+
+    java_exe = _find_compatible_java() or shutil.which("java")
+    if java_exe:
+        # java.exe normally lives at <JAVA_HOME>/bin/java(.exe)
+        return Path(java_exe).resolve().parent.parent
+    return None
+
+
 def _ensure_java_for_bioformats() -> None:
-    """Point scyjava at an already-installed JDK instead of letting it download one.
+    """Point scyjava at a suitable JDK instead of letting it download one.
 
     bioio-bioformats starts a JVM via scyjava, which by default *always*
     downloads its own pinned Java build into the user's cache dir — even if a
     perfectly good JDK is already installed. On locked-down Windows machines
     (e.g. corporate VMs) Group Policy commonly blocks *executing* binaries
     from user-writable folders like AppData, so that download-and-run step
-    fails even though the download itself succeeds. Reusing a JDK already
-    installed under Program Files sidesteps that restriction entirely.
+    fails even though the download itself succeeds. Installing the optional
+    ``jdk4py`` dependency (see the ``bioformats`` extra) sidesteps this
+    entirely by bundling a known-good JDK inside the wheel itself; falling
+    back to a host-installed JDK otherwise.
     """
     global _java_configured
     if _java_configured:
         return
     _java_configured = True
 
-    java_exe = _find_compatible_java()
-    if java_exe:
-        # java.exe normally lives at <JAVA_HOME>/bin/java(.exe)
-        java_home = Path(java_exe).resolve().parent.parent
+    java_home = _select_java_home()
+    if java_home is not None:
         os.environ["JAVA_HOME"] = str(java_home)
         # Some Java-discovery paths (e.g. jgo) scan PATH rather than
         # JAVA_HOME — put our chosen version first so it wins either way.
         os.environ["PATH"] = str(java_home / "bin") + os.pathsep + os.environ.get("PATH", "")
-        log.debug("Using compatible Java at %s", java_home)
-    elif "JAVA_HOME" not in os.environ:
-        java_exe = shutil.which("java")
-        if java_exe:
-            java_home = Path(java_exe).resolve().parent.parent
-            os.environ["JAVA_HOME"] = str(java_home)
-            log.debug("JAVA_HOME not set — using detected Java at %s", java_home)
+        log.debug("Using Java at %s", java_home)
 
     try:
         import scyjava.config
