@@ -2751,16 +2751,23 @@ class CorrelativeImagingWidget(QWidget):
                                        blending=blending, scale=scale,
                                        contrast_limits=auto_contrast_limits(mip[i]))
 
-    def _add_roi_overlays(self, well, shape_yx: tuple) -> None:
+    def _add_roi_overlays(self, well, shape_yx: tuple, pixel_size_um: float = 1.0) -> None:
         # Separate Labels layers per ROI kind — napari's own layer-visibility
         # checkboxes double as the "toggle one ROI type vs another" control.
         # "background" is the hole's complement (near-whole-frame) and would
         # blanket the entire view if shown filled by default, so it starts
         # hidden; hole/existing are the meaningful, smaller regions worth
         # seeing immediately.
+        #
+        # scale MUST match the image layers' scale (see _add_image_layers /
+        # NapariViewer.show_image, which scale by pixel_size_um) — without
+        # it, napari renders this mask at raw pixel scale while the image
+        # renders at physical (µm) scale, so the ROI appears shifted/outside
+        # the image whenever pixel_size_um != 1.
         if well is None or not well.roi_paths:
             return
         h, w = shape_yx
+        scale = [pixel_size_um, pixel_size_um]
         for p in well.roi_paths:
             mask = _load_roi_mask(p, h, w)
             if mask is None or not mask.any():
@@ -2768,29 +2775,33 @@ class CorrelativeImagingWidget(QWidget):
             kind = _classify_roi_path(p)
             self._viewer.add_labels(
                 mask.astype(int), name=f"roi_{kind}/{well.well_id}", opacity=0.4,
-                visible=(kind != "background"),
+                visible=(kind != "background"), scale=scale,
             )
 
     def _show_in_viewer(self, image_data, label: str, well=None, projection: str = "max") -> None:
         self._viewer.layers.clear()
         self._add_image_layers(image_data, label, projection)
         if well is not None:
-            self._add_roi_overlays(well, image_data.data.shape[-2:])
+            self._add_roi_overlays(well, image_data.data.shape[-2:], image_data.pixel_size_um)
 
     def _show_well_overview(self, well, bf_data, fl_data, projection: str) -> None:
         self._viewer.layers.clear()
         shape_yx = None
+        pixel_size_um = 1.0
         if bf_data is not None:
             # BF as a translucent (not additive) base layer — additively
             # summing it with FL would wash the whole view out to white,
             # since BF is often bright across most of the frame.
             self._add_image_layers(bf_data, "BF", projection, blending="translucent")
             shape_yx = bf_data.data.shape[-2:]
+            pixel_size_um = bf_data.pixel_size_um
         if fl_data is not None:
             self._add_image_layers(fl_data, "FL", projection)
             shape_yx = shape_yx or fl_data.data.shape[-2:]
+            if bf_data is None:
+                pixel_size_um = fl_data.pixel_size_um
         if shape_yx is not None:
-            self._add_roi_overlays(well, shape_yx)
+            self._add_roi_overlays(well, shape_yx, pixel_size_um)
 
     def _on_view_requested(self, well, which: str, projection: str = "max") -> None:
         if self._viewer is None:
