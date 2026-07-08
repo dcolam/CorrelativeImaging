@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "correlative-imaging"
 version = "0.1.0"
 description = "Modern Python pipeline for correlative microscopy image analysis"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.14"
 dependencies = [
     # Core image processing
     "numpy>=1.26",
