@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -10,6 +12,40 @@ from typing import Any
 import numpy as np
 
 log = logging.getLogger(__name__)
+
+_java_configured = False
+
+
+def _ensure_java_for_bioformats() -> None:
+    """Point scyjava at an already-installed JDK instead of letting it download one.
+
+    bioio-bioformats starts a JVM via scyjava, which by default *always*
+    downloads its own pinned Java build into the user's cache dir — even if a
+    perfectly good JDK is already installed. On locked-down Windows machines
+    (e.g. corporate VMs) Group Policy commonly blocks *executing* binaries
+    from user-writable folders like AppData, so that download-and-run step
+    fails even though the download itself succeeds. Reusing a JDK already
+    installed under Program Files sidesteps that restriction entirely.
+    """
+    global _java_configured
+    if _java_configured:
+        return
+    _java_configured = True
+
+    if "JAVA_HOME" not in os.environ:
+        java_exe = shutil.which("java")
+        if java_exe:
+            # java.exe normally lives at <JAVA_HOME>/bin/java(.exe)
+            java_home = Path(java_exe).resolve().parent.parent
+            os.environ["JAVA_HOME"] = str(java_home)
+            log.debug("JAVA_HOME not set — using detected Java at %s", java_home)
+
+    try:
+        import scyjava.config
+        # "auto": prefer JAVA_HOME / system java, only download if none found.
+        scyjava.config.set_java_constraints(fetch="auto")
+    except ImportError:
+        pass
 
 # Map suffix → explicit reader class to avoid bioio's trial-and-error detection.
 # bioio's default auto-detection tries ome-tiff first for any .tif file, which
@@ -160,6 +196,7 @@ def read_image(path: str | Path, scene: int = 0) -> ImageData:
             "Install with: pip install bioio-bioformats",
             suffix,
         )
+        _ensure_java_for_bioformats()
 
     try:
         from bioio import BioImage
