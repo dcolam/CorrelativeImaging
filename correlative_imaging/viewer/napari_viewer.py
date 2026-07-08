@@ -70,10 +70,16 @@ class NapariViewer:
     # Layer helpers
     # ------------------------------------------------------------------
 
-    def show_image(self, image_data: ImageData, group: str = "raw", projection: str = "max") -> None:
+    def show_image(self, image_data: ImageData, group: str = "raw", projection: str = "max",
+                   blending: str = "additive") -> None:
         """Add every channel as a separate napari Image layer.
 
         projection: 'min' | 'max' | 'mean' | 'sum'  (Z-projection method; no-op for 2-D images).
+        blending:   napari blending mode. Use 'translucent' (not the default
+                    'additive') when this image will be shown alongside
+                    another — e.g. brightfield next to fluorescence — since
+                    additively summing a bright, near-full-frame BF layer
+                    with FL channels washes the whole view out to white.
         """
         from napari.utils.colormaps import ensure_colormap
 
@@ -88,7 +94,7 @@ class NapariViewer:
                 mip[i],
                 name=f"{group}/{ch_name}",
                 colormap=cmap,
-                blending="additive",
+                blending=blending,
                 scale=[image_data.pixel_size_um, image_data.pixel_size_um],
                 contrast_limits=auto_contrast_limits(mip[i]),
             )

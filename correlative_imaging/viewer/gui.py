@@ -1067,7 +1067,16 @@ class BFPipelineTab(QWidget):
         if self._viewer is None:
             self._log("[napari] No viewer attached — cannot display result.")
             return
-        self._viewer.layers.clear()
+        # Append to whatever's already in the viewer (e.g. the Setup tab's
+        # BF + FL + ROI overview) instead of wiping it — only replace this
+        # well's own previous test-result layers, so re-testing the same
+        # well doesn't pile up duplicates.
+        stale_names = {f"BF proj/{well_id}", f"Segmentation/{well_id}",
+                       *(f"{kind}/{well_id}" for kind in masks)}
+        for layer in list(self._viewer.layers):
+            if layer.name in stale_names:
+                self._viewer.layers.remove(layer)
+
         if ch_vis is not None:
             self._viewer.add_image(ch_vis, name=f"BF proj/{well_id}", colormap="gray")
         self._viewer.add_labels(seg, name=f"Segmentation/{well_id}", opacity=0.45)
@@ -1078,7 +1087,7 @@ class BFPipelineTab(QWidget):
                     name=f"{kind}/{well_id}", opacity=0.5,
                 )
         self._log(
-            f"  → napari: BF projection + segmentation map + {len(masks)} ROI(s) loaded."
+            f"  → napari: BF projection + segmentation map + {len(masks)} ROI(s) appended."
         )
 
     def _get_plate_tab(self):
@@ -1358,7 +1367,13 @@ class _BFWorker(QThread):
                         circ = 4 * np.pi * comp.area / comp.perimeter ** 2
                         if circ < min_circ:
                             continue
-                        score = comp.area * circ
+                        # Rank by roundness alone, not area × roundness: the
+                        # background class is usually the majority of the
+                        # frame and can still be moderately round-ish, which
+                        # let it outscore a smaller but much rounder true
+                        # hole under an area-weighted score. Area is only a
+                        # pass/fail gate (min_area) here, not a factor.
+                        score = circ
                         if score > best_score:
                             best_score = score
                             best_label = lbl
@@ -2720,11 +2735,12 @@ class CorrelativeImagingWidget(QWidget):
         root.addWidget(self._tabs)
         self.setMinimumWidth(420)
 
-    def _add_image_layers(self, image_data, label: str, projection: str) -> None:
+    def _add_image_layers(self, image_data, label: str, projection: str,
+                          blending: str = "additive") -> None:
         try:
             from correlative_imaging.viewer.napari_viewer import NapariViewer
             nv = NapariViewer.__new__(NapariViewer); nv._viewer = self._viewer
-            nv.show_image(image_data, group=label, projection=projection)
+            nv.show_image(image_data, group=label, projection=projection, blending=blending)
         except Exception:
             px = image_data.pixel_size_um; scale = [px, px]
             # ImageData.data always keeps the channel axis first (C,Y,X) or
@@ -2732,13 +2748,16 @@ class CorrelativeImagingWidget(QWidget):
             mip = image_data.project(projection)
             for i, ch in enumerate(image_data.channel_names):
                 self._viewer.add_image(mip[i], name=f"{label}/{ch}",
-                                       blending="additive", scale=scale,
+                                       blending=blending, scale=scale,
                                        contrast_limits=auto_contrast_limits(mip[i]))
 
     def _add_roi_overlays(self, well, shape_yx: tuple) -> None:
         # Separate Labels layers per ROI kind — napari's own layer-visibility
-        # checkboxes double as the "toggle one ROI type vs another" control,
-        # so no extra UI is needed to switch between them.
+        # checkboxes double as the "toggle one ROI type vs another" control.
+        # "background" is the hole's complement (near-whole-frame) and would
+        # blanket the entire view if shown filled by default, so it starts
+        # hidden; hole/existing are the meaningful, smaller regions worth
+        # seeing immediately.
         if well is None or not well.roi_paths:
             return
         h, w = shape_yx
@@ -2747,11 +2766,10 @@ class CorrelativeImagingWidget(QWidget):
             if mask is None or not mask.any():
                 continue
             kind = _classify_roi_path(p)
-            lyr = self._viewer.add_labels(
-                mask.astype(int), name=f"roi_{kind}/{well.well_id}",
-                opacity=0.4, visible=(kind == "hole"),
+            self._viewer.add_labels(
+                mask.astype(int), name=f"roi_{kind}/{well.well_id}", opacity=0.4,
+                visible=(kind != "background"),
             )
-            lyr.contour = 1
 
     def _show_in_viewer(self, image_data, label: str, well=None, projection: str = "max") -> None:
         self._viewer.layers.clear()
@@ -2763,7 +2781,10 @@ class CorrelativeImagingWidget(QWidget):
         self._viewer.layers.clear()
         shape_yx = None
         if bf_data is not None:
-            self._add_image_layers(bf_data, "BF", projection)
+            # BF as a translucent (not additive) base layer — additively
+            # summing it with FL would wash the whole view out to white,
+            # since BF is often bright across most of the frame.
+            self._add_image_layers(bf_data, "BF", projection, blending="translucent")
             shape_yx = bf_data.data.shape[-2:]
         if fl_data is not None:
             self._add_image_layers(fl_data, "FL", projection)
