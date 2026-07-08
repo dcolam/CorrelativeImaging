@@ -44,8 +44,18 @@ def _ensure_java_for_bioformats() -> None:
         import scyjava.config
         # "auto": prefer JAVA_HOME / system java, only download if none found.
         scyjava.config.set_java_constraints(fetch="auto")
+        # Bio-Formats' own reader logging (via bffile/SLF4J) is extremely
+        # chatty at INFO level — every parsed file tag gets printed, which can
+        # bury the actual error when something goes wrong. Must be set before
+        # the JVM starts; DebugTools.setRootLevel (called after JVM start)
+        # would be the alternative but risks racing bffile's own startup.
+        scyjava.config.add_option("-Dorg.slf4j.simpleLogger.defaultLogLevel=warn")
     except ImportError:
         pass
+
+    # Belt-and-suspenders: bffile also mirrors Java log records through this
+    # Python logger, independent of the JVM-side SLF4J level.
+    logging.getLogger("bffile").setLevel(logging.WARNING)
 
 # Map suffix → explicit reader class to avoid bioio's trial-and-error detection.
 # bioio's default auto-detection tries ome-tiff first for any .tif file, which
