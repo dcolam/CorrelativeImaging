@@ -183,7 +183,7 @@ class ExtractROI(Step):
 
 
 # ------------------------------------------------------------------
-# Load ROI from file — ImageJ .roi / .zip or binary mask image
+# Load ROI from file — ImageJ .roi or binary mask image
 # ------------------------------------------------------------------
 
 @dataclass
@@ -194,7 +194,6 @@ class LoadROI(Step):
     Supported formats
     -----------------
     - ImageJ ``.roi`` file (single polygon/rectangle ROI)
-    - ImageJ ``.zip`` archive (multiple ROIs — merged into one mask)
     - Binary image (``.tif``, ``.tiff``, ``.png``) — any non-zero pixel = ROI
 
     For batch runs the **same file is applied to every image**.  If per-image
@@ -222,15 +221,16 @@ class LoadROI(Step):
 
         h, w = image.shape[-2], image.shape[-1]
         suffix = src.suffix.lower()
+        scale = self._pixel_scale(src, context.pixel_size_um)
 
-        if suffix in {".roi", ".zip"}:
-            mask = self._from_imagej(src, h, w)
+        if suffix == ".roi":
+            mask = self._from_imagej(src, h, w, scale=scale)
         elif suffix in {".tif", ".tiff", ".png", ".bmp"}:
             mask = self._from_image(src, h, w)
         else:
             raise ValueError(
                 f"Unsupported ROI file format '{suffix}'. "
-                "Use .roi, .zip (ImageJ) or .tif / .png (binary mask)."
+                "Use .roi (ImageJ) or .tif / .png (binary mask)."
             )
 
         return StepResult(masks={self.roi_name: mask}, mask_paths={self.roi_name: str(src)})
@@ -238,28 +238,57 @@ class LoadROI(Step):
     # ── Private helpers ──────────────────────────────────────────────
 
     @staticmethod
-    def _from_imagej(src, h: int, w: int) -> np.ndarray:
+    def _pixel_scale(src, target_pixel_size_um: float) -> float:
+        """Ratio to convert pixel coordinates stored in *src* into the
+        target image's pixel grid.
+
+        Looks for a ``<src>.json`` sidecar (written by the BF Pipeline tab,
+        see ``gui._save_roi``) recording the physical pixel size of the
+        image the ROI was drawn on. If the ROI's source image had a
+        different pixel size than the image it's now being applied to (e.g.
+        a brightfield ROI applied to a differently-scaled fluorescence
+        image), returns the ratio needed to rescale raw stored pixel
+        coordinates onto the target's pixel grid. Returns ``1.0`` (no
+        rescaling — today's behavior) when there's no sidecar, no recorded
+        pixel size, or the target's pixel size is unknown/zero — this is the
+        case for pre-existing ROI files with no provenance to rescale from.
+        """
+        import json
+        from pathlib import Path as _Path
+
+        sidecar = _Path(str(src) + ".json")
+        if not sidecar.exists() or not target_pixel_size_um:
+            return 1.0
+        try:
+            info = json.loads(sidecar.read_text())
+            source_px = info.get("pixel_size_um")
+        except Exception:
+            return 1.0
+        if not source_px:
+            return 1.0
+        return source_px / target_pixel_size_um
+
+    @staticmethod
+    def _from_imagej(src, h: int, w: int, scale: float = 1.0) -> np.ndarray:
         try:
             import roifile
         except ImportError as exc:
             raise ImportError(
-                "roifile is required for ImageJ .roi/.zip files: "
+                "roifile is required for ImageJ .roi files: "
                 "pip install roifile"
             ) from exc
 
         from skimage.draw import polygon as draw_polygon
 
-        rois = (
-            roifile.ImagejRoi.fromzip(str(src))
-            if src.suffix.lower() == ".zip"
-            else [roifile.ImagejRoi.fromfile(str(src))]
-        )
+        rois = [roifile.ImagejRoi.fromfile(str(src))]
 
         mask = np.zeros((h, w), dtype=bool)
         for roi in rois:
             try:
                 coords = roi.coordinates()
                 if coords is not None and len(coords) >= 3:
+                    if scale != 1.0:
+                        coords = coords * scale
                     rows = np.clip(coords[:, 1].astype(int), 0, h - 1)
                     cols = np.clip(coords[:, 0].astype(int), 0, w - 1)
                     rr, cc = draw_polygon(rows, cols, shape=(h, w))
@@ -269,10 +298,10 @@ class LoadROI(Step):
                 pass  # polygon coords unavailable — fall through to bounding-box
             # Fallback: use bounding box attributes
             try:
-                r1 = max(0, int(roi.top))
-                c1 = max(0, int(roi.left))
-                r2 = min(h, int(roi.bottom))
-                c2 = min(w, int(roi.right))
+                r1 = max(0, int(roi.top * scale))
+                c1 = max(0, int(roi.left * scale))
+                r2 = min(h, int(roi.bottom * scale))
+                c2 = min(w, int(roi.right * scale))
                 mask[r1:r2, c1:c2] = True
             except Exception:
                 pass  # ROI has neither polygon coords nor a valid bounding box — skip

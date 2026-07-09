@@ -164,8 +164,7 @@ def scan_plate_folder(
     # ── Scan for ROI files and assign to wells ───────────────────────
     well_lookup = {(w.row, w.col, w.field): w for w in wells}
     roi_files: list[Path] = []
-    for ext in (".roi", ".zip"):
-        roi_files.extend(sorted(glob_fn(f"*{ext}")))
+    roi_files.extend(sorted(glob_fn("*.roi")))
     for extra_dir in extra_roi_dirs or []:
         extra_dir = Path(extra_dir)
         if extra_dir.is_dir():
@@ -174,7 +173,7 @@ def scan_plate_folder(
             # (e.g. the BF pipeline's rois/ dir) — never a folder containing
             # raw acquisition images, so there's no risk of misclassifying
             # a plate image as an ROI mask.
-            for ext in (".roi", ".zip", ".tif", ".tiff"):
+            for ext in (".roi", ".tif", ".tiff"):
                 roi_files.extend(sorted(extra_dir.glob(f"*{ext}")))
     if contains:
         roi_files = [f for f in roi_files if contains in f.name]
