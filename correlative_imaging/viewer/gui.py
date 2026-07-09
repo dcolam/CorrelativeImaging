@@ -239,7 +239,7 @@ class _WellBatchWorker(QThread):
 
     def __init__(self, wells: list, pipeline_dict_fn, bf_cfg: dict | None,
                  output_dir: Path, experiment: str, max_workers: int = 1,
-                 db_path: Path | None = None):
+                 db_path: Path | None = None, force_regen: bool = False):
         super().__init__()
         self._wells = wells
         self._pipeline_dict_fn = pipeline_dict_fn
@@ -248,6 +248,7 @@ class _WellBatchWorker(QThread):
         self._experiment = experiment
         self._max_workers = max_workers
         self._db_path = Path(db_path) if db_path else (self._output_dir / "results.db")
+        self._force_regen = force_regen
         self._abort = False
 
     def abort(self) -> None:
@@ -265,14 +266,18 @@ class _WellBatchWorker(QThread):
             # any one of them gets every class (re)generated together.
             if self._bf_cfg:
                 class_names = [c["name"] for c in self._bf_cfg.get("classes", [])]
-                missing = [
-                    w for w in self._wells
-                    if any(_find_well_roi(w, name) is None for name in class_names)
-                ]
+                if self._force_regen:
+                    missing = list(self._wells)
+                else:
+                    missing = [
+                        w for w in self._wells
+                        if any(_find_well_roi(w, name) is None for name in class_names)
+                    ]
                 if missing:
+                    reason = "forced regeneration" if self._force_regen else \
+                        f"({total - len(missing)} reused from disk)"
                     self.log_msg.emit(
-                        f"Generating BF-pipeline ROI(s) for {len(missing)}/{total} well(s) "
-                        f"({total - len(missing)} reused from disk) …"
+                        f"Generating BF-pipeline ROI(s) for {len(missing)}/{total} well(s) {reason} …"
                     )
                     bf_worker = _BFWorker(missing, self._bf_cfg, test_mode=False)
                     bf_worker.log_msg.connect(lambda m: self.log_msg.emit(f"[BF] {m}"))
@@ -1212,7 +1217,7 @@ class BFPipelineTab(QWidget):
             self._worker.result_ready.connect(self._show_test_result)
         self._worker.start()
 
-    def _show_test_result(self, ch_vis, seg, masks: dict, well_id: str) -> None:
+    def _show_test_result(self, ch_vis, seg, masks: dict, well_id: str, pixel_size_um: float = 1.0) -> None:
         if self._viewer is None:
             self._log("[napari] No viewer attached — cannot display result.")
             return
@@ -1226,14 +1231,20 @@ class BFPipelineTab(QWidget):
             if layer.name in stale_names:
                 self._viewer.layers.remove(layer)
 
+        # scale MUST match the already-loaded image's scale (see
+        # _add_image_layers / NapariViewer.show_image) — without it, these
+        # layers render at raw pixel scale while the loaded sample renders
+        # at physical (µm) scale, making them appear far larger/misaligned
+        # whenever pixel_size_um != 1.
+        scale = [pixel_size_um, pixel_size_um]
         if ch_vis is not None:
-            self._viewer.add_image(ch_vis, name=f"BF proj/{well_id}", colormap="gray")
-        self._viewer.add_labels(seg, name=f"Segmentation/{well_id}", opacity=0.45)
+            self._viewer.add_image(ch_vis, name=f"BF proj/{well_id}", colormap="gray", scale=scale)
+        self._viewer.add_labels(seg, name=f"Segmentation/{well_id}", opacity=0.45, scale=scale)
         for i, (kind, mask) in enumerate(masks.items(), start=1):
             if mask.max() > 0:
                 self._viewer.add_labels(
                     mask.astype("int32") * i,
-                    name=f"{kind}/{well_id}", opacity=0.5,
+                    name=f"{kind}/{well_id}", opacity=0.5, scale=scale,
                 )
         self._log(
             f"  → napari: BF projection + segmentation map + {len(masks)} ROI(s) appended."
@@ -1299,7 +1310,7 @@ class _BFWorker(QThread):
     progress     = Signal(int, int, str)
     log_msg      = Signal(str)
     finished     = Signal(int, int)          # n_ok, n_err
-    result_ready = Signal(object, object, object, str)  # ch_u8, prob(H,W,C), masks{c:mask}, well_id
+    result_ready = Signal(object, object, object, str, float)  # ch_u8, prob(H,W,C), masks{c:mask}, well_id, pixel_size_um
 
     def __init__(self, wells: list, cfg: dict, test_mode: bool = False):
         super().__init__()
@@ -1576,7 +1587,8 @@ class _BFWorker(QThread):
 
                     if self._test_mode:
                         self.result_ready.emit(
-                            ch_vis_map.get(stem), seg, masks, well.well_id
+                            ch_vis_map.get(stem), seg, masks, well.well_id,
+                            px_map.get(stem, 1.0),
                         )
 
                 except Exception:
@@ -2874,6 +2886,15 @@ class RunTab(QWidget):
         par_row.addStretch()
         bl.addLayout(par_row)
 
+        self._force_regen_cb = QCheckBox("Force regenerate BF-pipeline ROI(s) (ignore existing files)")
+        self._force_regen_cb.setToolTip(
+            "Off (default): a well's BF-pipeline ROI(s) are reused from disk "
+            "if already present, only generated for wells missing one. "
+            "On: every well's ROI(s) are regenerated from scratch this run, "
+            "overwriting whatever's already there."
+        )
+        bl.addWidget(self._force_regen_cb)
+
         ctrl = QHBoxLayout()
         self._run_btn   = QPushButton("Run batch"); self._run_btn.setStyleSheet("font-weight:bold")
         self._run_btn.clicked.connect(self._on_run)
@@ -2963,18 +2984,21 @@ class RunTab(QWidget):
             pipeline_dict_fn, needs_bf = self._make_well_pipeline_dict_fn()
             bf_cfg = self._get_bf_config() if (needs_bf and self._get_bf_config) else None
             if bf_cfg:
-                class_names = [c["name"] for c in bf_cfg.get("classes", [])]
-                if any(_find_well_roi(well, name) is None for name in class_names):
-                    self._log(f"Generating BF-pipeline ROI(s) for {well.well_id} before preview …")
-                    self._preview_btn.setEnabled(False)
-                    self._preview_btn.setText("Running BF pipeline …")
-                    self._bf_preview_worker = _BFWorker([well], bf_cfg, test_mode=False)
-                    self._bf_preview_worker.log_msg.connect(lambda m: self._log(f"[BF] {m}"))
-                    self._bf_preview_worker.finished.connect(
-                        lambda n_ok, n_err: self._run_well_preview(img_data, well, pipeline_dict_fn)
-                    )
-                    self._bf_preview_worker.start()
-                    return
+                # Unlike batch (hundreds of wells, reuse-from-disk matters for
+                # time), preview is a single well on demand — the whole point
+                # is to verify the pipeline actually works right now,
+                # including Ilastik, not to shortcut past it using
+                # possibly-stale files from an earlier run. Always regenerate.
+                self._log(f"Running BF pipeline for {well.well_id} before preview …")
+                self._preview_btn.setEnabled(False)
+                self._preview_btn.setText("Running BF pipeline …")
+                self._bf_preview_worker = _BFWorker([well], bf_cfg, test_mode=False)
+                self._bf_preview_worker.log_msg.connect(lambda m: self._log(f"[BF] {m}"))
+                self._bf_preview_worker.finished.connect(
+                    lambda n_ok, n_err: self._run_well_preview(img_data, well, pipeline_dict_fn)
+                )
+                self._bf_preview_worker.start()
+                return
             self._run_well_preview(img_data, well, pipeline_dict_fn)
         else:
             if well is None:
@@ -3134,6 +3158,7 @@ class RunTab(QWidget):
             self._worker = _WellBatchWorker(
                 wells, pipeline_dict_fn, bf_cfg, setup.output_dir, setup.experiment,
                 max_workers=max_workers, db_path=db_path,
+                force_regen=self._force_regen_cb.isChecked(),
             )
         else:
             self._worker = _BatchWorker(pl_dict, setup.input_dir, setup.output_dir, setup.experiment,
