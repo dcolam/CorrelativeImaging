@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,29 @@ import numpy as np
 log = logging.getLogger(__name__)
 
 _java_configured = False
+
+# Bio-Formats starts its JVM lazily on the *first* read — concurrent threads
+# racing that one-time startup (relevant once batch runs are parallelized;
+# see batch.WellBatchRunner) can crash the process. Serialize only the reads
+# that happen before the JVM is confirmed running; once ready, subsequent
+# Bio-Formats reads proceed unlocked/concurrently like any other format.
+_bf_construct_lock = threading.Lock()
+_bf_jvm_ready = False
+
+
+def _construct_bioformats_image(bioimage_cls, path: Path, reader_cls):
+    global _bf_jvm_ready
+    if _bf_jvm_ready:
+        return bioimage_cls(str(path), reader=reader_cls)
+    with _bf_construct_lock:
+        # Java setup (JAVA_HOME, scyjava constraints) must finish under this
+        # same lock, not before it — otherwise a second thread can see
+        # _java_configured already True (set at the top of that function,
+        # before the slow work) and start the JVM before setup completes.
+        _ensure_java_for_bioformats()
+        img = bioimage_cls(str(path), reader=reader_cls)
+        _bf_jvm_ready = True
+        return img
 
 # jpype's native bridge (used by scyjava/bffile to embed the JVM) lags behind
 # the newest JDK releases — brand-new majors (e.g. 21+) have been observed to
@@ -283,7 +307,8 @@ def read_image(path: str | Path, scene: int = 0) -> ImageData:
             "Install with: pip install bioio-bioformats",
             suffix,
         )
-        _ensure_java_for_bioformats()
+        # Java setup happens inside _construct_bioformats_image, under the
+        # same lock as the first JVM-starting construction (see there for why).
 
     try:
         from bioio import BioImage
@@ -298,7 +323,10 @@ def read_image(path: str | Path, scene: int = 0) -> ImageData:
         # bioio_bioformats.Reader (and some others) don't accept `scene` in
         # __init__ — BioImage forwards the kwarg there and it blows up.
         # Create without scene, then set it via the public API.
-        img = BioImage(str(path), reader=reader_cls)
+        if suffix in bioformats_extensions:
+            img = _construct_bioformats_image(BioImage, path, reader_cls)
+        else:
+            img = BioImage(str(path), reader=reader_cls)
         if scene != 0:
             img.set_scene(scene)
     else:

@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS particle_measurements (
     image_id        INTEGER NOT NULL REFERENCES images(id),
     channel         TEXT    NOT NULL,
     roi_mask        TEXT,
+    roi_path        TEXT,
     label           INTEGER,
     area_px         REAL,
     area_um2        REAL,
@@ -76,6 +77,7 @@ CREATE TABLE IF NOT EXISTS intensity_measurements (
     image_id        INTEGER NOT NULL REFERENCES images(id),
     channel         TEXT    NOT NULL,
     roi_mask        TEXT,
+    roi_path        TEXT,
     mean_intensity  REAL,
     sum_intensity   REAL,
     std_intensity   REAL,
@@ -119,6 +121,8 @@ class ResultsDB:
             ("colocalization_results",      "roi_mask TEXT"),
             ("colocalization_per_particle", "roi_mask TEXT"),
             ("particle_measurements",       "roi_mask TEXT"),
+            ("particle_measurements",       "roi_path TEXT"),
+            ("intensity_measurements",      "roi_path TEXT"),
         ]
         for table, col_def in new_columns:
             try:
@@ -177,6 +181,7 @@ class ResultsDB:
                     image_id,
                     str(r.get("channel", "")),
                     str(r.get("roi_mask", "whole_image")),
+                    str(r.get("roi_path", "") or ""),
                     int(r.get("label", 0)),
                     float(r.get("area", 0)),
                     float(r.get("area_um2", 0)),
@@ -194,10 +199,10 @@ class ResultsDB:
         self._con.executemany(
             """
             INSERT INTO particle_measurements
-                (image_id, channel, roi_mask, label, area_px, area_um2, perimeter_px,
+                (image_id, channel, roi_mask, roi_path, label, area_px, area_um2, perimeter_px,
                  circularity, eccentricity, solidity, mean_intensity,
                  max_intensity, min_intensity, centroid_row, centroid_col)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             rows,
         )
@@ -215,6 +220,7 @@ class ResultsDB:
                 image_id,
                 str(r.get("channel", "")),
                 str(r.get("roi_mask", "whole_image")),
+                str(r.get("roi_path", "") or ""),
                 float(r.get("mean_intensity", 0)),
                 float(r.get("sum_intensity", 0)),
                 float(r.get("std_intensity", 0)),
@@ -226,9 +232,9 @@ class ResultsDB:
         self._con.executemany(
             """
             INSERT INTO intensity_measurements
-                (image_id, channel, roi_mask,
+                (image_id, channel, roi_mask, roi_path,
                  mean_intensity, sum_intensity, std_intensity, area_px, area_um2)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             rows,
         )

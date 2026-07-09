@@ -113,6 +113,7 @@ class ParticleAnalysis(Step):
         ch_name = context.channel_names[self.channel] if self.channel < len(context.channel_names) else f"ch{self.channel}"
         df.insert(0, "channel", ch_name)
         df.insert(1, "roi_mask", self.roi_mask or "whole_image")
+        df.insert(2, "roi_path", context.mask_paths.get(self.roi_mask, "") if self.roi_mask else "")
         df = df.reset_index(drop=True)
 
         # Keep only particles that survived filtering in the label image
@@ -176,6 +177,7 @@ class IntensityMeasurement(Step):
         vals = {
             "channel":        ch_name,
             "roi_mask":       self.roi_mask or "whole_image",
+            "roi_path":       context.mask_paths.get(self.roi_mask, "") if self.roi_mask else "",
             "mean_intensity": float(pixels.mean()) if pixels.size > 0 else 0.0,
             "sum_intensity":  float(pixels.sum())  if pixels.size > 0 else 0.0,
             "std_intensity":  float(pixels.std())  if pixels.size > 0 else 0.0,

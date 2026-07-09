@@ -213,8 +213,8 @@ class _BatchWorker(QThread):
 
 class _WellBatchWorker(QThread):
     """Batch runner for plate wells: reuse-or-generate each well's BF-pipeline
-    hole ROI, then run the FL analysis pipeline per well (see WellBatchRunner
-    in correlative_imaging.batch).
+    hole/background ROI, then run the FL analysis pipeline per well (see
+    WellBatchRunner in correlative_imaging.batch).
 
     ``pipeline_dict_fn`` must be safe to call from this background thread —
     build it with ``CorrelativeImagingWidget.make_well_pipeline_dict_fn()``,
@@ -225,13 +225,17 @@ class _WellBatchWorker(QThread):
     finished = Signal(str)
 
     def __init__(self, wells: list, pipeline_dict_fn, bf_cfg: dict | None,
-                 output_dir: Path, experiment: str):
+                 output_dir: Path, experiment: str, max_workers: int = 1,
+                 needs_hole_roi: bool = False, needs_background_roi: bool = False):
         super().__init__()
         self._wells = wells
         self._pipeline_dict_fn = pipeline_dict_fn
         self._bf_cfg = bf_cfg
         self._output_dir = Path(output_dir)
         self._experiment = experiment
+        self._max_workers = max_workers
+        self._needs_hole_roi = needs_hole_roi
+        self._needs_background_roi = needs_background_roi
         self._abort = False
 
     def abort(self) -> None:
@@ -243,19 +247,25 @@ class _WellBatchWorker(QThread):
 
             total = len(self._wells)
 
-            # ── Ensure a hole ROI exists for every well, reusing from disk ──
+            # ── Ensure hole/background ROI exists for every well that needs
+            # one, reusing from disk — a single BF-pipeline pass produces
+            # both, so a well missing either one gets (re)generated.
             if self._bf_cfg:
-                missing = [w for w in self._wells if _find_well_roi(w, "hole") is None]
+                missing = [
+                    w for w in self._wells
+                    if (self._needs_hole_roi and _find_well_roi(w, "hole") is None)
+                    or (self._needs_background_roi and _find_well_roi(w, "background") is None)
+                ]
                 if missing:
                     self.log_msg.emit(
-                        f"Generating hole ROI for {len(missing)}/{total} well(s) "
+                        f"Generating hole/background ROI for {len(missing)}/{total} well(s) "
                         f"({total - len(missing)} reused from disk) …"
                     )
                     bf_worker = _BFWorker(missing, self._bf_cfg, test_mode=False)
                     bf_worker.log_msg.connect(lambda m: self.log_msg.emit(f"[BF] {m}"))
                     bf_worker.run()   # synchronous call — reuses its logic on this thread
                 else:
-                    self.log_msg.emit(f"All {total} well(s) already have a hole ROI on disk.")
+                    self.log_msg.emit(f"All {total} well(s) already have hole/background ROI on disk.")
 
             if self._abort:
                 self.log_msg.emit("Aborted before FL analysis.")
@@ -276,6 +286,8 @@ class _WellBatchWorker(QThread):
                 pipeline_dict_fn=self._pipeline_dict_fn,
                 progress_fn=_cb,
                 should_abort=lambda: self._abort,
+                max_workers=self._max_workers,
+                warn_fn=self.log_msg.emit,
             )
             self.finished.emit("" if self._abort else str(db_path))
         except Exception:
@@ -1475,13 +1487,22 @@ def _classify_roi_path(path: Path) -> str:
     return "existing"
 
 
-def _find_well_roi(well, kind: str) -> Path | None:
-    """Return the first of a well's ROI files classified as *kind*
+def _find_well_roi(well, kind: str, tag: str = "") -> Path | None:
+    """Return one of a well's ROI files classified as *kind*
     (``"hole"``, ``"background"``, or ``"existing"``), or ``None``.
+
+    ``tag``: for ``kind="existing"`` only, restrict to files whose stem
+    contains this substring (case-insensitive) — e.g. ``"class1"`` vs
+    ``"class2"`` — so multiple distinct pre-existing ROI selections can each
+    be matched to their own file per well instead of both grabbing whichever
+    "existing" file happens to sort first.
     """
     for p in well.roi_paths:
-        if _classify_roi_path(p) == kind:
-            return p
+        if _classify_roi_path(p) != kind:
+            continue
+        if tag and tag.lower() not in Path(p).stem.lower():
+            continue
+        return p
     return None
 
 
@@ -1646,6 +1667,14 @@ class ChannelPanel(QWidget):
         afl = QFormLayout(an_box)
         afl.setLabelAlignment(Qt.AlignRight)
 
+        self._particle_en = QCheckBox("Run particle analysis")
+        self._particle_en.setChecked(True)
+        self._particle_en.setToolTip(
+            "Segment + measure individual particles (thresholded, filtered by\n"
+            "size/circularity below). Turn off to skip particle detection\n"
+            "entirely and only run the threshold-free bulk intensity\n"
+            "measurement below, for this channel."
+        )
         self._min_area = QDoubleSpinBox()
         self._min_area.setRange(0, 1e6); self._min_area.setValue(0.5); self._min_area.setSuffix(" µm²")
         self._max_area = QDoubleSpinBox()
@@ -1660,12 +1689,16 @@ class ChannelPanel(QWidget):
             "independent of particle detection."
         )
 
+        afl.addRow(self._particle_en)
         afl.addRow("Min area:", self._min_area)
         afl.addRow("Max area:", self._max_area)
         afl.addRow("Min circularity:", self._min_circ)
         afl.addRow("Z proj.:", self._an_z_proj)
         afl.addRow(self._bulk_intensity)
         lay.addWidget(an_box)
+
+        for w in (self._min_area, self._max_area, self._min_circ, self._an_z_proj):
+            self._particle_en.toggled.connect(w.setEnabled)
 
         lay.addStretch()
         scroll.setWidget(inner)
@@ -1687,6 +1720,7 @@ class ChannelPanel(QWidget):
         self._min_obj.setValue(other._min_obj.value())
         self._ws_en.setChecked(other._ws_en.isChecked())
         self._ws_dist.setValue(other._ws_dist.value())
+        self._particle_en.setChecked(other._particle_en.isChecked())
         self._min_area.setValue(other._min_area.value())
         self._max_area.setValue(other._max_area.value())
         self._min_circ.setValue(other._min_circ.value())
@@ -1723,10 +1757,12 @@ class ChannelPanel(QWidget):
         return steps
 
     def get_analysis_steps(self, roi_mask_key: str) -> list[dict]:
-        steps = [{"type": "ParticleAnalysis", "channel": self._ch_index,
-                  "min_size_um2": self._min_area.value(), "max_size_um2": self._max_area.value(),
-                  "min_circularity": self._min_circ.value(), "z_projection": self._an_z_proj.currentText(),
-                  "roi_mask": roi_mask_key}]
+        steps: list[dict] = []
+        if self._particle_en.isChecked():
+            steps.append({"type": "ParticleAnalysis", "channel": self._ch_index,
+                          "min_size_um2": self._min_area.value(), "max_size_um2": self._max_area.value(),
+                          "min_circularity": self._min_circ.value(), "z_projection": self._an_z_proj.currentText(),
+                          "roi_mask": roi_mask_key})
         if self._bulk_intensity.isChecked():
             steps.append({"type": "IntensityMeasurement", "channel": self._ch_index,
                           "z_projection": self._an_z_proj.currentText(), "roi_mask": roi_mask_key})
@@ -1828,7 +1864,7 @@ class ChannelsTab(QWidget):
 class _ROISel:
     """Data object holding one ROI selection's configuration."""
     label: str     = "Whole image"
-    # "whole" | "auto" | "file" | "well_hole" | "well_existing"
+    # "whole" | "auto" | "file" | "well_hole" | "well_existing" | "well_background"
     source: str    = "whole"
     channel: int   = 0
     blur: float    = 20.0
@@ -1836,6 +1872,11 @@ class _ROISel:
     path: str      = ""
     fill_holes: bool = True
     dilation_um: float = 0.0
+    # "well_existing" only: restrict matches to files whose stem contains this
+    # substring (case-insensitive), e.g. "class1" vs "class2" — required
+    # whenever a well can have more than one pre-existing ROI file, otherwise
+    # every "well_existing" selection would grab the same (first-found) file.
+    existing_tag: str = ""
 
     @property
     def mask_key(self) -> str:
@@ -1846,17 +1887,22 @@ class _ROISel:
         return f"roi_{slug}" if slug else "roi"
 
     def list_label(self) -> str:
-        src = {"whole":        "whole image",
-               "auto":         f"auto ch{self.channel}",
-               "file":         Path(self.path).name if self.path else "(no file)",
-               "well_hole":    "BF-pipeline hole ROI (per well)",
-               "well_existing":"existing project ROI (per well)"}.get(self.source, self.source)
+        existing_suffix = f" tag={self.existing_tag}" if (self.source == "well_existing" and self.existing_tag) else ""
+        src = {"whole":          "whole image",
+               "auto":           f"auto ch{self.channel}",
+               "file":           Path(self.path).name if self.path else "(no file)",
+               "well_hole":      "BF-pipeline hole ROI (per well)",
+               "well_background":"BF-pipeline background ROI (per well)",
+               "well_existing":  f"existing project ROI (per well){existing_suffix}"}.get(self.source, self.source)
         return f"{self.label}  [{src}]"
+
+    # Maps source -> the "kind" _find_well_roi expects.
+    _WELL_DYNAMIC_KINDS = {"well_hole": "hole", "well_existing": "existing", "well_background": "background"}
 
     def get_roi_step(self, well=None) -> dict | None:
         """Build this selection's ROI-extraction step dict.
 
-        ``well`` resolves the two per-well-dynamic sources against that
+        ``well`` resolves the three per-well-dynamic sources against that
         well's ``roi_paths`` (see ``_find_well_roi``). It's ``None`` during
         single-image preview, or when a well genuinely has no matching ROI —
         in both cases this returns ``None`` and the caller (see
@@ -1871,9 +1917,10 @@ class _ROISel:
                     "blur_sigma": self.blur, "method": self.method, "roi_name": self.mask_key}
         if self.source == "file" and self.path:
             return {"type": "LoadROI", "path": self.path, "roi_name": self.mask_key}
-        if self.source in ("well_hole", "well_existing") and well is not None:
-            kind = "hole" if self.source == "well_hole" else "existing"
-            resolved = _find_well_roi(well, kind)
+        if self.source in self._WELL_DYNAMIC_KINDS and well is not None:
+            kind = self._WELL_DYNAMIC_KINDS[self.source]
+            tag = self.existing_tag if self.source == "well_existing" else ""
+            resolved = _find_well_roi(well, kind, tag=tag)
             if resolved is not None:
                 return {"type": "LoadROI", "path": str(resolved), "roi_name": self.mask_key}
             log.warning(
@@ -1961,22 +2008,34 @@ class ROISelectionsTab(QWidget):
         self._rb_auto  = QRadioButton("Auto-detect from channel")
         self._rb_file  = QRadioButton("Import from file  (.roi / .zip / .tif)")
         self._rb_well_hole = QRadioButton("BF-pipeline hole ROI  (per well, batch only)")
+        self._rb_well_background = QRadioButton("BF-pipeline background ROI  (per well, batch only)")
         self._rb_well_existing = QRadioButton("Existing project ROI  (per well, batch only)")
         self._rb_whole.setChecked(True)
         for rb in [self._rb_whole, self._rb_auto, self._rb_file,
-                   self._rb_well_hole, self._rb_well_existing]:
+                   self._rb_well_hole, self._rb_well_background, self._rb_well_existing]:
             self._src_grp.addButton(rb)
             dfl.addRow(rb)
         note2 = QLabel(
-            "The two “per well” sources are resolved separately for each "
-            "well during a batch run (BF-pipeline hole ROI is reused from disk "
-            "if present, else generated on the fly; existing project ROI is "
-            "matched by well coordinate). During single-image preview they "
-            "contribute no restriction."
+            "The three “per well” sources are resolved separately for each "
+            "well during a batch run — always matched to that well specifically, "
+            "never a fixed file shared across wells: BF-pipeline hole/background "
+            "ROI are reused from disk if present, else generated together on the "
+            "fly; existing project ROI is matched by well coordinate (use the tag "
+            "field below to disambiguate if a well has more than one, e.g. "
+            "class1 vs class2). Any well with no match for a selection is "
+            "reported at the end of the batch run, not silently skipped. "
+            "During single-image preview these contribute no restriction."
         )
         note2.setWordWrap(True)
         note2.setStyleSheet("color: gray; font-size: 10px;")
         dfl.addRow(note2)
+
+        self._existing_tag_edit = QLineEdit()
+        self._existing_tag_edit.setPlaceholderText("e.g. class1 — leave empty to match any")
+        self._existing_tag_row_label = QLabel("Match filename containing:")
+        dfl.addRow(self._existing_tag_row_label, self._existing_tag_edit)
+        self._existing_tag_row_label.setVisible(False)
+        self._existing_tag_edit.setVisible(False)
 
         # Auto-detect sub-group
         self._auto_grp = QGroupBox("Auto-detect options")
@@ -2018,6 +2077,8 @@ class ROISelectionsTab(QWidget):
         # Wire visibility toggles
         self._rb_auto.toggled.connect(self._auto_grp.setVisible)
         self._rb_file.toggled.connect(self._file_grp.setVisible)
+        self._rb_well_existing.toggled.connect(self._existing_tag_row_label.setVisible)
+        self._rb_well_existing.toggled.connect(self._existing_tag_edit.setVisible)
 
         # Wire auto-save on any field change
         for sig in [
@@ -2028,6 +2089,7 @@ class ROISelectionsTab(QWidget):
             self._path_edit.textChanged,
             self._fill_cb.toggled,
             self._dil_spin.valueChanged,
+            self._existing_tag_edit.textChanged,
         ]:
             sig.connect(self._on_form_changed)
         self._src_grp.buttonToggled.connect(self._on_form_changed)
@@ -2077,10 +2139,13 @@ class ROISelectionsTab(QWidget):
         rb_map = {
             "whole": self._rb_whole, "auto": self._rb_auto, "file": self._rb_file,
             "well_hole": self._rb_well_hole, "well_existing": self._rb_well_existing,
+            "well_background": self._rb_well_background,
         }
         rb_map.get(sel.source, self._rb_whole).setChecked(True)
         self._auto_grp.setVisible(sel.source == "auto")
         self._file_grp.setVisible(sel.source == "file")
+        self._existing_tag_row_label.setVisible(sel.source == "well_existing")
+        self._existing_tag_edit.setVisible(sel.source == "well_existing")
         idx = min(sel.channel, self._ch_combo.count() - 1) if self._ch_combo.count() else 0
         self._ch_combo.setCurrentIndex(idx)
         self._blur_spin.setValue(sel.blur)
@@ -2088,14 +2153,16 @@ class ROISelectionsTab(QWidget):
         self._path_edit.setText(sel.path)
         self._fill_cb.setChecked(sel.fill_holes)
         self._dil_spin.setValue(sel.dilation_um)
+        self._existing_tag_edit.setText(sel.existing_tag)
         self._loading = False
 
     def _save_form(self, sel: _ROISel) -> None:
         sel.label  = self._lbl_edit.text().strip() or sel.label
-        sel.source = ("whole"         if self._rb_whole.isChecked() else
-                      "auto"          if self._rb_auto.isChecked()  else
-                      "well_hole"     if self._rb_well_hole.isChecked() else
-                      "well_existing" if self._rb_well_existing.isChecked() else
+        sel.source = ("whole"           if self._rb_whole.isChecked() else
+                      "auto"            if self._rb_auto.isChecked()  else
+                      "well_hole"       if self._rb_well_hole.isChecked() else
+                      "well_background" if self._rb_well_background.isChecked() else
+                      "well_existing"   if self._rb_well_existing.isChecked() else
                       "file")
         sel.channel    = self._ch_combo.currentIndex()
         sel.blur       = self._blur_spin.value()
@@ -2103,6 +2170,7 @@ class ROISelectionsTab(QWidget):
         sel.path       = self._path_edit.text().strip()
         sel.fill_holes = self._fill_cb.isChecked()
         sel.dilation_um = self._dil_spin.value()
+        sel.existing_tag = self._existing_tag_edit.text().strip()
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -2450,6 +2518,26 @@ class RunTab(QWidget):
 
         batch_box = QGroupBox("Batch run")
         bl = QVBoxLayout(batch_box)
+
+        par_row = QHBoxLayout()
+        self._parallel_cb = QCheckBox("Parallel batch (experimental)")
+        self._parallel_cb.setToolTip(
+            "Runs multiple wells' read + pipeline concurrently in a thread "
+            "pool instead of one at a time. Off by default — sequential "
+            "behavior (the well-tested default) is unchanged either way. "
+            "Database writes always happen one at a time regardless."
+        )
+        self._parallel_cb.toggled.connect(self._on_parallel_toggled)
+        self._worker_spin = QSpinBox()
+        self._worker_spin.setRange(2, 32)
+        self._worker_spin.setValue(4)
+        self._worker_spin.setEnabled(False)
+        self._worker_spin.setPrefix("workers: ")
+        par_row.addWidget(self._parallel_cb)
+        par_row.addWidget(self._worker_spin)
+        par_row.addStretch()
+        bl.addLayout(par_row)
+
         ctrl = QHBoxLayout()
         self._run_btn   = QPushButton("Run batch"); self._run_btn.setStyleSheet("font-weight:bold")
         self._run_btn.clicked.connect(self._on_run)
@@ -2653,15 +2741,21 @@ class RunTab(QWidget):
 
         wells = setup.get_all_wells() if hasattr(setup, "get_all_wells") else []
         if wells and self._make_well_pipeline_dict_fn is not None:
-            pipeline_dict_fn, needs_hole_roi = self._make_well_pipeline_dict_fn()
-            bf_cfg = self._get_bf_config() if (needs_hole_roi and self._get_bf_config) else None
+            pipeline_dict_fn, needs_hole_roi, needs_background_roi = self._make_well_pipeline_dict_fn()
+            needs_bf = needs_hole_roi or needs_background_roi
+            bf_cfg = self._get_bf_config() if (needs_bf and self._get_bf_config) else None
             if bf_cfg and not bf_cfg.get("save_dir"):
                 # Mirror BFPipelineTab.run_on_wells: without this, a missing
                 # "Save ROIs to" falls back to writing ROI files next to the
                 # source BF image — often a read-only/slow network data share.
                 bf_cfg["output_dir"] = str(setup.output_dir)
+            max_workers = self._worker_spin.value() if self._parallel_cb.isChecked() else 1
+            if max_workers > 1:
+                self._log(f"Parallel batch (experimental): {max_workers} workers.")
             self._worker = _WellBatchWorker(
                 wells, pipeline_dict_fn, bf_cfg, setup.output_dir, setup.experiment,
+                max_workers=max_workers,
+                needs_hole_roi=needs_hole_roi, needs_background_roi=needs_background_roi,
             )
         else:
             self._worker = _BatchWorker(pl_dict, setup.input_dir, setup.output_dir, setup.experiment)
@@ -2669,6 +2763,9 @@ class RunTab(QWidget):
         self._worker.log_msg.connect(self._log)
         self._worker.finished.connect(self._on_finished)
         self._worker.start()
+
+    def _on_parallel_toggled(self, checked: bool) -> None:
+        self._worker_spin.setEnabled(checked)
 
     def _on_abort(self) -> None:
         if self._worker: self._worker.abort(); self._log("Abort requested …")
@@ -2923,12 +3020,19 @@ class CorrelativeImagingWidget(QWidget):
 
     def make_well_pipeline_dict_fn(self):
         """Snapshot the current Channels/ROI/Combine config into a plain,
-        thread-safe closure ``(well) -> pipeline dict``.
+        thread-safe closure ``(well) -> (pipeline dict, missing_labels)``.
 
-        Returns ``(fn, needs_hole_roi)`` — ``needs_hole_roi`` is True iff at
-        least one selection uses the "BF-pipeline hole ROI" source, so the
-        caller only bothers running Ilastik hole-detection when it's
-        actually needed.
+        ``missing_labels`` lists the ``label`` of every per-well-dynamic
+        selection (``well_hole`` / ``well_background`` / ``well_existing``)
+        that had no matching file for this specific well — the caller
+        (``WellBatchRunner``) surfaces these instead of silently dropping
+        the selection for that well. "Whole image" / "auto" / "file"
+        selections can't go missing this way and are never listed.
+
+        Returns ``(fn, needs_hole_roi, needs_background_roi)`` — the two
+        flags are True iff at least one selection uses that BF-pipeline
+        source, so the caller only bothers running Ilastik hole/background
+        detection when actually needed.
 
         ``_WellBatchWorker`` calls ``fn`` once per well from a background
         QThread — it must not touch any QWidget. This method reads all
@@ -2945,6 +3049,8 @@ class CorrelativeImagingWidget(QWidget):
 
         sels = list(self._roi_tab.get_selections())
         needs_hole_roi = any(s.source == "well_hole" for s in sels)
+        needs_background_roi = any(s.source == "well_background" for s in sels)
+        per_well_dynamic = {"well_hole", "well_background", "well_existing"}
         per_sel_tail: list[tuple] = []
         for sel in sels:
             tail: list[dict] = []
@@ -2953,18 +3059,21 @@ class CorrelativeImagingWidget(QWidget):
             tail.extend(self._combine_tab.get_coloc_steps(sel.mask_key))
             per_sel_tail.append((sel, tail))
 
-        def _fn(well) -> dict:
+        def _fn(well) -> tuple[dict, list[str]]:
             steps = list(preprocess_steps) + list(segment_steps)
+            missing: list[str] = []
             for sel, tail in per_sel_tail:
                 roi_step = sel.get_roi_step(well)
                 if sel.source != "whole" and roi_step is None:
+                    if sel.source in per_well_dynamic:
+                        missing.append(sel.label)
                     continue
                 if roi_step:
                     steps.append(roi_step)
                 steps.extend(tail)
-            return {"name": "pipeline", "steps": steps}
+            return {"name": "pipeline", "steps": steps}, missing
 
-        return _fn, needs_hole_roi
+        return _fn, needs_hole_roi, needs_background_roi
 
 
 # ──────────────────────────────────────────────────────────────────

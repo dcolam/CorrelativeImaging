@@ -35,6 +35,11 @@ class PipelineContext:
     pixel_size_um: float = 1.0
     z_step_um: float = 1.0
     masks: dict[str, np.ndarray] = field(default_factory=dict)
+    # Source file path for each entry in `masks`, when the mask came from a
+    # file (LoadROI) rather than auto-detection — lets downstream steps
+    # (ParticleAnalysis, IntensityMeasurement) record *which file* was
+    # actually used, not just the user-chosen label for the selection.
+    mask_paths: dict[str, str] = field(default_factory=dict)
     metadata: dict = field(default_factory=dict)
 
     def channel_index(self, name_or_idx: int | str) -> int:
@@ -53,6 +58,7 @@ class StepResult:
     image: np.ndarray | None = None            # modified (C,Z,Y,X) or (C,Y,X) array
     measurements: pd.DataFrame | None = None   # tabular measurements
     masks: dict[str, np.ndarray] = field(default_factory=dict)  # named binary/label masks
+    mask_paths: dict[str, str] = field(default_factory=dict)    # source file per mask, if any
     info: dict[str, Any] = field(default_factory=dict)          # scalar stats / metadata
 
 
@@ -128,6 +134,7 @@ class Pipeline:
             if result.image is not None:
                 current = result.image
             context.masks.update(result.masks)
+            context.mask_paths.update(result.mask_paths)
             results.append(result)
             if on_step:
                 on_step(step, result, current)

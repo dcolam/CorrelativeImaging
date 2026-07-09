@@ -56,6 +56,11 @@ dev = [
     "pytest-cov>=4.1",
     "ruff>=0.1",
 ]
+analysis = [
+    # notebooks/ — exploring results.db output
+    "jupyter>=1.0",
+    "matplotlib>=3.8",
+]
 
 [project.scripts]
 ci = "correlative_imaging.cli:cli"

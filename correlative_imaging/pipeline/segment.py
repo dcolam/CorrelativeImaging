@@ -233,7 +233,7 @@ class LoadROI(Step):
                 "Use .roi, .zip (ImageJ) or .tif / .png (binary mask)."
             )
 
-        return StepResult(masks={self.roi_name: mask})
+        return StepResult(masks={self.roi_name: mask}, mask_paths={self.roi_name: str(src)})
 
     # ── Private helpers ──────────────────────────────────────────────
 
