@@ -92,6 +92,12 @@ def _select_java_home() -> Path | None:
     """Pick a JAVA_HOME, preferring the bundled jdk4py JDK (self-contained,
     version-pinned, same wheel-install mechanism as PyQt6/numpy) over
     whatever happens to be installed on the host.
+
+    Returns ``None`` if no *version-checked* compatible JDK can be found —
+    callers must treat that as fatal, not silently proceed. jpype's native
+    bridge has been observed to crash the whole process with zero Python
+    traceback when handed an incompatible JDK (e.g. a brand-new major); an
+    unchecked ``shutil.which("java")`` fallback used to risk exactly that.
     """
     try:
         from jdk4py import JAVA_HOME as bundled_home
@@ -99,7 +105,7 @@ def _select_java_home() -> Path | None:
     except ImportError:
         pass
 
-    java_exe = _find_compatible_java() or shutil.which("java")
+    java_exe = _find_compatible_java()
     if java_exe:
         # java.exe normally lives at <JAVA_HOME>/bin/java(.exe)
         return Path(java_exe).resolve().parent.parent
@@ -122,15 +128,27 @@ def _ensure_java_for_bioformats() -> None:
     global _java_configured
     if _java_configured:
         return
-    _java_configured = True
 
     java_home = _select_java_home()
-    if java_home is not None:
-        os.environ["JAVA_HOME"] = str(java_home)
-        # Some Java-discovery paths (e.g. jgo) scan PATH rather than
-        # JAVA_HOME — put our chosen version first so it wins either way.
-        os.environ["PATH"] = str(java_home / "bin") + os.pathsep + os.environ.get("PATH", "")
-        log.debug("Using Java at %s", java_home)
+    if java_home is None:
+        # Do NOT let this fall through to scyjava's own default behavior:
+        # it will either try to auto-download a JDK (blocked by Group
+        # Policy on locked-down Windows machines — the original failure
+        # mode this module works around) or hand an unvalidated host JDK
+        # to jpype, which can crash the process natively with no
+        # traceback. Fail loudly in Python instead, with an actionable fix.
+        raise ImportError(
+            "No compatible Java runtime found for Bio-Formats (.vsi/.czi/.lif/etc). "
+            "Install the bundled JDK: pip install -e \".[bioformats]\" "
+            "(installs jdk4py — a self-contained JDK 17, no system Java needed)."
+        )
+    _java_configured = True
+
+    os.environ["JAVA_HOME"] = str(java_home)
+    # Some Java-discovery paths (e.g. jgo) scan PATH rather than
+    # JAVA_HOME — put our chosen version first so it wins either way.
+    os.environ["PATH"] = str(java_home / "bin") + os.pathsep + os.environ.get("PATH", "")
+    log.debug("Using Java at %s", java_home)
 
     try:
         import scyjava.config
