@@ -11,31 +11,13 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from correlative_imaging.diagnostics import auto_contrast_limits
+
 if TYPE_CHECKING:
     from correlative_imaging.io import ImageData
     from correlative_imaging.pipeline import Pipeline
 
 log = logging.getLogger(__name__)
-
-
-def auto_contrast_limits(data: np.ndarray, low: float = 1.0, high: float = 99.5) -> tuple[float, float]:
-    """Robust percentile-based display range for an image layer.
-
-    napari's own default (min/max of the data at add-time) is easily skewed
-    dim by a handful of outlier hot/saturated pixels — common in microscopy
-    images with a stray calibration mark or thumbnail artifact. A percentile
-    stretch is far more representative of the actual signal. Display-only;
-    does not modify the underlying data.
-    """
-    finite = data[np.isfinite(data)] if np.issubdtype(data.dtype, np.floating) else data.ravel()
-    if finite.size == 0:
-        return (0.0, 1.0)
-    lo, hi = (float(v) for v in np.percentile(finite, [low, high]))
-    if hi <= lo:
-        lo, hi = float(finite.min()), float(finite.max())
-        if hi <= lo:
-            hi = lo + 1.0
-    return (lo, hi)
 
 
 def _require_napari():

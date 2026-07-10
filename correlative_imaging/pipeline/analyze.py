@@ -24,6 +24,26 @@ _REGION_PROPS = [
     "bbox",
 ]
 
+# User-selectable particle-level metrics (Channels tab). "circularity" and
+# "area_um2" are derived, not raw regionprops columns; "centroid" and "bbox"
+# each expand to more than one output column. Always computed internally
+# (min/max-size and min-circularity filtering depend on area_um2/circularity
+# regardless of what's selected for output) — a None ``metrics`` list means
+# "all of them", keeping old saved pipeline JSONs behaving identically.
+PARTICLE_METRIC_CHOICES = [
+    "area", "area_um2", "perimeter", "circularity", "eccentricity", "solidity",
+    "mean_intensity", "max_intensity", "min_intensity", "centroid", "bbox",
+]
+_PARTICLE_METRIC_COLUMNS = {
+    "centroid": ["centroid_row", "centroid_col"],
+    "bbox": ["bbox-0", "bbox-1", "bbox-2", "bbox-3"],
+}
+
+# User-selectable gross/bulk metrics (Channels tab). "area_px"/"area_um2" are
+# the selection's own area — independently toggleable from mean/sum/std so a
+# selection's area can be recorded without also measuring bulk intensity.
+INTENSITY_METRIC_CHOICES = ["mean_intensity", "sum_intensity", "std_intensity", "area_px", "area_um2"]
+
 
 @dataclass
 @register_step
@@ -44,6 +64,10 @@ class ParticleAnalysis(Step):
     z_projection:   How to collapse Z before analysis.
     roi_mask:       Name of an ROI mask in context to restrict analysis area.
                     Typically ``'roi'`` from an ExtractROI step.
+    metrics:        Which per-particle metrics to keep in the output, from
+                    ``PARTICLE_METRIC_CHOICES``. ``None`` = all of them
+                    (backward-compatible default). ``channel``/``roi_mask``/
+                    ``roi_path``/``label`` are always kept regardless.
     """
     channel: int
     min_size_um2: float = 0.5
@@ -51,6 +75,7 @@ class ParticleAnalysis(Step):
     min_circularity: float = 0.0
     z_projection: str = "max"
     roi_mask: str = ""   # empty = no restriction
+    metrics: list[str] | None = None   # None = all of PARTICLE_METRIC_CHOICES
 
     @property
     def name(self) -> str:
@@ -122,6 +147,16 @@ class ParticleAnalysis(Step):
             np.isin(label_image, list(surviving_labels)), label_image, 0
         )
 
+        # Trim to user-selected metrics — "channel"/"roi_mask"/"roi_path"/
+        # "label" are bookkeeping/identity columns and always kept. Filtering
+        # above already used the full internal set (area_um2/circularity)
+        # regardless of what's selected for output.
+        selected = self.metrics if self.metrics is not None else PARTICLE_METRIC_CHOICES
+        keep = ["channel", "roi_mask", "roi_path", "label"]
+        for m in selected:
+            keep.extend(_PARTICLE_METRIC_COLUMNS.get(m, [m]))
+        df = df[[c for c in keep if c in df.columns]]
+
         return StepResult(
             measurements=df,
             masks={f"particles_ch{self.channel}": filtered_labels},
@@ -146,10 +181,16 @@ class IntensityMeasurement(Step):
     channel:       Channel index to measure.
     z_projection:  How to collapse Z ('max', 'mean', 'sum').
     roi_mask:      Key of an ROI mask in context.masks.  Empty = whole image.
+    metrics:       Which of ``INTENSITY_METRIC_CHOICES`` to keep in the
+                    output. ``None`` = all of them (backward-compatible
+                    default). ``area_px``/``area_um2`` are independent of
+                    mean/sum/std — a selection's area can be recorded without
+                    also measuring bulk intensity.
     """
     channel: int
     z_projection: str = "max"
     roi_mask: str = ""
+    metrics: list[str] | None = None   # None = all of INTENSITY_METRIC_CHOICES
 
     @property
     def name(self) -> str:
@@ -174,17 +215,21 @@ class IntensityMeasurement(Step):
                    if self.channel < len(context.channel_names)
                    else f"ch{self.channel}")
 
-        vals = {
-            "channel":        ch_name,
-            "roi_mask":       self.roi_mask or "whole_image",
-            "roi_path":       context.mask_paths.get(self.roi_mask, "") if self.roi_mask else "",
+        all_vals = {
             "mean_intensity": float(pixels.mean()) if pixels.size > 0 else 0.0,
             "sum_intensity":  float(pixels.sum())  if pixels.size > 0 else 0.0,
             "std_intensity":  float(pixels.std())  if pixels.size > 0 else 0.0,
             "area_px":        area_px,
             "area_um2":       area_um2,
         }
+        selected = self.metrics if self.metrics is not None else INTENSITY_METRIC_CHOICES
+        vals = {
+            "channel":        ch_name,
+            "roi_mask":       self.roi_mask or "whole_image",
+            "roi_path":       context.mask_paths.get(self.roi_mask, "") if self.roi_mask else "",
+            **{m: all_vals[m] for m in selected if m in all_vals},
+        }
         return StepResult(
             measurements=pd.DataFrame([vals]),
-            info={"mean_intensity": vals["mean_intensity"]},
+            info={"mean_intensity": all_vals["mean_intensity"]},
         )

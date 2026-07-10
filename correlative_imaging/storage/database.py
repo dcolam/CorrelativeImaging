@@ -12,6 +12,22 @@ import pandas as pd
 
 log = logging.getLogger(__name__)
 
+
+def _as_float(v) -> float | None:
+    """None/NaN-preserving float cast — a metric the user didn't select to
+    save is stored as SQL NULL, not 0, so "not measured" stays distinguishable
+    from "measured and happened to be zero"."""
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return None
+    return float(v)
+
+
+def _as_int(v) -> int | None:
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return None
+    return int(v)
+
+
 _DDL = """
 CREATE TABLE IF NOT EXISTS images (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -182,18 +198,18 @@ class ResultsDB:
                     str(r.get("channel", "")),
                     str(r.get("roi_mask", "whole_image")),
                     str(r.get("roi_path", "") or ""),
-                    int(r.get("label", 0)),
-                    float(r.get("area", 0)),
-                    float(r.get("area_um2", 0)),
-                    float(r.get("perimeter", 0)),
-                    float(r.get("circularity", 0)),
-                    float(r.get("eccentricity", 0)),
-                    float(r.get("solidity", 0)),
-                    float(r.get("mean_intensity", 0)),
-                    float(r.get("max_intensity", 0)),
-                    float(r.get("min_intensity", 0)),
-                    float(r.get("centroid_row", 0)),
-                    float(r.get("centroid_col", 0)),
+                    _as_int(r.get("label")),
+                    _as_float(r.get("area")),
+                    _as_float(r.get("area_um2")),
+                    _as_float(r.get("perimeter")),
+                    _as_float(r.get("circularity")),
+                    _as_float(r.get("eccentricity")),
+                    _as_float(r.get("solidity")),
+                    _as_float(r.get("mean_intensity")),
+                    _as_float(r.get("max_intensity")),
+                    _as_float(r.get("min_intensity")),
+                    _as_float(r.get("centroid_row")),
+                    _as_float(r.get("centroid_col")),
                 )
             )
         self._con.executemany(
@@ -221,11 +237,11 @@ class ResultsDB:
                 str(r.get("channel", "")),
                 str(r.get("roi_mask", "whole_image")),
                 str(r.get("roi_path", "") or ""),
-                float(r.get("mean_intensity", 0)),
-                float(r.get("sum_intensity", 0)),
-                float(r.get("std_intensity", 0)),
-                int(r.get("area_px", 0)),
-                float(r.get("area_um2", 0)),
+                _as_float(r.get("mean_intensity")),
+                _as_float(r.get("sum_intensity")),
+                _as_float(r.get("std_intensity")),
+                _as_int(r.get("area_px")),
+                _as_float(r.get("area_um2")),
             )
             for _, r in df.iterrows()
         ]
@@ -329,6 +345,64 @@ class ResultsDB:
             ),
         )
         self._con.commit()
+
+    # ------------------------------------------------------------------
+    # Merge (parallel-batch per-worker sub-DBs → one combined database)
+    # ------------------------------------------------------------------
+
+    def merge_from(self, other_db_path: str | Path) -> int:
+        """Copy every row from *other_db_path* (a separate ``ResultsDB`` file,
+        e.g. a per-worker sub-database from a parallel batch run) into this
+        database. ``image_id`` foreign keys are remapped since each source
+        database has its own independent AUTOINCREMENT sequence — copying
+        ``images`` rows first and recording old→new id, then rewriting every
+        other table's ``image_id`` through that mapping as it's copied.
+
+        The source file is left untouched — callers keep sub-DBs alongside
+        the merged one for inspection/debugging.
+
+        Returns the number of images merged.
+        """
+        other_db_path = Path(other_db_path)
+        src = sqlite3.connect(str(other_db_path))
+        src.row_factory = sqlite3.Row
+        try:
+            id_map: dict[int, int] = {}
+            for row in src.execute("SELECT * FROM images ORDER BY id"):
+                d = dict(row)
+                old_id = d.pop("id")
+                cur = self._con.execute(
+                    """
+                    INSERT INTO images (path, filename, experiment, n_channels,
+                                        pixel_size_um, run_timestamp, metadata)
+                    VALUES (:path, :filename, :experiment, :n_channels,
+                            :pixel_size_um, :run_timestamp, :metadata)
+                    """,
+                    d,
+                )
+                id_map[old_id] = cur.lastrowid
+
+            for table in (
+                "particle_measurements", "intensity_measurements",
+                "colocalization_results", "colocalization_per_particle",
+                "pipeline_runs",
+            ):
+                cols = [c[1] for c in src.execute(f"PRAGMA table_info({table})") if c[1] != "id"]
+                col_list = ", ".join(cols)
+                placeholders = ", ".join(f":{c}" for c in cols)
+                for row in src.execute(f"SELECT * FROM {table}"):  # noqa: S608
+                    d = {c: row[c] for c in cols}
+                    if "image_id" in d and d["image_id"] is not None:
+                        d["image_id"] = id_map.get(d["image_id"])
+                    self._con.execute(
+                        f"INSERT INTO {table} ({col_list}) VALUES ({placeholders})",  # noqa: S608
+                        d,
+                    )
+
+            self._con.commit()
+            return len(id_map)
+        finally:
+            src.close()
 
     # ------------------------------------------------------------------
     # Export helpers

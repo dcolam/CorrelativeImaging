@@ -11,6 +11,7 @@ from pathlib import Path
 
 from tqdm import tqdm
 
+from correlative_imaging.diagnostics import bbox_from_mask, composite_rgb, save_diagnostic_image
 from correlative_imaging.io import read_image, supported_extensions
 from correlative_imaging.io.plate import WellInfo
 from correlative_imaging.pipeline.base import Pipeline, PipelineContext, Step
@@ -175,6 +176,45 @@ class _WellComputeResult:
     missing_selections: list[str] = field(default_factory=list)  # unmatched per-well selection labels
 
 
+def _save_well_diagnostics(well, image_data, pl_dict: dict, context: PipelineContext, diag_cfg: dict) -> None:
+    """Write whole-image and/or per-ROI-crop composite diagnostic images for
+    one well, per ``diag_cfg`` (see ``RunTab._on_run`` for the dict shape).
+
+    Only the actual ROI *selections* configured in this well's pipeline are
+    cropped — ``context.masks`` also holds intermediate segmentation/particle
+    label masks (``mask_ch{c}``, ``particles_ch{c}``) that aren't selections
+    and must not be emitted as crops.
+    """
+    out_dir = Path(diag_cfg["output_dir"])
+    out_dir.mkdir(parents=True, exist_ok=True)
+    formats = diag_cfg["formats"]
+    colors = diag_cfg.get("colors") or []
+    planes = list(image_data.project("max"))
+
+    if diag_cfg.get("whole"):
+        rgb = composite_rgb(planes, colors)
+        save_diagnostic_image(rgb, out_dir / f"{well.well_id}_whole", formats)
+
+    if diag_cfg.get("crops"):
+        pixel_size_um = image_data.pixel_size_um or 1.0
+        pad_px = round(diag_cfg.get("crop_pad_um", 0.0) / pixel_size_um)
+        roi_names = [
+            s["roi_name"] for s in pl_dict.get("steps", [])
+            if s.get("type") in ("LoadROI", "ExtractROI") and "roi_name" in s
+        ]
+        for roi_name in roi_names:
+            mask = context.masks.get(roi_name)
+            if mask is None:
+                continue
+            bbox = bbox_from_mask(mask, pad_px)
+            if bbox is None:
+                continue
+            r0, r1, c0, c1 = bbox
+            cropped_planes = [p[r0:r1, c0:c1] for p in planes]
+            rgb = composite_rgb(cropped_planes, colors)
+            save_diagnostic_image(rgb, out_dir / f"{well.well_id}_{roi_name}_crop", formats)
+
+
 class WellBatchRunner:
     """Run a per-well pipeline over a list of :class:`WellInfo`.
 
@@ -197,7 +237,11 @@ class WellBatchRunner:
     # only reads well.fl_path, never the database.
     # ------------------------------------------------------------------
 
-    def _process_well(self, well: WellInfo, pipeline_dict_fn: PipelineDictFn) -> _WellComputeResult:
+    def _process_well(
+        self, well: WellInfo, pipeline_dict_fn: PipelineDictFn,
+        diag_cfg: dict | None = None,
+        on_step_fn: Callable[[WellInfo, int, int, str], None] | None = None,
+    ) -> _WellComputeResult:
         pl_dict, missing = pipeline_dict_fn(well)
         pipeline_json = json.dumps(pl_dict)
         pl_name = pl_dict.get("name", "pipeline")
@@ -212,7 +256,26 @@ class WellBatchRunner:
                 pixel_size_um=image_data.pixel_size_um,
                 z_step_um=image_data.z_step_um,
             )
-            _, results = pl.run(image_data.data, context)
+            total_steps = len(pl.steps)
+            on_step = None
+            if on_step_fn:
+                step_counter = [0]
+
+                def on_step(step, result, current):
+                    step_counter[0] += 1
+                    on_step_fn(well, step_counter[0], total_steps, step.name)
+
+            _, results = pl.run(image_data.data, context, on_step=on_step)
+
+            if diag_cfg:
+                try:
+                    _save_well_diagnostics(well, image_data, pl_dict, context, diag_cfg)
+                except Exception:
+                    log.warning(
+                        "Diagnostic image export failed for well %s:\n%s",
+                        well.well_id, traceback.format_exc(),
+                    )
+
             return _WellComputeResult(
                 well=well, pl_name=pl_name, pipeline_json=pipeline_json,
                 steps_and_results=list(zip(pl.steps, results)),
@@ -284,6 +347,8 @@ class WellBatchRunner:
         should_abort: Callable[[], bool] | None = None,
         max_workers: int = 1,
         warn_fn: Callable[[str], None] | None = None,
+        diag_cfg: dict | None = None,
+        on_step_fn: Callable[[WellInfo, int, int, str], None] | None = None,
     ) -> None:
         """Process every well with an FL image, using a pipeline built per well.
 
@@ -296,13 +361,25 @@ class WellBatchRunner:
         ``images.metadata`` JSON records which selection(s) were unmatched. A
         summary count per selection is emitted once at the end of the run.
 
+        diag_cfg: optional diagnostic-image export config (see
+        ``RunTab._on_run`` for the dict shape) — when given, ``_process_well``
+        also writes composite diagnostic image(s) per well.
+
+        on_step_fn: optional callback ``(well, step_index, total_steps,
+        step_name)`` invoked after each pipeline step within a well — drives
+        a per-image step-level progress indicator, distinct from the
+        well-level ``progress_fn``. Called from whichever thread is running
+        that well (may not be the calling thread when ``max_workers > 1``).
+
         max_workers: EXPERIMENTAL. 1 (default) = original sequential
-        behavior, byte-for-byte. >1 runs the read+pipeline-compute stage for
-        multiple wells concurrently in a thread pool (numpy/scipy/skimage/
-        tifffile release the GIL, so this can meaningfully speed up I/O- and
-        compute-bound batches); all database writes still happen on this
-        method's own thread, one at a time, so SQLite is never touched
-        concurrently.
+        behavior, byte-for-byte, writing directly to ``db_path``. >1 gives
+        each worker thread its own sub-database (``<db_path>.partN<ext>``) —
+        a whole contiguous slice of wells per thread, compute *and* write —
+        so SQLite is never touched by more than one thread at a time and
+        writes are never serialized onto a single connection. All sub-DBs
+        are merged into ``db_path`` at the end (remapping ``image_id``
+        foreign keys, since each sub-DB has its own independent autoincrement
+        sequence) and kept on disk afterward, not deleted.
         """
         wells_with_fl = [w for w in wells if w.fl_path is not None]
         if not wells_with_fl:
@@ -311,19 +388,22 @@ class WellBatchRunner:
         total = len(wells_with_fl)
 
         from collections import Counter
+        import threading
         missing_counts: Counter = Counter()
+        missing_lock = threading.Lock()
 
         def _note_missing(well: WellInfo, missing: list[str]) -> None:
             if not missing:
                 return
-            missing_counts.update(missing)
+            with missing_lock:
+                missing_counts.update(missing)
             msg = f"⚠ {well.well_id}: no match for {', '.join(missing)} — skipped for this well"
             log.warning(msg)
             if warn_fn:
                 warn_fn(msg)
 
-        with ResultsDB(self.db_path) as db:
-            if max_workers <= 1:
+        if max_workers <= 1:
+            with ResultsDB(self.db_path) as db:
                 iterator = (
                     tqdm(wells_with_fl, unit="well", desc="Batch")
                     if progress_fn is None else wells_with_fl
@@ -332,44 +412,56 @@ class WellBatchRunner:
                     if should_abort and should_abort():
                         log.info("Batch aborted at well %s", well.well_id)
                         break
-                    result = self._process_well(well, pipeline_dict_fn)
+                    result = self._process_well(well, pipeline_dict_fn, diag_cfg, on_step_fn)
                     _note_missing(well, result.missing_selections)
                     n_particles = self._write_result(db, result)
                     if progress_fn:
                         progress_fn(idx + 1, total, well.well_id, n_particles)
-            else:
-                from concurrent.futures import ThreadPoolExecutor, as_completed
+        else:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
 
-                log.info(
-                    "Running well batch with %d worker threads (experimental)",
-                    max_workers,
+            log.info(
+                "Running well batch with %d worker threads, one sub-DB each (experimental)",
+                max_workers,
+            )
+            n_chunks = min(max_workers, len(wells_with_fl))
+            chunks = [wells_with_fl[i::n_chunks] for i in range(n_chunks)]
+            progress_lock = threading.Lock()
+            done = [0]
+
+            def _run_chunk(chunk_idx: int, chunk: list[WellInfo]) -> Path:
+                sub_db_path = self.db_path.with_name(
+                    f"{self.db_path.stem}.part{chunk_idx}{self.db_path.suffix}"
                 )
-                with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    futures = {
-                        executor.submit(self._process_well, w, pipeline_dict_fn): w
-                        for w in wells_with_fl
-                    }
-                    done = 0
-                    aborted = False
-                    for future in as_completed(futures):
-                        well = futures[future]
-                        if future.cancelled():
-                            continue
-                        result = future.result()
+                with ResultsDB(sub_db_path) as db:
+                    for well in chunk:
+                        if should_abort and should_abort():
+                            log.info("Batch aborted at well %s (chunk %d)", well.well_id, chunk_idx)
+                            break
+                        result = self._process_well(well, pipeline_dict_fn, diag_cfg, on_step_fn)
                         _note_missing(well, result.missing_selections)
                         n_particles = self._write_result(db, result)
-                        done += 1
+                        with progress_lock:
+                            done[0] += 1
+                            current = done[0]
                         if progress_fn:
-                            progress_fn(done, total, well.well_id, n_particles)
-                        if not aborted and should_abort and should_abort():
-                            aborted = True
-                            log.info(
-                                "Batch abort requested — draining %d in-flight well(s), "
-                                "no further wells will start",
-                                sum(1 for f in futures if not f.done()),
-                            )
-                            for f in futures:
-                                f.cancel()
+                            progress_fn(current, total, well.well_id, n_particles)
+                return sub_db_path
+
+            sub_db_paths: list[Path] = []
+            with ThreadPoolExecutor(max_workers=n_chunks) as executor:
+                futures = {
+                    executor.submit(_run_chunk, i, chunk): i
+                    for i, chunk in enumerate(chunks)
+                }
+                for future in as_completed(futures):
+                    sub_db_paths.append(future.result())
+
+            log.info("Merging %d sub-DB(s) into %s …", len(sub_db_paths), self.db_path)
+            with ResultsDB(self.db_path) as db:
+                for sub_path in sorted(sub_db_paths):
+                    n = db.merge_from(sub_path)
+                    log.info("  merged %d image(s) from %s", n, sub_path.name)
 
         if missing_counts:
             summary = "Unmatched ROI selections: " + ", ".join(
