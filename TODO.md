@@ -40,12 +40,14 @@ tabs, a fake `napari.qt.threading` harness driving the real preview code
 
 ## Recent (not part of the original numbered list)
 
-- [x] Split "Setup" tab: it now only has folders + a "Load existing pipeline
-  JSON" section (moved here from Channels tab). Plate scan / grid / selected-
-  well controls moved to a new **Plate** tab, so neither tab overflows a
-  short window. Pipeline Summary tab now scrolls internally too (its bottom
-  controls could get clipped before). Verified headlessly: all 8 tabs build,
-  cycle, JSON-load signal/round-trip still works.
+- [x] Split "Setup" tab: it now has folders, the plate-scan controls
+  (extension/filter/recursive/Scan button — moved back here per your
+  follow-up), and a "Load existing pipeline JSON" section (moved here from
+  Channels tab). Only the plate grid + selected-well detail live on the new
+  **Plate** tab now, so neither tab overflows a short window. Pipeline
+  Summary tab now scrolls internally too (its bottom controls could get
+  clipped before). Verified headlessly: all 8 tabs build, cycle, JSON-load
+  signal/round-trip still works, scan controls confirmed on Setup page.
 - [x] Extracted diagnostic-image compositing helpers (`composite_rgb`,
   `save_diagnostic_image`, `bbox_from_mask`, `auto_contrast_limits`) out of
   `gui.py` into a new `correlative_imaging/diagnostics.py` with zero Qt/napari

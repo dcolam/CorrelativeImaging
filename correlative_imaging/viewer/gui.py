@@ -625,36 +625,8 @@ class PlateTab(QWidget):
         ff.addRow("Experiment:",    self._exp_edit)
         setup_lay.addWidget(folder_box)
 
-        # ── 2. Load an existing pipeline JSON (optional) ─────────────
-        json_box = QGroupBox("2. Load existing pipeline (optional)")
-        jl = QVBoxLayout(json_box)
-        json_row = QHBoxLayout()
-        json_row.addWidget(QLabel("Pipeline JSON:"))
-        self._json_combo = QComboBox()
-        self._json_combo.addItem("(none found in output folder)")
-        json_row.addWidget(self._json_combo, stretch=1)
-        load_json_btn = QPushButton("Load")
-        load_json_btn.clicked.connect(self._on_load_json_clicked)
-        json_row.addWidget(load_json_btn)
-        browse_json_btn = QPushButton("Browse …")
-        browse_json_btn.clicked.connect(self._on_browse_json_clicked)
-        json_row.addWidget(browse_json_btn)
-        jl.addLayout(json_row)
-        setup_lay.addWidget(json_box)
-        setup_lay.addStretch()
-
-        # ── Plate page: scan options + grid + selected-well detail ───
-        plate_outer = QVBoxLayout(self.plate_page)
-        plate_outer.setContentsMargins(0, 0, 0, 0)
-        plate_content = QWidget()
-        lay = QVBoxLayout(plate_content)
-        plate_scroll = QScrollArea()
-        plate_scroll.setWidgetResizable(True)
-        plate_scroll.setWidget(plate_content)
-        plate_outer.addWidget(plate_scroll)
-
-        # ── 1. Plate scan options ────────────────────────────────────
-        scan_box = QGroupBox("1. Plate scan")
+        # ── 2. Plate scan options ────────────────────────────────────
+        scan_box = QGroupBox("2. Plate scan")
         sl = QFormLayout(scan_box)
 
         self._ext_edit = QLineEdit(".vsi")
@@ -674,10 +646,38 @@ class PlateTab(QWidget):
         self._status_lbl = QLabel("")
         self._status_lbl.setWordWrap(True)
         sl.addRow(self._status_lbl)
-        lay.addWidget(scan_box)
+        setup_lay.addWidget(scan_box)
 
-        # ── 2. Plate grid ────────────────────────────────────────────
-        grid_box = QGroupBox("2. Plate layout  (click a well to select)")
+        # ── 3. Load an existing pipeline JSON (optional) ─────────────
+        json_box = QGroupBox("3. Load existing pipeline (optional)")
+        jl = QVBoxLayout(json_box)
+        json_row = QHBoxLayout()
+        json_row.addWidget(QLabel("Pipeline JSON:"))
+        self._json_combo = QComboBox()
+        self._json_combo.addItem("(none found in output folder)")
+        json_row.addWidget(self._json_combo, stretch=1)
+        load_json_btn = QPushButton("Load")
+        load_json_btn.clicked.connect(self._on_load_json_clicked)
+        json_row.addWidget(load_json_btn)
+        browse_json_btn = QPushButton("Browse …")
+        browse_json_btn.clicked.connect(self._on_browse_json_clicked)
+        json_row.addWidget(browse_json_btn)
+        jl.addLayout(json_row)
+        setup_lay.addWidget(json_box)
+        setup_lay.addStretch()
+
+        # ── Plate page: grid + selected-well detail ───────────────────
+        plate_outer = QVBoxLayout(self.plate_page)
+        plate_outer.setContentsMargins(0, 0, 0, 0)
+        plate_content = QWidget()
+        lay = QVBoxLayout(plate_content)
+        plate_scroll = QScrollArea()
+        plate_scroll.setWidgetResizable(True)
+        plate_scroll.setWidget(plate_content)
+        plate_outer.addWidget(plate_scroll)
+
+        # ── 1. Plate grid ────────────────────────────────────────────
+        grid_box = QGroupBox("1. Plate layout  (click a well to select)")
         gl = QVBoxLayout(grid_box)
 
         legend = QHBoxLayout()
@@ -709,7 +709,7 @@ class PlateTab(QWidget):
         lay.addWidget(grid_box)
 
         # ── 4. Selected well / load sample ───────────────────────────
-        detail_box = QGroupBox("3. Selected well")
+        detail_box = QGroupBox("2. Selected well")
         dl = QFormLayout(detail_box)
         self._d_well = QLabel("—")
         self._d_bf   = QLabel("—"); self._d_bf.setWordWrap(True)
