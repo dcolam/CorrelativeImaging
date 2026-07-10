@@ -807,19 +807,33 @@ class PlateTab(QWidget):
 
     # ── Load pipeline JSON ────────────────────────────────────────────
 
-    def refresh_json_dropdown(self, output_dir) -> None:
-        """Repopulate the dropdown with *_pipeline.json files found in
-        output_dir (the naming convention from RunTab's auto-save, see
-        _run_basename). Call whenever output_dir might have changed."""
+    def refresh_json_dropdown(self, input_dir=None, output_dir=None) -> None:
+        """Repopulate the dropdown with *_pipeline.json files found in both
+        the input and output folders (the naming convention from RunTab's
+        auto-save, see _run_basename — but a JSON could also have been saved
+        or copied next to the raw data). Call whenever either folder might
+        have changed, e.g. right after a plate scan."""
         self._json_combo.blockSignals(True)
         current = self._json_combo.currentText()
         self._json_combo.clear()
-        found = sorted(Path(output_dir).glob("*_pipeline.json")) if output_dir else []
+        seen: set[Path] = set()
+        found: list[Path] = []
+        for d in (input_dir, output_dir):
+            if not d:
+                continue
+            d = Path(d)
+            if not d.is_dir():
+                continue
+            for p in sorted(d.glob("*_pipeline.json")):
+                resolved = p.resolve()
+                if resolved not in seen:
+                    seen.add(resolved)
+                    found.append(p)
         if found:
             for p in found:
                 self._json_combo.addItem(p.name, str(p))
         else:
-            self._json_combo.addItem("(none found in output folder)")
+            self._json_combo.addItem("(none found in input/output folder)")
         idx = self._json_combo.findText(current)
         self._json_combo.setCurrentIndex(idx if idx >= 0 else 0)
         self._json_combo.blockSignals(False)
@@ -899,6 +913,8 @@ class PlateTab(QWidget):
                     tags.add(tag)
         if tags:
             self.existing_rois_detected.emit(sorted(tags))
+
+        self.refresh_json_dropdown(self.input_dir, self.output_dir)
 
     def _on_well_clicked(self, well_id: str) -> None:
         w = self._wells.get(well_id)
@@ -3961,7 +3977,7 @@ class CorrelativeImagingWidget(QWidget):
 
     def _on_tab_changed(self, index: int) -> None:
         if self._tabs.widget(index) is self._plate_tab.setup_page:
-            self._plate_tab.refresh_json_dropdown(self._plate_tab.output_dir)
+            self._plate_tab.refresh_json_dropdown(self._plate_tab.input_dir, self._plate_tab.output_dir)
 
     def _on_load_pipeline_json(self, pl_dict: dict) -> None:
         """Apply a loaded pipeline JSON to Channels, ROI & Selections, and
