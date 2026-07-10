@@ -48,6 +48,51 @@ tabs, a fake `napari.qt.threading` harness driving the real preview code
   Summary tab now scrolls internally too (its bottom controls could get
   clipped before). Verified headlessly: all 8 tabs build, cycle, JSON-load
   signal/round-trip still works, scan controls confirmed on Setup page.
+- [x] **Fixed a real bug found while extending diagnostics**: `RunTab` was
+  constructed without `get_channel_colors=`, so `self._get_channel_colors`
+  was always `None` — every diagnostic image was composited with an empty
+  color list (silently landing all-black) and the single-image preview
+  always fell back to rotating step-colors instead of the user's assigned
+  channel colors, regardless of what was set in the Channels tab's "Channel
+  identity" box. Fixed by wiring `get_channel_colors=lambda: [p.display_color
+  for p in self._channels_tab.get_panels()]` into the `RunTab(...)`
+  constructor call. Verified with a regression test that builds the *real*
+  `CorrelativeImagingWidget` (not a hand-fed `RunTab`), sets colors through
+  the actual `ChannelPanel` combo, and confirms both the diagnostic `diag_cfg`
+  and the preview layers pick them up — this is the exact path the earlier,
+  narrower tests never exercised (they always supplied colors directly).
+- [x] Diagnostic images now use each channel's **last pre-threshold
+  processed image** (e.g. post-Normalize) as the composite base, not raw
+  values — reuses `Pipeline.run()`'s own returned final image, which (since
+  `AutoThreshold`/`WatershedSplit` never touch `result.image`) already holds
+  exactly that per channel. Verified with a GaussianBlur step: the saved
+  composite showed the blur spread, proving the processed image was used,
+  not raw.
+- [x] Added an optional **ROI-outline stamp** on diagnostic images (new
+  `diagnostics.stamp_outlines()`, white 1px inner boundary) — draws exactly
+  where each ROI selection landed directly onto the composite, including
+  JPGs. New "Stamp ROI outline on image" checkbox on the Run tab.
+- [x] Added an optional **particle label co-save**: one extra
+  `<well>_particles_ch<N>.tif` per channel with particle analysis enabled,
+  saving the exact integer-labeled particle mask from `context.masks`
+  (TIFF-only, never JPG, since lossy compression would corrupt label
+  values). New "Also save particle label images (TIFF)" checkbox, off by
+  default given it's a heavier, more specialized output.
+- [x] Added a **"Assign channel colors …" popup dialog** (`ChannelColorDialog`)
+  on the Channels tab — lists every channel with its own color/swatch picker
+  in one place, applying back to each `ChannelPanel`'s existing color combo,
+  instead of having to open each channel's own panel to change its color.
+- [x] Decoupled loading a pipeline JSON from having a sample image loaded
+  first. Previously `_on_load_pipeline_json` refused outright ("load a
+  sample image first") because channel count/names aren't in the JSON
+  itself. Now derives the channel count from the highest channel/
+  primary_channel/secondary_channel index referenced anywhere in the JSON's
+  steps, and creates that many generic channel panels (ch0, ch1, …) on the
+  spot if fewer (or none) exist yet — so clicking Load on the Setup tab's
+  JSON dropdown populates Channels/ROI & Selections/Colocalization
+  immediately, no image load required. If a sample was already loaded with
+  real channel names and it already has enough channels, those real names
+  are left alone (verified both paths explicitly).
 - [x] Extracted diagnostic-image compositing helpers (`composite_rgb`,
   `save_diagnostic_image`, `bbox_from_mask`, `auto_contrast_limits`) out of
   `gui.py` into a new `correlative_imaging/diagnostics.py` with zero Qt/napari

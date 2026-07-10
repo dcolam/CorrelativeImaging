@@ -11,7 +11,7 @@ from pathlib import Path
 
 from tqdm import tqdm
 
-from correlative_imaging.diagnostics import bbox_from_mask, composite_rgb, save_diagnostic_image
+from correlative_imaging.diagnostics import bbox_from_mask, composite_rgb, save_diagnostic_image, stamp_outlines
 from correlative_imaging.io import read_image, supported_extensions
 from correlative_imaging.io.plate import WellInfo
 from correlative_imaging.pipeline.base import Pipeline, PipelineContext, Step
@@ -176,9 +176,26 @@ class _WellComputeResult:
     missing_selections: list[str] = field(default_factory=list)  # unmatched per-well selection labels
 
 
-def _save_well_diagnostics(well, image_data, pl_dict: dict, context: PipelineContext, diag_cfg: dict) -> None:
+def _project_planes(arr) -> "np.ndarray":
+    """Collapse a (C, Z, Y, X) pipeline image to (C, Y, X) via max-projection;
+    no-op for an already-2-D-per-channel (C, Y, X) array."""
+    return arr.max(axis=1) if arr.ndim == 4 else arr
+
+
+def _save_well_diagnostics(
+    well, final_image, pixel_size_um: float, pl_dict: dict,
+    context: PipelineContext, diag_cfg: dict,
+) -> None:
     """Write whole-image and/or per-ROI-crop composite diagnostic images for
     one well, per ``diag_cfg`` (see ``RunTab._on_run`` for the dict shape).
+
+    ``final_image`` is the array ``Pipeline.run()`` returns (not the raw
+    ``image_data.data``) — since ``AutoThreshold``/``WatershedSplit`` never
+    set ``result.image`` (only ``result.masks``) and every preprocessing step
+    only overwrites its own channel's slice, this is exactly each channel's
+    *last pre-threshold* image, matching what the single-image preview shows
+    by default (#23) — a channel with no preprocessing steps configured just
+    keeps its raw data unchanged, which is still the right fallback.
 
     Only the actual ROI *selections* configured in this well's pipeline are
     cropped — ``context.masks`` also holds intermediate segmentation/particle
@@ -189,30 +206,39 @@ def _save_well_diagnostics(well, image_data, pl_dict: dict, context: PipelineCon
     out_dir.mkdir(parents=True, exist_ok=True)
     formats = diag_cfg["formats"]
     colors = diag_cfg.get("colors") or []
-    planes = list(image_data.project("max"))
+    stamp = diag_cfg.get("stamp_rois", False)
+    planes = list(_project_planes(final_image))
+
+    roi_names = [
+        s["roi_name"] for s in pl_dict.get("steps", [])
+        if s.get("type") in ("LoadROI", "ExtractROI") and "roi_name" in s
+    ]
+    roi_masks = {name: context.masks[name] for name in roi_names if context.masks.get(name) is not None}
 
     if diag_cfg.get("whole"):
         rgb = composite_rgb(planes, colors)
+        if stamp and roi_masks:
+            rgb = stamp_outlines(rgb, roi_masks)
         save_diagnostic_image(rgb, out_dir / f"{well.well_id}_whole", formats)
 
     if diag_cfg.get("crops"):
-        pixel_size_um = image_data.pixel_size_um or 1.0
-        pad_px = round(diag_cfg.get("crop_pad_um", 0.0) / pixel_size_um)
-        roi_names = [
-            s["roi_name"] for s in pl_dict.get("steps", [])
-            if s.get("type") in ("LoadROI", "ExtractROI") and "roi_name" in s
-        ]
-        for roi_name in roi_names:
-            mask = context.masks.get(roi_name)
-            if mask is None:
-                continue
+        pad_px = round(diag_cfg.get("crop_pad_um", 0.0) / (pixel_size_um or 1.0))
+        for roi_name, mask in roi_masks.items():
             bbox = bbox_from_mask(mask, pad_px)
             if bbox is None:
                 continue
             r0, r1, c0, c1 = bbox
             cropped_planes = [p[r0:r1, c0:c1] for p in planes]
             rgb = composite_rgb(cropped_planes, colors)
+            if stamp:
+                rgb = stamp_outlines(rgb, {roi_name: mask[r0:r1, c0:c1]})
             save_diagnostic_image(rgb, out_dir / f"{well.well_id}_{roi_name}_crop", formats)
+
+    if diag_cfg.get("save_particle_labels"):
+        import tifffile
+        for key, mask in context.masks.items():
+            if key.startswith("particles_ch") and mask is not None and mask.max() > 0:
+                tifffile.imwrite(str(out_dir / f"{well.well_id}_{key}.tif"), mask.astype("uint16"))
 
 
 class WellBatchRunner:
@@ -265,11 +291,13 @@ class WellBatchRunner:
                     step_counter[0] += 1
                     on_step_fn(well, step_counter[0], total_steps, step.name)
 
-            _, results = pl.run(image_data.data, context, on_step=on_step)
+            final_image, results = pl.run(image_data.data, context, on_step=on_step)
 
             if diag_cfg:
                 try:
-                    _save_well_diagnostics(well, image_data, pl_dict, context, diag_cfg)
+                    _save_well_diagnostics(
+                        well, final_image, image_data.pixel_size_um, pl_dict, context, diag_cfg,
+                    )
                 except Exception:
                     log.warning(
                         "Diagnostic image export failed for well %s:\n%s",

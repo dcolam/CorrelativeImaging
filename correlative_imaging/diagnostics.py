@@ -79,6 +79,26 @@ def save_diagnostic_image(rgb: np.ndarray, path_no_ext: Path, formats: set[str])
         iio.imwrite(str(path_no_ext.with_suffix(".jpg")), rgb)
 
 
+def stamp_outlines(
+    rgb: np.ndarray, masks: dict[str, np.ndarray],
+    color: tuple[int, int, int] = (255, 255, 255),
+) -> np.ndarray:
+    """Draw a 1px inner-boundary outline of each mask onto an RGB composite —
+    lets a saved diagnostic image (including a lossy JPG) show exactly where
+    an ROI selection landed without needing to reopen it alongside a
+    separate mask file. Returns a new array; ``rgb`` itself is untouched.
+    """
+    from skimage.segmentation import find_boundaries
+
+    out = rgb.copy()
+    for mask in masks.values():
+        if mask is None or not np.any(mask):
+            continue
+        boundary = find_boundaries(mask.astype(bool), mode="inner")
+        out[boundary] = color
+    return out
+
+
 def bbox_from_mask(mask: np.ndarray, pad_px: int = 0):
     """Return (r0, r1, c0, c1) bounding box of a mask's True pixels, padded
     by pad_px and clipped to the mask's own shape. None if mask is empty."""

@@ -15,6 +15,7 @@ from qtpy.QtWidgets import (
     QButtonGroup,
     QCheckBox,
     QComboBox,
+    QDialog,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
@@ -43,6 +44,7 @@ from qtpy.QtWidgets import (
 )
 
 from correlative_imaging.diagnostics import CHANNEL_COLOR_CHOICES as _CHANNEL_COLOR_CHOICES
+from correlative_imaging.diagnostics import CHANNEL_COLOR_RGB as _CHANNEL_COLOR_RGB
 from correlative_imaging.io import supported_extensions
 from correlative_imaging.pipeline.analyze import INTENSITY_METRIC_CHOICES, PARTICLE_METRIC_CHOICES
 from correlative_imaging.viewer.napari_viewer import auto_contrast_limits
@@ -2120,6 +2122,57 @@ class ChannelPanel(QWidget):
         )
 
 
+class ChannelColorDialog(QDialog):
+    """Small popup listing every channel with a color/LUT picker each —
+    the same colors drive the preview default display (#23) and diagnostic
+    image export, so it's convenient to review/set them all in one place
+    instead of digging into each channel's own panel."""
+
+    def __init__(self, panels: list["ChannelPanel"], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Assign channel colors")
+        self._panels = panels
+        self._combos: list[QComboBox] = []
+
+        lay = QVBoxLayout(self)
+        form = QFormLayout()
+        for p in panels:
+            combo = QComboBox()
+            combo.addItems(_CHANNEL_COLOR_CHOICES)
+            combo.setCurrentText(p.display_color)
+            swatch = QLabel()
+            swatch.setFixedSize(18, 18)
+
+            def _update_swatch(text, lbl=swatch):
+                r, g, b = _CHANNEL_COLOR_RGB.get(text, (1.0, 1.0, 1.0))
+                lbl.setStyleSheet(
+                    f"background-color: rgb({int(r*255)},{int(g*255)},{int(b*255)}); "
+                    "border: 1px solid #666;"
+                )
+
+            combo.currentTextChanged.connect(_update_swatch)
+            _update_swatch(combo.currentText())
+
+            row = QHBoxLayout()
+            row.addWidget(combo)
+            row.addWidget(swatch)
+            row.addStretch()
+            form.addRow(f"{p.display_name}:", row)
+            self._combos.append(combo)
+        lay.addLayout(form)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        ok_btn = QPushButton("OK"); ok_btn.clicked.connect(self.accept)
+        cancel_btn = QPushButton("Cancel"); cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(ok_btn); btn_row.addWidget(cancel_btn)
+        lay.addLayout(btn_row)
+
+    def apply(self) -> None:
+        for p, combo in zip(self._panels, self._combos):
+            p._color_combo.setCurrentText(combo.currentText())
+
+
 class ChannelsTab(QWidget):
     """Sidebar: list of channels on the left, settings panel on the right."""
 
@@ -2155,10 +2208,24 @@ class ChannelsTab(QWidget):
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
+        top_row = QHBoxLayout()
         disable_btn = QPushButton("Disable all steps (all channels)")
         disable_btn.clicked.connect(self._disable_all_steps)
-        root.addWidget(disable_btn)
+        top_row.addWidget(disable_btn)
+        colors_btn = QPushButton("Assign channel colors …")
+        colors_btn.clicked.connect(self._on_assign_colors)
+        top_row.addWidget(colors_btn)
+        root.addLayout(top_row)
         root.addWidget(splitter)
+
+    def _on_assign_colors(self) -> None:
+        if not self._panels:
+            QMessageBox.information(self, "No channels yet",
+                                     "Load a sample image or a pipeline JSON first.")
+            return
+        dlg = ChannelColorDialog(self._panels, self)
+        if dlg.exec():
+            dlg.apply()
 
     def _on_row_changed(self, row: int) -> None:
         if 0 <= row < len(self._panels):
@@ -2726,6 +2793,20 @@ class CombineTab(QWidget):
                 zp.setCurrentText(s.get("z_projection", "max"))
 
 
+def _max_channel_index(pl_dict: dict) -> int:
+    """Highest channel index referenced anywhere in a pipeline dict's steps
+    (channel/primary_channel/secondary_channel), or -1 if none found. Lets a
+    loaded pipeline JSON create enough generic channel panels on its own,
+    without requiring a sample image to already be loaded first."""
+    idx = -1
+    for s in pl_dict.get("steps", []):
+        for key in ("channel", "primary_channel", "secondary_channel"):
+            v = s.get(key)
+            if isinstance(v, int):
+                idx = max(idx, v)
+    return idx
+
+
 def _metrics_suffix(selected: list[str] | None, all_choices: list[str]) -> str:
     """", metrics=..." suffix for _step_repr — empty when all metrics are
     saved (the common case), so the summary stays uncluttered."""
@@ -3219,8 +3300,29 @@ class RunTab(QWidget):
         diag_opt_row.addStretch()
         dfl.addLayout(diag_opt_row)
 
+        diag_extra_row = QHBoxLayout()
+        self._diag_stamp_cb = QCheckBox("Stamp ROI outline on image")
+        self._diag_stamp_cb.setToolTip(
+            "Draws a white outline of each ROI selection's boundary directly onto\n"
+            "the saved composite (including JPGs) — no need to reopen a separate\n"
+            "mask file to see where a selection landed."
+        )
+        self._diag_particles_cb = QCheckBox("Also save particle label images (TIFF)")
+        self._diag_particles_cb.setToolTip(
+            "One extra TIFF per channel with particle analysis enabled\n"
+            "(<well>_particles_ch<N>.tif), with each particle's own integer\n"
+            "label preserved — always TIFF, never JPG, since lossy compression\n"
+            "would corrupt the label values."
+        )
+        diag_extra_row.addWidget(self._diag_stamp_cb)
+        diag_extra_row.addWidget(self._diag_particles_cb)
+        diag_extra_row.addStretch()
+        dfl.addLayout(diag_extra_row)
+
         diag_note = QLabel(
-            "Colors come from each channel's \"Color\" setting in the Channels tab."
+            "Colors come from each channel's \"Color\" setting in the Channels tab.\n"
+            "The base image is each channel's last pre-threshold (e.g. post-Normalize) "
+            "result, not the raw values."
         )
         diag_note.setStyleSheet("color: gray; font-size: 10px;")
         dfl.addWidget(diag_note)
@@ -3531,6 +3633,8 @@ class RunTab(QWidget):
                     "formats": formats,
                     "colors": colors,
                     "output_dir": str(setup.output_dir / "diagnostics"),
+                    "stamp_rois": self._diag_stamp_cb.isChecked(),
+                    "save_particle_labels": self._diag_particles_cb.isChecked(),
                 }
             else:
                 self._log("Diagnostic images enabled but no format checked — skipping.")
@@ -3621,6 +3725,7 @@ class CorrelativeImagingWidget(QWidget):
             get_bf_config     = self._bf_tab.get_config,
             make_well_pipeline_dict_fn = self.make_well_pipeline_dict_fn,
             napari_viewer     = napari_viewer,
+            get_channel_colors = lambda: [p.display_color for p in self._channels_tab.get_panels()],
         )
 
         self._roi_tab.set_viewer(napari_viewer)
@@ -3823,16 +3928,19 @@ class CorrelativeImagingWidget(QWidget):
 
     def _on_load_pipeline_json(self, pl_dict: dict) -> None:
         """Apply a loaded pipeline JSON to Channels, ROI & Selections, and
-        Colocalization all at once. Channels must already be set (a sample
-        image loaded) since channel count/names aren't recoverable from the
-        JSON alone (it only has channel indices)."""
-        if not self._channels_tab.get_panels():
-            QMessageBox.information(
-                self, "Load a sample image first",
-                "Load a sample image in the Setup tab first, so channel "
-                "count/names are known, then load the pipeline JSON."
-            )
-            return
+        Colocalization all at once — independent of whether a sample image
+        has been loaded. If no sample is loaded yet (or fewer channels are
+        known than the JSON references), generic channel panels (ch0, ch1,
+        …) are created first so there's always somewhere for the loaded
+        settings to land; a later sample load still resets channel names as
+        usual, but doesn't have to happen first."""
+        n_needed = _max_channel_index(pl_dict) + 1
+        if len(self._channels_tab.get_panels()) < n_needed:
+            names = [f"ch{i}" for i in range(n_needed)]
+            self._channels_tab.set_channels(names)
+            self._roi_tab.set_channels(names)
+            self._combine_tab.set_channels(names)
+
         self._channels_tab.populate_from_pipeline(pl_dict)
         warnings = self._roi_tab.populate_from_pipeline(pl_dict)
         self._combine_tab.populate_from_pipeline(pl_dict)
