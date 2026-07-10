@@ -1560,9 +1560,18 @@ class _BFWorker(QThread):
                 return
             self.log_msg.emit("  Ilastik finished.")
 
-            # Map each well (in order) to its output HDF5.
-            # Don't reconstruct the filename — Ilastik's {nickname} derivation
-            # varies by version. Scan what's actually there and sort by name.
+            # Map each well to its output HDF5 by NAME, not by position.
+            # `h5_stems` is in plate-scan order (B2, B3, ..., B9, B10, B11, ...
+            # — natural, since scan_plate_folder sorts columns as ints), but
+            # `sorted(out_dir.glob("*.h5"))` sorts the OUTPUT filenames as
+            # strings — lexicographically "B10" < "B11" < ... < "B19" < "B2".
+            # A positional zip() of these two differently-ordered lists
+            # silently pairs every well past column 9 in each row with some
+            # OTHER well's segmentation output — exactly the "projection
+            # doesn't match the segmentation at all" bug. Ilastik's
+            # {nickname} substitution echoes the input file's own stem, so
+            # match each output file back to the well whose stem it contains,
+            # instead of assuming any particular ordering lines the two lists up.
             output_h5s = sorted(out_dir.glob("*.h5"))
             self.log_msg.emit(
                 f"  Output files ({len(output_h5s)}): "
@@ -1572,6 +1581,33 @@ class _BFWorker(QThread):
                 self.log_msg.emit(
                     f"  ERROR: expected {len(h5_stems)} output(s), "
                     f"got {len(output_h5s)} — aborting Phase 3."
+                )
+                self.finished.emit(n_ok, n_err + len(h5_stems))
+                return
+
+            stem_to_output: dict[str, Path] = {}
+            unmatched_outputs: list[Path] = []
+            for out_f in output_h5s:
+                exact = [s for s in h5_stems if s == out_f.stem]
+                candidates = exact or [s for s in h5_stems if s in out_f.stem]
+                if len(candidates) == 1:
+                    stem_to_output[candidates[0]] = out_f
+                elif len(candidates) > 1:
+                    # Ambiguous substring match — the longest (most specific)
+                    # stem is the correct one (a shorter well's stem can't be
+                    # a genuine match if a longer, more complete stem also
+                    # matches the same output filename).
+                    stem_to_output[max(candidates, key=len)] = out_f
+                else:
+                    unmatched_outputs.append(out_f)
+
+            missing_stems = [s for s in h5_stems if s not in stem_to_output]
+            if missing_stems or unmatched_outputs:
+                self.log_msg.emit(
+                    f"  ERROR: could not confidently match {len(missing_stems)} well(s) "
+                    f"to their Ilastik output by name ({len(unmatched_outputs)} output "
+                    f"file(s) unmatched) — aborting Phase 3 rather than risk pairing "
+                    f"wells with the wrong segmentation."
                 )
                 self.finished.emit(n_ok, n_err + len(h5_stems))
                 return
@@ -1592,11 +1628,12 @@ class _BFWorker(QThread):
             self.log_msg.emit(
                 f"Phase 3/3 — extracting {len(classes)} class ROI(s) per well …"
             )
-            for j, (stem, h5_out) in enumerate(zip(h5_stems, output_h5s)):
+            for j, stem in enumerate(h5_stems):
                 if self._abort:
                     self.log_msg.emit("Aborted.")
                     break
 
+                h5_out = stem_to_output[stem]
                 well = well_map[stem]
                 self.progress.emit(total * 2 + j, total * 3, well.well_id)
 

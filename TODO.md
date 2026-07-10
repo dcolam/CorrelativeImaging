@@ -3,6 +3,33 @@
 Queued during a design pass through every GUI tab. Checked items are built and
 verified (real execution, not just compile-checks unless noted).
 
+## CRITICAL BUG FOUND AND FIXED — re-run any BF-pipeline output from before this
+
+`_BFWorker.run()` (Phase 3, `gui.py`) paired each well's BF projection with its
+Ilastik segmentation output using `zip(h5_stems, sorted(output_h5s))`.
+`h5_stems` is in natural plate-scan order (B2, B3, ..., B9, B10, B11, ...) but
+`sorted(out_dir.glob("*.h5"))` sorts the output *filenames as strings* —
+lexicographically "B10" < "B11" < ... < "B19" < "B2". These two orderings
+diverge for every row with 10+ columns — i.e. every row on a 384-well plate —
+so every well past column 9 got silently paired with some *other* well's
+segmentation output. This is what looked like a "ROI doesn't align with the
+fluorescence at all" bug on manual inspection (well B11) — it wasn't a
+coordinate/scale/registration issue, the ROI was built from a completely
+different well's segmentation the whole time.
+
+Fixed: match each output file back to its well **by name** (matching the
+stem Ilastik echoes into its output filename), never by list position.
+Verified with a real test simulating wells B2–B12 (straddling the exact
+column 9→10 bug boundary) with per-well-identifiable fake segmentation
+content — confirmed every well now matches its own output; would have failed
+under the old code (confirmed against the actual bug's signature in a real
+run's log).
+
+**Any BF-pipeline ROI/segmentation output generated before this fix is
+unreliable and should be regenerated** (Force regenerate checkbox) before
+trusting measurements from it — this includes the `output2/` run inspected
+during this investigation.
+
 ## STATUS as of this overnight session
 
 Every numbered item is done except the two explicitly deferred by you:
