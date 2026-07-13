@@ -201,6 +201,65 @@ def scan_plate_folder(
     return wells
 
 
+def discover_plate_folders(
+    root: str | Path,
+    extension: str = ".vsi",
+    contains: str = "",
+) -> dict[str, Path]:
+    """Find one or more plate export folders under *root*.
+
+    A "plate folder" is any directory that directly contains at least one
+    file matching the well-coordinate naming convention (see module
+    docstring) — no plate-ID token in the filename is required or assumed;
+    the folder itself is the unit of plate identity.
+
+    Two layouts are handled transparently:
+
+    * **Single plate** — *root* itself directly contains the well files
+      (today's convention, unchanged). Returns ``{root.name: root}``.
+    * **Multiple plates** — *root* is a parent folder whose immediate
+      subdirectories are each one plate's own export folder (only one
+      level down is checked; plates are not expected to be nested deeper
+      than that). Returns one entry per matching subfolder, keyed by that
+      subfolder's own name.
+
+    Duplicate subfolder names (rare, but possible if plates were exported
+    under differently-located parents with the same folder name) are
+    disambiguated with a numeric suffix and logged.
+    """
+    root = Path(root)
+    if not extension.startswith("."):
+        extension = f".{extension}"
+
+    def _has_wells(d: Path) -> bool:
+        files = list(d.glob(f"*{extension}"))
+        if contains:
+            files = [f for f in files if contains in f.name]
+        return any(_WELL_RE.search(f.stem) for f in files)
+
+    if _has_wells(root):
+        return {root.name or str(root): root}
+
+    plates: dict[str, Path] = {}
+    seen: dict[str, int] = {}
+    for d in sorted(p for p in root.iterdir() if p.is_dir()):
+        if not _has_wells(d):
+            continue
+        name = d.name
+        if name in seen:
+            seen[name] += 1
+            key = f"{name} ({seen[name]})"
+            log.warning("Duplicate plate folder name '%s' — disambiguating as '%s'", name, key)
+        else:
+            seen[name] = 0
+            key = name
+        plates[key] = d
+
+    if plates:
+        log.info("Multi-plate scan: %d plate folder(s) found under %s", len(plates), root)
+    return plates
+
+
 def read_well(
     well: WellInfo,
     load_bf: bool = True,

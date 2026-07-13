@@ -6,8 +6,9 @@ import datetime
 import json
 import logging
 import re
+import threading
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from qtpy.QtCore import Qt, QSettings, QThread, QTimer, Signal
@@ -181,6 +182,12 @@ def _run_basename(experiment: str) -> str:
     return f"{exp}_{ts}"
 
 
+def _sanitize_name(name: str) -> str:
+    """Filesystem-safe version of a user-editable label (e.g. a plate's
+    custom display name), for use as a subfolder name."""
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", (name or "").strip()) or "plate"
+
+
 class _BatchWorker(QThread):
     progress = Signal(int, int, str, object)
     log_msg  = Signal(str)
@@ -320,6 +327,130 @@ class _WellBatchWorker(QThread):
                 on_step_fn=_on_step,
             )
             self.finished.emit("" if self._abort else str(db_path))
+        except Exception:
+            self.log_msg.emit(traceback.format_exc())
+            self.finished.emit("")
+
+
+class _MultiPlateBatchWorker(QThread):
+    """Run the FL batch pipeline across every ENABLED plate detected by
+    PlateTab, each plate writing to its own output subfolder / DB (see
+    PlateTab.get_plate_output_dir). Plates run concurrently up to
+    max_parallel_plates; each plate still uses its own _WellBatchWorker
+    internally for well-level parallelism (max_workers_per_plate).
+
+    With exactly one plate (the common case — most projects are single-
+    plate) this reduces to running one _WellBatchWorker, writing to the
+    same paths PlateTab.output_dir already resolved to before multi-plate
+    support existed, so single-plate behavior is unchanged.
+    """
+    progress = Signal(int, int, str, object)
+    step_progress = Signal(str, int, int, str)
+    log_msg  = Signal(str)
+    finished = Signal(str)
+
+    def __init__(self, plates: dict, pipeline_dict_fn, bf_cfg_base: dict | None,
+                 base_output_dir: Path, experiment: str,
+                 max_workers_per_plate: int = 1, max_parallel_plates: int = 1,
+                 force_regen: bool = False, diag_cfg_base: dict | None = None,
+                 get_plate_output_dir=None, run_basename: str = "run"):
+        super().__init__()
+        self._plates = plates  # dict[str, _PlateEntry]
+        self._pipeline_dict_fn = pipeline_dict_fn
+        self._bf_cfg_base = bf_cfg_base
+        self._base_output_dir = Path(base_output_dir)
+        self._experiment = experiment
+        self._max_workers_per_plate = max_workers_per_plate
+        self._max_parallel_plates = max(1, max_parallel_plates)
+        self._force_regen = force_regen
+        self._diag_cfg_base = diag_cfg_base
+        self._get_plate_output_dir = get_plate_output_dir
+        self._run_basename = run_basename
+        self._abort = False
+        self._lock = threading.Lock()
+        self._active_workers: list = []
+
+    def abort(self) -> None:
+        self._abort = True
+        with self._lock:
+            for w in self._active_workers:
+                w.abort()
+
+    def _run_one_plate(self, key: str, entry) -> str | None:
+        if self._abort:
+            return None
+        plate_out = (self._get_plate_output_dir(key)
+                     if self._get_plate_output_dir else self._base_output_dir)
+        plate_out.mkdir(parents=True, exist_ok=True)
+        db_path = plate_out / f"{self._run_basename}.db"
+
+        bf_cfg = None
+        if self._bf_cfg_base:
+            bf_cfg = dict(self._bf_cfg_base)
+            if not bf_cfg.get("save_dir"):
+                bf_cfg["output_dir"] = str(plate_out)
+
+        diag_cfg = None
+        if self._diag_cfg_base:
+            diag_cfg = dict(self._diag_cfg_base)
+            diag_cfg["output_dir"] = str(plate_out / "diagnostics")
+
+        tag = entry.display_name
+
+        def _cb(current, total_, name, n_particles):
+            self.progress.emit(current, total_, f"[{tag}] {name}", n_particles)
+            icon   = "✓" if n_particles is not None else "✗"
+            detail = f"({n_particles} particles)" if n_particles is not None else "(error)"
+            self.log_msg.emit(f"[{tag}] {icon}  {name}  {detail}")
+
+        def _on_step(well_id, step_idx, total_steps, step_name):
+            self.step_progress.emit(f"{tag}/{well_id}", step_idx, total_steps, step_name)
+
+        worker = _WellBatchWorker(
+            list(entry.wells.values()), self._pipeline_dict_fn, bf_cfg, plate_out,
+            self._experiment, max_workers=self._max_workers_per_plate, db_path=db_path,
+            force_regen=self._force_regen, diag_cfg=diag_cfg,
+        )
+        worker.progress.connect(_cb)
+        worker.step_progress.connect(_on_step)
+        worker.log_msg.connect(lambda m: self.log_msg.emit(f"[{tag}] {m}"))
+
+        with self._lock:
+            self._active_workers.append(worker)
+        try:
+            worker.run()  # synchronous — same pattern _WellBatchWorker already
+                           # uses to run _BFWorker on its own thread
+        finally:
+            with self._lock:
+                self._active_workers.remove(worker)
+
+        if self._abort:
+            return None
+        self.log_msg.emit(f"[{tag}] done → {db_path}")
+        return str(db_path)
+
+    def run(self) -> None:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        try:
+            items = list(self._plates.items())
+            self.log_msg.emit(
+                f"Running {len(items)} plate(s)"
+                + (f", {self._max_parallel_plates} in parallel" if self._max_parallel_plates > 1 else "")
+                + " …"
+            )
+            results: list[str] = []
+            with ThreadPoolExecutor(max_workers=self._max_parallel_plates) as ex:
+                futs = {ex.submit(self._run_one_plate, k, e): k for k, e in items}
+                for fut in as_completed(futs):
+                    key = futs[fut]
+                    try:
+                        db_path = fut.result()
+                        if db_path:
+                            results.append(db_path)
+                    except Exception:
+                        tag = self._plates[key].display_name
+                        self.log_msg.emit(f"[{tag}] ERROR:\n{traceback.format_exc()}")
+            self.finished.emit("; ".join(results))
         except Exception:
             self.log_msg.emit(traceback.format_exc())
             self.finished.emit("")
@@ -484,6 +615,24 @@ _STEP_COLORMAPS = ["green", "cyan", "magenta", "yellow", "red", "blue", "orange"
 _ROI_BADGE_COLOR = "#FFEB3B"  # border color marking a well with ROI file(s)
 
 
+@dataclass
+class _PlateEntry:
+    """One detected plate folder — see discover_plate_folders(). ``key`` is
+    the stable, folder-derived identity used for on-disk paths/lookups;
+    ``display_name`` is the (possibly user-renamed) label shown in the UI
+    and used to namespace this plate's output subfolder when more than one
+    plate is detected."""
+    key: str
+    folder: Path
+    wells: dict = field(default_factory=dict)   # well_id -> WellInfo
+    enabled: bool = True
+    display_name: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.display_name:
+            self.display_name = self.key
+
+
 class _WellButton(QPushButton):
     """Single cell in the plate grid."""
 
@@ -594,7 +743,9 @@ class PlateTab(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._wells: dict[str, object] = {}
+        self._plates: dict[str, _PlateEntry] = {}
+        self._current_plate_key: str | None = None
+        self._wells: dict[str, object] = {}   # currently-viewed plate's wells
         self._image_data = None
         self._load_worker: _LoadImageWorker | None = None
         self._restoring_settings = False
@@ -677,6 +828,30 @@ class PlateTab(QWidget):
         plate_scroll.setWidgetResizable(True)
         plate_scroll.setWidget(plate_content)
         plate_outer.addWidget(plate_scroll)
+
+        # ── 0. Multi-plate management (hidden unless >1 plate detected) ──
+        plates_box = QGroupBox("Plates detected")
+        pv = QVBoxLayout(plates_box)
+
+        plate_sel_row = QHBoxLayout()
+        plate_sel_row.addWidget(QLabel("Viewing plate:"))
+        self._plate_combo = QComboBox()
+        self._plate_combo.currentIndexChanged.connect(self._on_plate_combo_changed)
+        plate_sel_row.addWidget(self._plate_combo, stretch=1)
+        pv.addLayout(plate_sel_row)
+
+        self._plate_table = QTableWidget(0, 3)
+        self._plate_table.setHorizontalHeaderLabels(
+            ["Include in batch", "Detected folder", "Custom name"]
+        )
+        self._plate_table.horizontalHeader().setStretchLastSection(True)
+        self._plate_table.setMaximumHeight(140)
+        self._plate_table.itemChanged.connect(self._on_plate_table_item_changed)
+        pv.addWidget(self._plate_table)
+
+        plates_box.setVisible(False)
+        self._plates_box = plates_box
+        lay.addWidget(plates_box)
 
         # ── 1. Plate grid ────────────────────────────────────────────
         grid_box = QGroupBox("1. Plate layout  (click a well to select)")
@@ -872,7 +1047,7 @@ class PlateTab(QWidget):
             self._output_edit.setText(str(p / "output"))
 
     def _scan(self) -> None:
-        from correlative_imaging.io.plate import scan_plate_folder
+        from correlative_imaging.io.plate import discover_plate_folders, scan_plate_folder
         folder = self._folder_edit.text().strip()
         if not folder or not Path(folder).is_dir():
             QMessageBox.warning(self, "No folder", "Set a valid input folder first.")
@@ -880,33 +1055,67 @@ class PlateTab(QWidget):
         ext       = self._ext_edit.text().strip() or ".vsi"
         contains  = self._contains_edit.text().strip()
         recursive = self._recursive_cb.isChecked()
-        bf_roi_dir = self.output_dir / "bf_pipeline" / "rois"
+
         try:
-            wells = scan_plate_folder(folder, extension=ext,
-                                      contains=contains, recursive=recursive,
-                                      extra_roi_dirs=[bf_roi_dir])
+            plate_folders = discover_plate_folders(folder, extension=ext, contains=contains)
         except Exception as exc:
             QMessageBox.critical(self, "Scan failed", str(exc))
             return
 
-        self._wells = {}
-        self._grid.clear_all()
-        for w in wells:
-            self._wells[w.well_id] = w
-            self._grid.set_well_status(w.well_id,
-                                       "complete" if w.is_complete else "bf_only",
-                                       has_roi=bool(w.roi_paths))
+        # No matching well-coordinate files anywhere — proceed with an empty
+        # scan result (matches the pre-multi-plate behavior of tolerating a
+        # zero-well folder) rather than aborting, so the status label and
+        # JSON-dropdown refresh below still happen.
+        if not plate_folders:
+            self._plates = {}
+            self._current_plate_key = None
+            self._rebuild_plate_selector()
+            self._update_plate_table()
+            self._wells = {}
+            self._grid.clear_all()
+            self._status_lbl.setText("0 wells found — no matching well-coordinate files.")
+            self.refresh_json_dropdown(self.input_dir, self.output_dir)
+            return
 
-        n_complete = sum(1 for w in wells if w.is_complete)
-        n_roi      = sum(1 for w in wells if w.roi_paths)
-        msg = f"{len(wells)} wells found — {n_complete} complete BF+FL pairs"
-        if len(wells) > n_complete:
-            msg += f", {len(wells) - n_complete} BF only"
+        # Preserve any prior include/rename choices across a re-scan, keyed
+        # by the stable folder-derived plate key.
+        old_names   = {k: e.display_name for k, e in self._plates.items()}
+        old_enabled = {k: e.enabled for k, e in self._plates.items()}
+        is_multi = len(plate_folders) > 1
+        base_out = self._base_output_dir()
+
+        new_plates: dict[str, _PlateEntry] = {}
+        for key, pdir in plate_folders.items():
+            display_name = old_names.get(key, key)
+            plate_out = (base_out / _sanitize_name(display_name)) if is_multi else base_out
+            bf_roi_dir = plate_out / "bf_pipeline" / "rois"
+            wells = scan_plate_folder(pdir, extension=ext, contains=contains,
+                                      recursive=recursive, extra_roi_dirs=[bf_roi_dir])
+            entry = _PlateEntry(key=key, folder=pdir, display_name=display_name,
+                                enabled=old_enabled.get(key, True))
+            entry.wells = {w.well_id: w for w in wells}
+            new_plates[key] = entry
+
+        self._plates = new_plates
+        self._rebuild_plate_selector()
+        self._update_plate_table()
+        self._select_plate(next(iter(self._plates)))
+
+        all_wells = [w for e in self._plates.values() for w in e.wells.values()]
+        n_complete = sum(1 for w in all_wells if w.is_complete)
+        n_roi      = sum(1 for w in all_wells if w.roi_paths)
+        if is_multi:
+            msg = (f"{len(self._plates)} plates found, {len(all_wells)} wells total "
+                   f"— {n_complete} complete BF+FL pairs")
+        else:
+            msg = f"{len(all_wells)} wells found — {n_complete} complete BF+FL pairs"
+        if len(all_wells) > n_complete:
+            msg += f", {len(all_wells) - n_complete} BF only"
         msg += f".  {n_roi} well(s) have ROI files." if n_roi else "."
         self._status_lbl.setText(msg)
 
         tags: set[str] = set()
-        for w in wells:
+        for w in all_wells:
             for p in w.roi_paths:
                 tag = _guess_existing_tag(p)
                 if tag:
@@ -915,6 +1124,88 @@ class PlateTab(QWidget):
             self.existing_rois_detected.emit(sorted(tags))
 
         self.refresh_json_dropdown(self.input_dir, self.output_dir)
+
+    # ── Multi-plate management ────────────────────────────────────────
+
+    def _rebuild_plate_selector(self) -> None:
+        self._plate_combo.blockSignals(True)
+        self._plate_combo.clear()
+        for key, entry in self._plates.items():
+            self._plate_combo.addItem(entry.display_name, key)
+        self._plate_combo.blockSignals(False)
+
+    def _update_plate_table(self) -> None:
+        self._plate_table.blockSignals(True)
+        self._plate_table.setRowCount(len(self._plates))
+        for row, (key, entry) in enumerate(self._plates.items()):
+            inc_item = QTableWidgetItem()
+            inc_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            inc_item.setCheckState(Qt.Checked if entry.enabled else Qt.Unchecked)
+            inc_item.setData(Qt.UserRole, key)
+            self._plate_table.setItem(row, 0, inc_item)
+
+            folder_item = QTableWidgetItem(str(entry.folder))
+            folder_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            self._plate_table.setItem(row, 1, folder_item)
+
+            name_item = QTableWidgetItem(entry.display_name)
+            name_item.setData(Qt.UserRole, key)
+            self._plate_table.setItem(row, 2, name_item)
+        self._plate_table.blockSignals(False)
+        self._plates_box.setVisible(len(self._plates) > 1)
+
+    def _on_plate_table_item_changed(self, item) -> None:
+        key = item.data(Qt.UserRole)
+        entry = self._plates.get(key)
+        if entry is None:
+            return
+        if item.column() == 0:
+            entry.enabled = item.checkState() == Qt.Checked
+        elif item.column() == 2:
+            entry.display_name = item.text().strip() or entry.key
+            idx = self._plate_combo.findData(key)
+            if idx >= 0:
+                self._plate_combo.setItemText(idx, entry.display_name)
+
+    def _on_plate_combo_changed(self, index: int) -> None:
+        key = self._plate_combo.itemData(index)
+        if key:
+            self._select_plate(key)
+
+    def _select_plate(self, key: str) -> None:
+        entry = self._plates.get(key)
+        if entry is None:
+            return
+        self._current_plate_key = key
+        self._wells = entry.wells
+        self._grid.clear_all()
+        for w in entry.wells.values():
+            self._grid.set_well_status(w.well_id,
+                                       "complete" if w.is_complete else "bf_only",
+                                       has_roi=bool(w.roi_paths))
+        idx = self._plate_combo.findData(key)
+        if idx >= 0 and self._plate_combo.currentIndex() != idx:
+            self._plate_combo.blockSignals(True)
+            self._plate_combo.setCurrentIndex(idx)
+            self._plate_combo.blockSignals(False)
+
+    def get_enabled_plates(self) -> dict:
+        """Plates checked 'Include in batch' — what an automated multi-plate
+        run should process. A single-plate scan always has its one entry
+        enabled by default, so this is never empty after a successful scan."""
+        return {k: e for k, e in self._plates.items() if e.enabled}
+
+    def get_plate_output_dir(self, key: str) -> Path:
+        """Output folder for one specific plate, namespaced by its display
+        name only when more than one plate is detected — with exactly one
+        plate this is identical to the plain output_dir (unchanged
+        single-plate behavior)."""
+        base = self._base_output_dir()
+        if len(self._plates) > 1:
+            entry = self._plates.get(key)
+            if entry is not None:
+                return base / _sanitize_name(entry.display_name)
+        return base
 
     def _on_well_clicked(self, well_id: str) -> None:
         w = self._wells.get(well_id)
@@ -989,10 +1280,25 @@ class PlateTab(QWidget):
         p = Path(self._folder_edit.text())
         return p if p.is_dir() else None
 
-    @property
-    def output_dir(self) -> Path:
+    def _base_output_dir(self) -> Path:
         t = self._output_edit.text().strip()
         return Path(t) if t else (self.input_dir or Path(".")) / "output"
+
+    @property
+    def base_output_dir(self) -> Path:
+        """The un-namespaced output folder, independent of which plate is
+        currently selected in the viewer — use for run-level (not
+        per-plate) artifacts such as the aggregate batch log."""
+        return self._base_output_dir()
+
+    @property
+    def output_dir(self) -> Path:
+        """Output folder for the CURRENTLY VIEWED plate. Identical to the
+        base output folder when only one plate is detected (or none has
+        been scanned yet) — unchanged from pre-multi-plate behavior."""
+        if len(self._plates) > 1 and self._current_plate_key:
+            return self.get_plate_output_dir(self._current_plate_key)
+        return self._base_output_dir()
 
     @property
     def experiment(self) -> str:
@@ -1289,6 +1595,28 @@ class BFPipelineTab(QWidget):
             "classes":         self.get_classes_config(),
             "save_dir":        self._save_dir_edit.text().strip(),
         }
+
+    def set_config(self, cfg: dict) -> None:
+        """Reverse of get_config() — populate every BF-pipeline widget from a
+        previously-saved config dict (e.g. embedded in a loaded pipeline
+        JSON's "bf_pipeline" key), so a saved run's Ilastik project/classes
+        don't have to be re-entered by hand."""
+        self._exe_edit.setText(cfg.get("ilastik_exe", ""))
+        self._ilp_edit.setText(cfg.get("ilp_path", ""))
+        idx = self._proj_combo.findText(cfg.get("z_method", "min"))
+        if idx >= 0:
+            self._proj_combo.setCurrentIndex(idx)
+        self._bf_ch_spin.setValue(int(cfg.get("bf_channel", 0)))
+        self._save_dir_edit.setText(cfg.get("save_dir", ""))
+
+        classes = cfg.get("classes", [])
+        n = len(classes) or 1
+        defaults = [(c["name"], c["min_area_px"], c["min_circularity"]) for c in classes]
+        self._n_classes_spin.blockSignals(True)
+        self._n_classes_spin.setValue(n)
+        self._n_classes_spin.blockSignals(False)
+        self._set_n_class_rows(n, defaults=defaults)
+        self._save_settings()
 
     # ── Run logic ────────────────────────────────────────────────────
 
@@ -3317,6 +3645,17 @@ class RunTab(QWidget):
         self._worker_spin.setPrefix("workers: ")
         par_row.addWidget(self._parallel_cb)
         par_row.addWidget(self._worker_spin)
+        self._plate_worker_spin = QSpinBox()
+        self._plate_worker_spin.setRange(1, 16)
+        self._plate_worker_spin.setValue(1)
+        self._plate_worker_spin.setPrefix("plates in parallel: ")
+        self._plate_worker_spin.setToolTip(
+            "Only relevant when multiple plates are detected in the Setup "
+            "tab. 1 = one plate at a time (safest default). Each plate "
+            "always gets its own output folder and DB regardless of this "
+            "setting."
+        )
+        par_row.addWidget(self._plate_worker_spin)
         par_row.addStretch()
         bl.addLayout(par_row)
 
@@ -3656,19 +3995,13 @@ class RunTab(QWidget):
         pl_dict = self._get_pipeline_dict()
         if not pl_dict.get("steps"):
             QMessageBox.warning(self, "No pipeline", "Configure channels first."); return
-        setup.output_dir.mkdir(parents=True, exist_ok=True)
 
         # DB, pipeline JSON, and log all share one base name (experiment +
         # run-start time) so a run's outputs are obviously grouped and never
-        # silently overwrite an earlier run's.
+        # silently overwrite an earlier run's. With multiple plates, this
+        # same base name is reused inside each plate's own output subfolder.
         base = _run_basename(setup.experiment)
-        db_path   = setup.output_dir / f"{base}.db"
-        json_path = setup.output_dir / f"{base}_pipeline.json"
-        self._current_log_path = setup.output_dir / f"{base}.log"
-        json_path.write_text(json.dumps(pl_dict, indent=2))
-
-        self._bar.setValue(0); self._run_btn.setEnabled(False); self._abort_btn.setEnabled(True)
-        self._log(f"Starting batch — outputs: {base}.db / {base}_pipeline.json / {base}.log")
+        max_workers = self._worker_spin.value() if self._parallel_cb.isChecked() else 1
 
         diag_cfg = None
         if self._diag_whole_cb.isChecked() or self._diag_crops_cb.isChecked():
@@ -3685,40 +4018,74 @@ class RunTab(QWidget):
                     "crop_pad_um": self._diag_crop_pad.value(),
                     "formats": formats,
                     "colors": colors,
-                    "output_dir": str(setup.output_dir / "diagnostics"),
                     "stamp_rois": self._diag_stamp_cb.isChecked(),
                     "save_particle_labels": self._diag_particles_cb.isChecked(),
+                    # "output_dir" is filled in per-plate below.
                 }
             else:
                 self._log("Diagnostic images enabled but no format checked — skipping.")
 
-        wells = setup.get_all_wells() if hasattr(setup, "get_all_wells") else []
-        if wells and self._make_well_pipeline_dict_fn is not None:
+        self._bar.setValue(0); self._run_btn.setEnabled(False); self._abort_btn.setEnabled(True)
+        self._step_bar.setValue(0); self._step_lbl.setText("")
+
+        enabled_plates = setup.get_enabled_plates() if hasattr(setup, "get_enabled_plates") else {}
+        has_wells = any(e.wells for e in enabled_plates.values())
+
+        if has_wells and self._make_well_pipeline_dict_fn is not None:
             pipeline_dict_fn, needs_bf = self._make_well_pipeline_dict_fn()
             bf_cfg = self._get_bf_config() if (needs_bf and self._get_bf_config) else None
-            if bf_cfg and not bf_cfg.get("save_dir"):
-                # Mirror BFPipelineTab.run_on_wells: without this, a missing
-                # "Save ROIs to" falls back to writing ROI files next to the
-                # source BF image — often a read-only/slow network data share.
-                bf_cfg["output_dir"] = str(setup.output_dir)
-            max_workers = self._worker_spin.value() if self._parallel_cb.isChecked() else 1
+
+            n_plates = len(enabled_plates)
+            log_base = setup.base_output_dir if hasattr(setup, "base_output_dir") else setup.output_dir
+            self._current_log_path = log_base / f"{base}.log"
+            if n_plates > 1:
+                self._log(f"Starting multi-plate batch — {n_plates} plate(s), run tag '{base}'.")
+            else:
+                self._log(f"Starting batch — outputs: {base}.db / {base}_pipeline.json / {base}.log")
+
+            # Same pipeline JSON saved once per plate, next to that plate's
+            # own DB, so each plate's outputs are independently self-describing.
+            for key in enabled_plates:
+                plate_out = setup.get_plate_output_dir(key)
+                plate_out.mkdir(parents=True, exist_ok=True)
+                (plate_out / f"{base}_pipeline.json").write_text(json.dumps(pl_dict, indent=2))
+
+            # _MultiPlateBatchWorker sets bf_cfg["output_dir"] to each plate's
+            # own folder itself when "Save ROIs to" is empty — mirrors
+            # BFPipelineTab.run_on_wells (a missing save_dir would otherwise
+            # write ROI files next to the source BF image, often a slow/
+            # read-only network data share).
             if max_workers > 1:
-                self._log(f"Parallel batch (experimental): {max_workers} workers.")
-            self._worker = _WellBatchWorker(
-                wells, pipeline_dict_fn, bf_cfg, setup.output_dir, setup.experiment,
-                max_workers=max_workers, db_path=db_path,
+                self._log(f"Parallel batch (experimental): {max_workers} well-worker(s) per plate.")
+
+            max_parallel_plates = self._plate_worker_spin.value() if n_plates > 1 else 1
+            self._worker = _MultiPlateBatchWorker(
+                enabled_plates, pipeline_dict_fn, bf_cfg,
+                setup.output_dir, setup.experiment,
+                max_workers_per_plate=max_workers,
+                max_parallel_plates=max_parallel_plates,
                 force_regen=self._force_regen_cb.isChecked(),
-                diag_cfg=diag_cfg,
+                diag_cfg_base=diag_cfg,
+                get_plate_output_dir=setup.get_plate_output_dir,
+                run_basename=base,
             )
         else:
+            setup.output_dir.mkdir(parents=True, exist_ok=True)
+            db_path   = setup.output_dir / f"{base}.db"
+            json_path = setup.output_dir / f"{base}_pipeline.json"
+            self._current_log_path = setup.output_dir / f"{base}.log"
+            json_path.write_text(json.dumps(pl_dict, indent=2))
+            if diag_cfg is not None:
+                diag_cfg["output_dir"] = str(setup.output_dir / "diagnostics")
+            self._log(f"Starting batch — outputs: {base}.db / {base}_pipeline.json / {base}.log")
             self._worker = _BatchWorker(pl_dict, setup.input_dir, setup.output_dir, setup.experiment,
                                          db_path=db_path)
+
         self._worker.progress.connect(self._on_progress)
         self._worker.log_msg.connect(self._log)
         self._worker.finished.connect(self._on_finished)
         if hasattr(self._worker, "step_progress"):
             self._worker.step_progress.connect(self._on_step_progress)
-        self._step_bar.setValue(0); self._step_lbl.setText("")
         self._worker.start()
 
     def _on_parallel_toggled(self, checked: bool) -> None:
@@ -3980,24 +4347,47 @@ class CorrelativeImagingWidget(QWidget):
             self._plate_tab.refresh_json_dropdown(self._plate_tab.input_dir, self._plate_tab.output_dir)
 
     def _on_load_pipeline_json(self, pl_dict: dict) -> None:
-        """Apply a loaded pipeline JSON to Channels, ROI & Selections, and
-        Colocalization all at once — independent of whether a sample image
-        has been loaded. If no sample is loaded yet (or fewer channels are
-        known than the JSON references), generic channel panels (ch0, ch1,
-        …) are created first so there's always somewhere for the loaded
-        settings to land; a later sample load still resets channel names as
-        usual, but doesn't have to happen first."""
-        n_needed = _max_channel_index(pl_dict) + 1
-        if len(self._channels_tab.get_panels()) < n_needed:
-            names = [f"ch{i}" for i in range(n_needed)]
-            self._channels_tab.set_channels(names)
-            self._roi_tab.set_channels(names)
-            self._combine_tab.set_channels(names)
+        """Apply a loaded pipeline JSON to Channels, ROI & Selections,
+        Colocalization, and (if present) the BF Pipeline tab — independent of
+        whether a sample image has been loaded.
+
+        Older JSONs (saved before this) only ever had "name"/"steps" — no
+        real channel names (just numeric indices in each step) and no
+        BF-pipeline config at all, so loading one could never restore either.
+        build_pipeline_dict() now also saves "channel_names" and
+        "bf_pipeline"; both are used here when present, with a fallback to
+        generic ch0/ch1/... panels (scanning the highest channel index
+        referenced in "steps") for JSONs saved before this change.
+        """
+        real_names = pl_dict.get("channel_names")
+        if real_names:
+            # Trust the JSON's recorded names outright — rebuilding panels
+            # loses whatever was there before, but populate_from_pipeline
+            # (below) immediately re-populates every setting from this same
+            # JSON anyway, so nothing is actually lost.
+            self._channels_tab.set_channels(real_names)
+            self._roi_tab.set_channels(real_names)
+            self._combine_tab.set_channels(real_names)
+        else:
+            n_needed = _max_channel_index(pl_dict) + 1
+            if len(self._channels_tab.get_panels()) < n_needed:
+                names = [f"ch{i}" for i in range(n_needed)]
+                self._channels_tab.set_channels(names)
+                self._roi_tab.set_channels(names)
+                self._combine_tab.set_channels(names)
 
         self._channels_tab.populate_from_pipeline(pl_dict)
         warnings = self._roi_tab.populate_from_pipeline(pl_dict)
         self._combine_tab.populate_from_pipeline(pl_dict)
-        msg = f"Loaded pipeline '{pl_dict.get('name', 'pipeline')}' into Channels, ROI & Selections, Colocalization."
+
+        bf_cfg = pl_dict.get("bf_pipeline")
+        loaded_bf = False
+        if bf_cfg and (bf_cfg.get("ilp_path") or bf_cfg.get("classes")):
+            self._bf_tab.set_config(bf_cfg)
+            loaded_bf = True
+
+        msg = f"Loaded pipeline '{pl_dict.get('name', 'pipeline')}' into Channels, ROI & Selections, Colocalization"
+        msg += ", BF Pipeline." if loaded_bf else ". (No BF-pipeline config in this JSON.)"
         if warnings:
             msg += "\n\n" + "\n".join(warnings)
             QMessageBox.warning(self, "Loaded with caveats", msg)
@@ -4044,7 +4434,18 @@ class CorrelativeImagingWidget(QWidget):
             for coloc in self._combine_tab.get_coloc_steps(sel.mask_key):
                 steps.append(coloc)
 
-        return {"name": "pipeline", "steps": steps}
+        return {
+            "name": "pipeline",
+            "steps": steps,
+            # Not read by Pipeline.load()/Step.from_dict() — extra metadata
+            # so a saved JSON can fully reconstruct the GUI state it came
+            # from, not just the step list. "steps" only carries numeric
+            # channel indices, and never included the BF-pipeline config at
+            # all, so loading a JSON couldn't restore either — see
+            # _on_load_pipeline_json.
+            "channel_names": self._channels_tab.get_channel_names(),
+            "bf_pipeline": self._bf_tab.get_config(),
+        }
 
     def make_well_pipeline_dict_fn(self):
         """Snapshot the current Channels/ROI/Combine config into a plain,
