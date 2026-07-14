@@ -42,6 +42,11 @@
 .EXAMPLE
     .\stage_plate_data.ps1 -SourceRoot "Z:\...\some_single_plate_folder" -DestRoot "D:\DC_CorrelativeImaging\ROMK" -MaxParallelPlates 1
 
+.EXAMPLE
+    .\stage_plate_data.ps1 -SourceRoot "Z:\...\n1_DIV21_DIV35_DIV49_July25" -DestRoot "D:\DC_CorrelativeImaging\iPSC_n1-2" -DryRun
+    Lists every file/folder that would be copied -- nothing is written,
+    nothing is created, source and destination are both left untouched.
+
 .NOTES
     Confirmed with user 2026-07-14: copy .vsi + companion folder + .oex;
     everything else (roi_folder, output, output2, _temp, loose reference
@@ -60,7 +65,9 @@ param(
     [int]$MaxParallelPlates = 4,
     [int]$RobocopyThreads   = 8,      # /MT per robocopy call
     [bool]$IncludeOex       = $true,  # copy *.oex sidecars alongside matching .vsi files
-    [bool]$IncludeRoiFolder = $false  # roi_folder and everything else is ignored per user
+    [bool]$IncludeRoiFolder = $false, # roi_folder and everything else is ignored per user
+
+    [switch]$DryRun  # robocopy /L -- list what would be copied, write/create/delete nothing
 )
 
 function Test-IsPlateFolder {
@@ -69,15 +76,28 @@ function Test-IsPlateFolder {
 }
 
 function Copy-OnePlate {
-    param($srcPlate, $dstPlate, $threads, $includeOex, $includeRoiFolder)
+    param($srcPlate, $dstPlate, $threads, $includeOex, $includeRoiFolder, $dryRun)
 
-    New-Item -ItemType Directory -Path $dstPlate -Force | Out-Null
+    # /L = list only: robocopy scans and reports which files/folders it
+    # would copy, without actually copying them. Note this script never
+    # passes /MIR, /PURGE, /MOV, or /MOVE anywhere -- so even a REAL (non
+    # dry-run) run only ever adds/overwrites files at the destination. It
+    # never deletes anything at the destination, and never touches the
+    # source at all. Real runs suppress the noisy per-file/per-dir lines
+    # (/NFL /NDL) since a dry run's whole point is to show exactly those.
+    $robocopyFlags = @("/MT:$threads", "/R:3", "/W:5")
+    if ($dryRun) {
+        $robocopyFlags += "/L"
+    } else {
+        $robocopyFlags += "/NFL", "/NDL"
+        New-Item -ItemType Directory -Path $dstPlate -Force | Out-Null
+    }
 
     # 1) .vsi files (and optionally .oex sidecars) directly in the plate root
     #    -- not recursive, they live directly in this folder.
     $filePatterns = @("*.vsi")
     if ($includeOex) { $filePatterns += "*.oex" }
-    robocopy $srcPlate $dstPlate @filePatterns /MT:$threads /R:3 /W:5 /NFL /NDL | Out-Null
+    robocopy $srcPlate $dstPlate @filePatterns @robocopyFlags
 
     # 2) each .vsi's own companion data folder "_<stem>_", only if present
     $vsiFiles = Get-ChildItem -Path $srcPlate -Filter *.vsi -File
@@ -86,7 +106,7 @@ function Copy-OnePlate {
         $companionSrc  = Join-Path $srcPlate $companionName
         if (Test-Path $companionSrc) {
             $companionDst = Join-Path $dstPlate $companionName
-            robocopy $companionSrc $companionDst /E /MT:$threads /R:3 /W:5 /NFL /NDL | Out-Null
+            robocopy $companionSrc $companionDst /E @robocopyFlags
         }
     }
 
@@ -95,9 +115,17 @@ function Copy-OnePlate {
         $roiSrc = Join-Path $srcPlate "roi_folder"
         if (Test-Path $roiSrc) {
             $roiDst = Join-Path $dstPlate "roi_folder"
-            robocopy $roiSrc $roiDst /E /MT:$threads /R:3 /W:5 /NFL /NDL | Out-Null
+            robocopy $roiSrc $roiDst /E @robocopyFlags
         }
     }
+}
+
+if ($DryRun) {
+    Write-Host "===================================================="
+    Write-Host " DRY RUN -- listing only. No files will be copied." -ForegroundColor Yellow
+    Write-Host " (Note: even a real run never deletes anything --"    -ForegroundColor Yellow
+    Write-Host " this script only ever adds files, never removes any.)" -ForegroundColor Yellow
+    Write-Host "===================================================="
 }
 
 # ── Discover plate(s): -SourceRoot itself, or its qualifying subfolders ──
@@ -120,14 +148,18 @@ foreach ($plate in $plateFolders) {
         Start-Sleep -Seconds 2
     }
     $dstPlate = Join-Path $DestRoot $plate.Name
-    Write-Host "Starting copy: $($plate.Name) -> $dstPlate"
+    Write-Host "$(if ($DryRun) { 'Listing' } else { 'Starting copy' }): $($plate.Name) -> $dstPlate"
     $jobs += Start-Job -ScriptBlock ${function:Copy-OnePlate} `
-        -ArgumentList $plate.FullName, $dstPlate, $RobocopyThreads, $IncludeOex, $IncludeRoiFolder
+        -ArgumentList $plate.FullName, $dstPlate, $RobocopyThreads, $IncludeOex, $IncludeRoiFolder, $DryRun.IsPresent
 }
 
-Write-Host "Waiting for all plate copies to finish..."
+Write-Host "Waiting for all plate jobs to finish..."
 $jobs | Wait-Job | Out-Null
 $jobs | Receive-Job
 $jobs | Remove-Job
 
-Write-Host "Done. Staged to $DestRoot"
+if ($DryRun) {
+    Write-Host "Dry run complete -- nothing was copied. Re-run without -DryRun to actually stage the data."
+} else {
+    Write-Host "Done. Staged to $DestRoot"
+}
