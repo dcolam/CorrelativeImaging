@@ -298,7 +298,17 @@ class _WellBatchWorker(QThread):
                     self.log_msg.emit(
                         f"Generating BF-pipeline ROI(s) for {len(missing)}/{total} well(s) {reason} …"
                     )
-                    bf_worker = _BFWorker(missing, self._bf_cfg, test_mode=False)
+                    # Fan the BF projection phase across processes at the same
+                    # width as the FL engine — the sequential projection loop
+                    # is otherwise a serious bottleneck at plate scale.
+                    if self._use_dask:
+                        proj_workers = self._dask_workers or max(1, (os.cpu_count() or 2) - 1)
+                    elif self._max_workers > 1:
+                        proj_workers = self._max_workers
+                    else:
+                        proj_workers = 1
+                    bf_worker = _BFWorker(missing, self._bf_cfg, test_mode=False,
+                                          proj_workers=proj_workers)
                     bf_worker.log_msg.connect(lambda m: self.log_msg.emit(f"[BF] {m}"))
                     bf_worker.run()   # synchronous call — reuses its logic on this thread
                 else:
@@ -1761,12 +1771,17 @@ class _BFWorker(QThread):
     finished     = Signal(int, int)          # n_ok, n_err
     result_ready = Signal(object, object, object, str, float)  # ch_u8, prob(H,W,C), masks{c:mask}, well_id, pixel_size_um
 
-    def __init__(self, wells: list, cfg: dict, test_mode: bool = False):
+    def __init__(self, wells: list, cfg: dict, test_mode: bool = False,
+                 proj_workers: int = 1):
         super().__init__()
         self._wells     = wells
         self._cfg       = cfg
         self._abort     = False
         self._test_mode = test_mode
+        # >1 fans the Phase-1 projections (read + z-project + write HDF5) out
+        # across worker processes. Left 1 (sequential) for test mode and for
+        # callers that don't opt in, keeping that path byte-for-byte.
+        self._proj_workers = proj_workers
 
     def abort(self) -> None:
         self._abort = True
@@ -1824,67 +1839,118 @@ class _BFWorker(QThread):
             # Critical: pass the original 16-bit (or whatever) pixel values —
             # Ilastik was trained on those, not on uint8-normalised data.
             # Shape matches what Fiji's ilastik4ij plugin sends: (t,z,c,y,x).
-            self.log_msg.emit("Phase 1/3 — loading and projecting BF images …")
             well_map:   dict[str, object]     = {}
             h5_stems:   list[str]             = []
             h5_in_args: list[str]             = []
-            ch_vis_map: dict[str, np.ndarray] = {}  # uint8 display copies
+            ch_vis_map: dict[str, np.ndarray] = {}  # uint8 display copies (test mode only)
             px_map:     dict[str, float]      = {}  # BF pixel_size_um, for ROI scale sidecars
 
-            for i, well in enumerate(self._wells):
-                if self._abort:
-                    self.log_msg.emit("Aborted.")
-                    self.finished.emit(n_ok, n_err)
-                    return
-
-                self.progress.emit(i, total * 3, f"loading {well.well_id}")
-
-                if well.bf_path is None:
-                    self.log_msg.emit(f"  ⚠ {well.well_id}: no BF — skipped")
+            wells_with_bf = [w for w in self._wells if w.bf_path is not None]
+            for w in self._wells:
+                if w.bf_path is None:
+                    self.log_msg.emit(f"  ⚠ {w.well_id}: no BF — skipped")
                     n_err += 1
-                    continue
 
-                try:
-                    img     = read_image(well.bf_path)
-                    ch_data = img.data[ch]          # (Z,H,W) or (H,W)
-                    if ch_data.ndim == 3:
-                        ch_data = proj_fn(ch_data, axis=0)   # → (H,W), original dtype
+            use_parallel = (
+                not self._test_mode and self._proj_workers > 1 and len(wells_with_bf) > 1
+            )
 
-                    stem = well.bf_path.stem
-                    well_map[stem] = well
-                    px_map[stem] = img.pixel_size_um
+            if use_parallel:
+                # ── Phase 1 (parallel): fan projections across processes ──
+                from concurrent.futures import ProcessPoolExecutor
+                import multiprocessing as mp
+                from correlative_imaging.batch import _bf_project_one
 
-                    # HDF5 for Ilastik — original bit depth, tzcyx shape
-                    h5_in = in_dir / f"{stem}.h5"
-                    with h5py.File(h5_in, "w") as f:
-                        f.create_dataset(
-                            "data",
-                            data=ch_data[np.newaxis, np.newaxis, np.newaxis],
-                        )
-                    h5_stems.append(stem)
-                    h5_in_args.append(f"{h5_in}/data")
+                n_pw = min(self._proj_workers, len(wells_with_bf))
+                self.log_msg.emit(
+                    f"Phase 1/3 — projecting {len(wells_with_bf)} BF images "
+                    f"across {n_pw} process(es) …"
+                )
+                well_map = {w.bf_path.stem: w for w in wells_with_bf}
+                tasks = [
+                    (str(w.bf_path), w.well_id, ch, cfg["z_method"],
+                     str(in_dir), str(proj_dir) if proj_dir else None)
+                    for w in wells_with_bf
+                ]
+                ctx = mp.get_context("spawn")
+                done = 0
+                with ProcessPoolExecutor(max_workers=n_pw, mp_context=ctx) as ex:
+                    futs = [ex.submit(_bf_project_one, t) for t in tasks]
+                    for fut in futs:
+                        if self._abort:
+                            self.log_msg.emit("Aborted during projection.")
+                            for f in futs:
+                                f.cancel()
+                            self.finished.emit(n_ok, n_err)
+                            return
+                        stem, well_id, px, dtype, err = fut.result()
+                        done += 1
+                        self.progress.emit(done, total * 3, f"projecting {well_id}")
+                        if err:
+                            # A failed well is simply never added to h5_stems,
+                            # and Phase 3 only ever looks up well_map[stem] for
+                            # stems in h5_stems — so its (harmless) leftover
+                            # well_map entry is never read. Nothing to clean up.
+                            self.log_msg.emit(f"  ✗ {well_id}: {err}")
+                            n_err += 1
+                            continue
+                        h5_stems.append(stem)
+                        h5_in_args.append(f"{in_dir / (stem + '.h5')}/data")
+                        px_map[stem] = px
+                        self.log_msg.emit(f"  ✓ {well_id}: projected (dtype={dtype})")
+            else:
+                # ── Phase 1 (sequential): original path; keeps ch_vis in
+                # memory for test-mode napari display ──
+                self.log_msg.emit("Phase 1/3 — loading and projecting BF images …")
+                for i, well in enumerate(wells_with_bf):
+                    if self._abort:
+                        self.log_msg.emit("Aborted.")
+                        self.finished.emit(n_ok, n_err)
+                        return
 
-                    # uint8 copy only for display / saved projection TIFF
-                    mn, mx = ch_data.min(), ch_data.max()
-                    ch_vis = ((ch_data - mn) / (mx - mn) * 255).astype(np.uint8) \
-                             if mx > mn else np.zeros_like(ch_data, dtype=np.uint8)
-                    ch_vis_map[stem] = ch_vis
+                    self.progress.emit(i, total * 3, f"loading {well.well_id}")
 
-                    if proj_dir:
-                        proj_out = proj_dir / f"{well.well_id}_proj.tif"
-                        tifffile.imwrite(str(proj_out), ch_vis)
-                        self.log_msg.emit(
-                            f"  ✓ {well.well_id}: projected "
-                            f"(dtype={ch_data.dtype}) → {proj_out.name}"
-                        )
-                    else:
-                        self.log_msg.emit(
-                            f"  ✓ {well.well_id}: projected (dtype={ch_data.dtype})"
-                        )
+                    try:
+                        img     = read_image(well.bf_path)
+                        ch_data = img.data[ch]          # (Z,H,W) or (H,W)
+                        if ch_data.ndim == 3:
+                            ch_data = proj_fn(ch_data, axis=0)   # → (H,W), original dtype
 
-                except Exception:
-                    self.log_msg.emit(f"  ✗ {well.well_id}: {_tb.format_exc()}")
-                    n_err += 1
+                        stem = well.bf_path.stem
+                        well_map[stem] = well
+                        px_map[stem] = img.pixel_size_um
+
+                        # HDF5 for Ilastik — original bit depth, tzcyx shape
+                        h5_in = in_dir / f"{stem}.h5"
+                        with h5py.File(h5_in, "w") as f:
+                            f.create_dataset(
+                                "data",
+                                data=ch_data[np.newaxis, np.newaxis, np.newaxis],
+                            )
+                        h5_stems.append(stem)
+                        h5_in_args.append(f"{h5_in}/data")
+
+                        # uint8 copy only for display / saved projection TIFF
+                        mn, mx = ch_data.min(), ch_data.max()
+                        ch_vis = ((ch_data - mn) / (mx - mn) * 255).astype(np.uint8) \
+                                 if mx > mn else np.zeros_like(ch_data, dtype=np.uint8)
+                        ch_vis_map[stem] = ch_vis
+
+                        if proj_dir:
+                            proj_out = proj_dir / f"{well.well_id}_proj.tif"
+                            tifffile.imwrite(str(proj_out), ch_vis)
+                            self.log_msg.emit(
+                                f"  ✓ {well.well_id}: projected "
+                                f"(dtype={ch_data.dtype}) → {proj_out.name}"
+                            )
+                        else:
+                            self.log_msg.emit(
+                                f"  ✓ {well.well_id}: projected (dtype={ch_data.dtype})"
+                            )
+
+                    except Exception:
+                        self.log_msg.emit(f"  ✗ {well.well_id}: {_tb.format_exc()}")
+                        n_err += 1
 
             if not h5_in_args:
                 self.log_msg.emit("No images to process.")
@@ -3692,13 +3758,13 @@ class RunTab(QWidget):
         dask_row = QHBoxLayout()
         self._dask_cb = QCheckBox("Use Dask (true multi-core, process-based)")
         self._dask_cb.setToolTip(
-            "Runs the per-well FL analysis across separate WORKER PROCESSES "
+            "Runs the heavy per-well work across separate WORKER PROCESSES "
             "via a Dask LocalCluster — real multi-core parallelism, unlike "
             "the thread pool above (which the GIL limits for the Python-heavy "
             "parts). Best for a powerful multi-core workstation.\n\n"
             "• Overrides the thread 'workers' setting when on.\n"
             "• Multiple plates are processed one at a time, each fanning out "
-            "across all Dask workers.\n"
+            "across all workers.\n"
             "• Per-step progress isn't shown in this mode (only per-well).\n"
             "• Requires 'dask[distributed]' installed; the run will report a "
             "clear error and you can fall back to the thread path if it isn't."
@@ -3708,11 +3774,14 @@ class RunTab(QWidget):
         self._dask_worker_spin.setRange(1, 80)
         self._dask_worker_spin.setValue(min(20, max(1, (os.cpu_count() or 4) - 1)))
         self._dask_worker_spin.setEnabled(False)
-        self._dask_worker_spin.setPrefix("dask workers: ")
+        self._dask_worker_spin.setPrefix("workers per plate: ")
         self._dask_worker_spin.setToolTip(
-            "Number of worker processes in the Dask cluster. A good starting "
-            "point is close to your physical core count; each worker reads and "
-            "analyzes one well at a time."
+            "Worker processes used PER PLATE — this one number drives both "
+            "phases: it's how many BF images are projected in parallel, and "
+            "then how many wells are analyzed in parallel (the FL Dask "
+            "cluster). Plates run one at a time, each getting this many "
+            "workers. A good starting point is close to your physical core "
+            "count."
         )
         dask_row.addWidget(self._dask_cb)
         dask_row.addWidget(self._dask_worker_spin)
@@ -4167,6 +4236,23 @@ class RunTab(QWidget):
         self._dask_worker_spin.setEnabled(checked)
         self._parallel_cb.setEnabled(not checked)
         self._worker_spin.setEnabled(not checked and self._parallel_cb.isChecked())
+        # "plates in parallel" is ignored under Dask (plates run serially, each
+        # fanning across ALL dask workers) — grey it out so it doesn't look
+        # like it has any effect in that mode.
+        self._plate_worker_spin.setEnabled(not checked)
+        if checked:
+            self._plate_worker_spin.setToolTip(
+                "Ignored while 'Use Dask' is on — plates run one at a time, "
+                "each fanning out across all Dask workers (running several "
+                "plates at once would just oversubscribe the same cores)."
+            )
+        else:
+            self._plate_worker_spin.setToolTip(
+                "Only relevant when multiple plates are detected in the Setup "
+                "tab. 1 = one plate at a time (safest default). Each plate "
+                "always gets its own output folder and DB regardless of this "
+                "setting."
+            )
 
     def _on_abort(self) -> None:
         if self._worker: self._worker.abort(); self._log("Abort requested …")

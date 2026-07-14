@@ -241,6 +241,47 @@ def _save_well_diagnostics(
                 tifffile.imwrite(str(out_dir / f"{well.well_id}_{key}.tif"), mask.astype("uint16"))
 
 
+def _bf_project_one(task: tuple) -> tuple:
+    """Read one brightfield image, z-project the chosen channel, write the
+    Ilastik HDF5 input, and (optionally) a uint8 projection TIFF.
+
+    MODULE-LEVEL and Qt-free on purpose: the BF-pipeline projection phase
+    fans these out across a ``ProcessPoolExecutor`` (spawn), so this must be
+    importable in a worker process without dragging in the GUI/Qt. Mirrors
+    the per-well projection that ``_BFWorker.run`` does inline for its
+    sequential/test path — kept in sync with it by hand (small, stable).
+
+    ``task`` = (bf_path, well_id, bf_channel, z_method, in_dir, proj_dir|None).
+    Returns (stem, well_id, pixel_size_um, dtype_str, error|None); on failure
+    ``stem`` is None and ``error`` holds the traceback.
+    """
+    import h5py
+    import numpy as np
+    import tifffile
+
+    bf_path_str, well_id, bf_channel, z_method, in_dir_str, proj_dir_str = task
+    try:
+        ops = {"min": np.min, "max": np.max, "mean": np.mean, "sum": np.sum}
+        proj_fn = ops.get(z_method, np.min)
+        bf_path = Path(bf_path_str)
+        stem = bf_path.stem
+        img = read_image(bf_path)
+        ch_data = img.data[bf_channel]              # (Z,H,W) or (H,W)
+        if ch_data.ndim == 3:
+            ch_data = proj_fn(ch_data, axis=0)      # → (H,W), original dtype
+        h5_in = Path(in_dir_str) / f"{stem}.h5"
+        with h5py.File(h5_in, "w") as f:
+            f.create_dataset("data", data=ch_data[np.newaxis, np.newaxis, np.newaxis])
+        if proj_dir_str:
+            mn, mx = ch_data.min(), ch_data.max()
+            ch_vis = (((ch_data - mn) / (mx - mn) * 255).astype(np.uint8)
+                      if mx > mn else np.zeros_like(ch_data, dtype=np.uint8))
+            tifffile.imwrite(str(Path(proj_dir_str) / f"{well_id}_proj.tif"), ch_vis)
+        return (stem, well_id, float(img.pixel_size_um), str(ch_data.dtype), None)
+    except Exception:
+        return (None, well_id, None, None, traceback.format_exc())
+
+
 def _run_pipeline_for_well(
     well: WellInfo,
     pl_dict: dict,
