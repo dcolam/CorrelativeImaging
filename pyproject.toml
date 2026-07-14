@@ -47,6 +47,10 @@ dask = [
     # Optional: process-based multi-core batch engine (RunTab "Use Dask").
     # Without this the thread/sequential batch paths still work unchanged.
     "dask[distributed]>=2024.1",
+    # bokeh powers the live LocalCluster dashboard (task stream, per-worker
+    # CPU/memory). dask[distributed] does NOT pull it in; without it the
+    # dashboard URL just shows an "install bokeh" page, but batch runs fine.
+    "bokeh>=3.1",
 ]
 bioformats = [
     # covers VSI, SCN, ICS, AFM, etc.
