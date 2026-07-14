@@ -5,7 +5,9 @@ from __future__ import annotations
 import datetime
 import json
 import logging
+import os
 import re
+import shutil
 import threading
 import traceback
 from dataclasses import dataclass, field
@@ -252,7 +254,8 @@ class _WellBatchWorker(QThread):
     def __init__(self, wells: list, pipeline_dict_fn, bf_cfg: dict | None,
                  output_dir: Path, experiment: str, max_workers: int = 1,
                  db_path: Path | None = None, force_regen: bool = False,
-                 diag_cfg: dict | None = None):
+                 diag_cfg: dict | None = None, use_dask: bool = False,
+                 dask_workers: int | None = None):
         super().__init__()
         self._wells = wells
         self._pipeline_dict_fn = pipeline_dict_fn
@@ -263,6 +266,8 @@ class _WellBatchWorker(QThread):
         self._db_path = Path(db_path) if db_path else (self._output_dir / "results.db")
         self._force_regen = force_regen
         self._diag_cfg = diag_cfg
+        self._use_dask = use_dask
+        self._dask_workers = dask_workers
         self._abort = False
 
     def abort(self) -> None:
@@ -324,7 +329,11 @@ class _WellBatchWorker(QThread):
                 max_workers=self._max_workers,
                 warn_fn=self.log_msg.emit,
                 diag_cfg=self._diag_cfg,
-                on_step_fn=_on_step,
+                # Per-step progress can't cross the Dask process boundary, so
+                # it's only wired for the in-process (thread/sequential) paths.
+                on_step_fn=None if self._use_dask else _on_step,
+                use_dask=self._use_dask,
+                dask_workers=self._dask_workers,
             )
             self.finished.emit("" if self._abort else str(db_path))
         except Exception:
@@ -353,7 +362,8 @@ class _MultiPlateBatchWorker(QThread):
                  base_output_dir: Path, experiment: str,
                  max_workers_per_plate: int = 1, max_parallel_plates: int = 1,
                  force_regen: bool = False, diag_cfg_base: dict | None = None,
-                 get_plate_output_dir=None, run_basename: str = "run"):
+                 get_plate_output_dir=None, run_basename: str = "run",
+                 use_dask: bool = False, dask_workers: int | None = None):
         super().__init__()
         self._plates = plates  # dict[str, _PlateEntry]
         self._pipeline_dict_fn = pipeline_dict_fn
@@ -361,7 +371,13 @@ class _MultiPlateBatchWorker(QThread):
         self._base_output_dir = Path(base_output_dir)
         self._experiment = experiment
         self._max_workers_per_plate = max_workers_per_plate
-        self._max_parallel_plates = max(1, max_parallel_plates)
+        self._use_dask = use_dask
+        self._dask_workers = dask_workers
+        # With Dask on, each plate's FL analysis already fans out across all
+        # dask process-workers (saturating the machine), so plates are run
+        # one at a time — spinning up several Dask clusters at once would just
+        # oversubscribe cores and multiply cluster overhead for no gain.
+        self._max_parallel_plates = 1 if use_dask else max(1, max_parallel_plates)
         self._force_regen = force_regen
         self._diag_cfg_base = diag_cfg_base
         self._get_plate_output_dir = get_plate_output_dir
@@ -410,6 +426,7 @@ class _MultiPlateBatchWorker(QThread):
             list(entry.wells.values()), self._pipeline_dict_fn, bf_cfg, plate_out,
             self._experiment, max_workers=self._max_workers_per_plate, db_path=db_path,
             force_regen=self._force_regen, diag_cfg=diag_cfg,
+            use_dask=self._use_dask, dask_workers=self._dask_workers,
         )
         worker.progress.connect(_cb)
         worker.step_progress.connect(_on_step)
@@ -1883,10 +1900,23 @@ class _BFWorker(QThread):
             )
             self.progress.emit(total, total * 3, "Ilastik running …")
 
+            # Ilastik .ilp projects are HDF5-backed — opening the same file
+            # from two concurrent headless processes is unsafe (a known
+            # HDF5 pain point, worse over network shares) even with
+            # --readonly=1, which only stops Ilastik writing state back, not
+            # concurrent opens. With multi-plate "plates in parallel" > 1,
+            # more than one plate's _BFWorker can invoke Ilastik at the same
+            # time on what would otherwise be the same project file, so each
+            # invocation runs against its own private temp copy instead —
+            # true parallelism, no shared file, nothing to serialize.
+            ilp_src = Path(cfg["ilp_path"])
+            ilp_copy = tmp / f"project_copy{ilp_src.suffix}"
+            shutil.copy2(ilp_src, ilp_copy)
+
             out_pattern = str(out_dir / "{nickname}.h5")
             cmd = [
                 exe, "--headless",
-                f"--project={cfg['ilp_path']}",
+                f"--project={ilp_copy}",
                 "--export_source=Simple Segmentation",
                 "--output_format=hdf5",
                 "--output_axis_order=tzcyx",
@@ -3659,6 +3689,36 @@ class RunTab(QWidget):
         par_row.addStretch()
         bl.addLayout(par_row)
 
+        dask_row = QHBoxLayout()
+        self._dask_cb = QCheckBox("Use Dask (true multi-core, process-based)")
+        self._dask_cb.setToolTip(
+            "Runs the per-well FL analysis across separate WORKER PROCESSES "
+            "via a Dask LocalCluster — real multi-core parallelism, unlike "
+            "the thread pool above (which the GIL limits for the Python-heavy "
+            "parts). Best for a powerful multi-core workstation.\n\n"
+            "• Overrides the thread 'workers' setting when on.\n"
+            "• Multiple plates are processed one at a time, each fanning out "
+            "across all Dask workers.\n"
+            "• Per-step progress isn't shown in this mode (only per-well).\n"
+            "• Requires 'dask[distributed]' installed; the run will report a "
+            "clear error and you can fall back to the thread path if it isn't."
+        )
+        self._dask_cb.toggled.connect(self._on_dask_toggled)
+        self._dask_worker_spin = QSpinBox()
+        self._dask_worker_spin.setRange(1, 80)
+        self._dask_worker_spin.setValue(min(20, max(1, (os.cpu_count() or 4) - 1)))
+        self._dask_worker_spin.setEnabled(False)
+        self._dask_worker_spin.setPrefix("dask workers: ")
+        self._dask_worker_spin.setToolTip(
+            "Number of worker processes in the Dask cluster. A good starting "
+            "point is close to your physical core count; each worker reads and "
+            "analyzes one well at a time."
+        )
+        dask_row.addWidget(self._dask_cb)
+        dask_row.addWidget(self._dask_worker_spin)
+        dask_row.addStretch()
+        bl.addLayout(dask_row)
+
         self._force_regen_cb = QCheckBox("Force regenerate BF-pipeline ROI(s) (ignore existing files)")
         self._force_regen_cb.setToolTip(
             "Off (default): a well's BF-pipeline ROI(s) are reused from disk "
@@ -4001,7 +4061,9 @@ class RunTab(QWidget):
         # silently overwrite an earlier run's. With multiple plates, this
         # same base name is reused inside each plate's own output subfolder.
         base = _run_basename(setup.experiment)
-        max_workers = self._worker_spin.value() if self._parallel_cb.isChecked() else 1
+        use_dask = self._dask_cb.isChecked()
+        dask_workers = self._dask_worker_spin.value() if use_dask else None
+        max_workers = self._worker_spin.value() if (self._parallel_cb.isChecked() and not use_dask) else 1
 
         diag_cfg = None
         if self._diag_whole_cb.isChecked() or self._diag_crops_cb.isChecked():
@@ -4055,7 +4117,12 @@ class RunTab(QWidget):
             # BFPipelineTab.run_on_wells (a missing save_dir would otherwise
             # write ROI files next to the source BF image, often a slow/
             # read-only network data share).
-            if max_workers > 1:
+            if use_dask:
+                self._log(
+                    f"Dask batch: {dask_workers} process worker(s) per plate"
+                    + (", plates run one at a time." if n_plates > 1 else ".")
+                )
+            elif max_workers > 1:
                 self._log(f"Parallel batch (experimental): {max_workers} well-worker(s) per plate.")
 
             max_parallel_plates = self._plate_worker_spin.value() if n_plates > 1 else 1
@@ -4068,6 +4135,8 @@ class RunTab(QWidget):
                 diag_cfg_base=diag_cfg,
                 get_plate_output_dir=setup.get_plate_output_dir,
                 run_basename=base,
+                use_dask=use_dask,
+                dask_workers=dask_workers,
             )
         else:
             setup.output_dir.mkdir(parents=True, exist_ok=True)
@@ -4090,6 +4159,14 @@ class RunTab(QWidget):
 
     def _on_parallel_toggled(self, checked: bool) -> None:
         self._worker_spin.setEnabled(checked)
+
+    def _on_dask_toggled(self, checked: bool) -> None:
+        # Dask (process-based) and the thread pool are two ways to do the same
+        # fan-out — enabling one greys out the other so they can't be armed
+        # at once. Dask, when on, takes precedence in _on_run regardless.
+        self._dask_worker_spin.setEnabled(checked)
+        self._parallel_cb.setEnabled(not checked)
+        self._worker_spin.setEnabled(not checked and self._parallel_cb.isChecked())
 
     def _on_abort(self) -> None:
         if self._worker: self._worker.abort(); self._log("Abort requested …")

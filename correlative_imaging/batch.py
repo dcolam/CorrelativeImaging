@@ -241,6 +241,98 @@ def _save_well_diagnostics(
                 tifffile.imwrite(str(out_dir / f"{well.well_id}_{key}.tif"), mask.astype("uint16"))
 
 
+def _run_pipeline_for_well(
+    well: WellInfo,
+    pl_dict: dict,
+    missing: list[str],
+    diag_cfg: dict | None = None,
+    on_step_fn: Callable[[WellInfo, int, int, str], None] | None = None,
+    trim_arrays: bool = False,
+) -> _WellComputeResult:
+    """Pure per-well compute: build the pipeline from an already-resolved
+    ``pl_dict``, read the FL image, run, optionally write diagnostics, and
+    return a :class:`_WellComputeResult`. Touches no shared state and never
+    the database.
+
+    This is a MODULE-LEVEL function (not a method or closure) on purpose: the
+    Dask engine ships it to spawned worker processes, where it must be
+    importable and where only picklable, plain-data arguments (``WellInfo``,
+    a JSON-able ``pl_dict``, a list of labels) may cross the boundary — hence
+    the pipeline dict is resolved by the caller, not a ``pipeline_dict_fn``
+    closure here.
+
+    ``trim_arrays`` (used only by the Dask path): after diagnostics have been
+    written, drop each ``StepResult``'s big full-frame ``image``/``masks``
+    arrays, since ``_write_result`` consumes only ``measurements``/``info`` —
+    this keeps the result light when it's pickled back across the process
+    boundary. Left False for the in-process (sequential/thread) paths, where
+    there is no IPC and the result is used and discarded immediately.
+    """
+    pipeline_json = json.dumps(pl_dict)
+    pl_name = pl_dict.get("name", "pipeline")
+    try:
+        pl = Pipeline(name=pl_name)
+        for step_data in pl_dict.get("steps", []):
+            pl.steps.append(Step.from_dict(step_data))
+
+        image_data = read_image(well.fl_path)
+        context = PipelineContext(
+            channel_names=image_data.channel_names,
+            pixel_size_um=image_data.pixel_size_um,
+            z_step_um=image_data.z_step_um,
+        )
+        total_steps = len(pl.steps)
+        on_step = None
+        if on_step_fn:
+            step_counter = [0]
+
+            def on_step(step, result, current):
+                step_counter[0] += 1
+                on_step_fn(well, step_counter[0], total_steps, step.name)
+
+        final_image, results = pl.run(image_data.data, context, on_step=on_step)
+
+        if diag_cfg:
+            try:
+                _save_well_diagnostics(
+                    well, final_image, image_data.pixel_size_um, pl_dict, context, diag_cfg,
+                )
+            except Exception:
+                log.warning(
+                    "Diagnostic image export failed for well %s:\n%s",
+                    well.well_id, traceback.format_exc(),
+                )
+
+        if trim_arrays:
+            for r in results:
+                r.image = None
+                r.masks = {}
+                r.mask_paths = {}
+
+        return _WellComputeResult(
+            well=well, pl_name=pl_name, pipeline_json=pipeline_json,
+            steps_and_results=list(zip(pl.steps, results)),
+            image_meta={
+                "n_channels": image_data.n_channels,
+                "pixel_size_um": image_data.pixel_size_um,
+                "metadata": {
+                    **image_data.metadata,
+                    "well_id": well.well_id,
+                    "row": well.row,
+                    "col": well.col,
+                    "field": well.field,
+                    "missing_selections": missing,
+                },
+            },
+            missing_selections=missing,
+        )
+    except Exception:
+        return _WellComputeResult(
+            well=well, pl_name=pl_name, pipeline_json=pipeline_json,
+            error=traceback.format_exc(), missing_selections=missing,
+        )
+
+
 class WellBatchRunner:
     """Run a per-well pipeline over a list of :class:`WellInfo`.
 
@@ -269,63 +361,9 @@ class WellBatchRunner:
         on_step_fn: Callable[[WellInfo, int, int, str], None] | None = None,
     ) -> _WellComputeResult:
         pl_dict, missing = pipeline_dict_fn(well)
-        pipeline_json = json.dumps(pl_dict)
-        pl_name = pl_dict.get("name", "pipeline")
-        try:
-            pl = Pipeline(name=pl_name)
-            for step_data in pl_dict.get("steps", []):
-                pl.steps.append(Step.from_dict(step_data))
-
-            image_data = read_image(well.fl_path)
-            context = PipelineContext(
-                channel_names=image_data.channel_names,
-                pixel_size_um=image_data.pixel_size_um,
-                z_step_um=image_data.z_step_um,
-            )
-            total_steps = len(pl.steps)
-            on_step = None
-            if on_step_fn:
-                step_counter = [0]
-
-                def on_step(step, result, current):
-                    step_counter[0] += 1
-                    on_step_fn(well, step_counter[0], total_steps, step.name)
-
-            final_image, results = pl.run(image_data.data, context, on_step=on_step)
-
-            if diag_cfg:
-                try:
-                    _save_well_diagnostics(
-                        well, final_image, image_data.pixel_size_um, pl_dict, context, diag_cfg,
-                    )
-                except Exception:
-                    log.warning(
-                        "Diagnostic image export failed for well %s:\n%s",
-                        well.well_id, traceback.format_exc(),
-                    )
-
-            return _WellComputeResult(
-                well=well, pl_name=pl_name, pipeline_json=pipeline_json,
-                steps_and_results=list(zip(pl.steps, results)),
-                image_meta={
-                    "n_channels": image_data.n_channels,
-                    "pixel_size_um": image_data.pixel_size_um,
-                    "metadata": {
-                        **image_data.metadata,
-                        "well_id": well.well_id,
-                        "row": well.row,
-                        "col": well.col,
-                        "field": well.field,
-                        "missing_selections": missing,
-                    },
-                },
-                missing_selections=missing,
-            )
-        except Exception:
-            return _WellComputeResult(
-                well=well, pl_name=pl_name, pipeline_json=pipeline_json,
-                error=traceback.format_exc(), missing_selections=missing,
-            )
+        return _run_pipeline_for_well(
+            well, pl_dict, missing, diag_cfg, on_step_fn, trim_arrays=False,
+        )
 
     # ------------------------------------------------------------------
     # DB write — must only ever be called from one thread (the orchestrating
@@ -366,6 +404,78 @@ class WellBatchRunner:
         return n_particles
 
     # ------------------------------------------------------------------
+    # Dask engine — process-based, true multi-core. Compute in workers,
+    # DB writes here on the main process (SQLite stays single-writer).
+    # ------------------------------------------------------------------
+
+    def _run_wells_dask(
+        self, wells_with_fl, pipeline_dict_fn, dask_workers, progress_fn,
+        should_abort, diag_cfg, note_missing, total, warn_fn,
+    ) -> None:
+        try:
+            import dask
+            from dask.distributed import Client, LocalCluster
+            from dask.distributed import as_completed as dask_as_completed
+        except ImportError as e:
+            raise RuntimeError(
+                "Dask parallel batch was requested but 'dask[distributed]' is not "
+                "installed in this environment. Install it with:\n"
+                "    pip install 'dask[distributed]'\n"
+                "…or turn off the Dask option to use the thread-based path instead."
+            ) from e
+
+        # Force spawn (not fork): matches Windows semantics everywhere, and
+        # avoids forking a process that may hold a live Bio-Formats JVM.
+        dask.config.set({"distributed.worker.multiprocessing-method": "spawn"})
+
+        # Resolve every well's pipeline dict HERE on the main process — cheap
+        # (dict-building + ROI-file matching, no image I/O) — so the possibly
+        # non-picklable pipeline_dict_fn closure never has to reach a worker;
+        # only plain, picklable data crosses the process boundary.
+        resolved = [(w, *pipeline_dict_fn(w)) for w in wells_with_fl]
+
+        import os
+        n_workers = dask_workers or max(1, (os.cpu_count() or 2) - 1)
+        log.info("Starting Dask LocalCluster: %d process worker(s), 1 thread each …", n_workers)
+
+        cluster = LocalCluster(n_workers=n_workers, threads_per_worker=1, processes=True)
+        client = Client(cluster)
+        try:
+            dash = cluster.dashboard_link
+            log.info("Dask dashboard: %s", dash)
+            if warn_fn:
+                warn_fn(f"Dask dashboard: {dash}")
+
+            # Surface unmatched selections up front (compute is remote, so we
+            # can't rely on doing it as results arrive — same counts either way).
+            for (w, _pl, missing) in resolved:
+                note_missing(w, missing)
+
+            futures = [
+                client.submit(
+                    _run_pipeline_for_well, w, pl_dict, missing, diag_cfg, None, True,
+                    pure=False,
+                )
+                for (w, pl_dict, missing) in resolved
+            ]
+
+            done = 0
+            with ResultsDB(self.db_path) as db:
+                for fut in dask_as_completed(futures):
+                    if should_abort and should_abort():
+                        log.info("Dask batch aborted — cancelling remaining tasks.")
+                        client.cancel(futures)
+                        break
+                    result = fut.result()
+                    n_particles = self._write_result(db, result)
+                    done += 1
+                    if progress_fn:
+                        progress_fn(done, total, result.well.well_id, n_particles)
+        finally:
+            client.close()
+            cluster.close()
+
+    # ------------------------------------------------------------------
 
     def run_wells(
         self,
@@ -377,6 +487,8 @@ class WellBatchRunner:
         warn_fn: Callable[[str], None] | None = None,
         diag_cfg: dict | None = None,
         on_step_fn: Callable[[WellInfo, int, int, str], None] | None = None,
+        use_dask: bool = False,
+        dask_workers: int | None = None,
     ) -> None:
         """Process every well with an FL image, using a pipeline built per well.
 
@@ -408,6 +520,16 @@ class WellBatchRunner:
         are merged into ``db_path`` at the end (remapping ``image_id``
         foreign keys, since each sub-DB has its own independent autoincrement
         sequence) and kept on disk afterward, not deleted.
+
+        use_dask: when True, the per-well compute runs in a Dask
+        ``LocalCluster`` of separate *processes* (true multi-core, unlike the
+        thread pool which is GIL-limited for the Python-heavy parts). Only
+        plain data is shipped to workers; DB writes stay on this (main)
+        process, so SQLite is single-writer as always. ``max_workers`` (the
+        thread path) is ignored when this is set. Requires
+        ``dask[distributed]`` — raises a clear error if not installed.
+        dask_workers: process-worker count for the Dask cluster (default:
+        CPU count − 1).
         """
         wells_with_fl = [w for w in wells if w.fl_path is not None]
         if not wells_with_fl:
@@ -430,7 +552,12 @@ class WellBatchRunner:
             if warn_fn:
                 warn_fn(msg)
 
-        if max_workers <= 1:
+        if use_dask:
+            self._run_wells_dask(
+                wells_with_fl, pipeline_dict_fn, dask_workers, progress_fn,
+                should_abort, diag_cfg, _note_missing, total, warn_fn,
+            )
+        elif max_workers <= 1:
             with ResultsDB(self.db_path) as db:
                 iterator = (
                     tqdm(wells_with_fl, unit="well", desc="Batch")

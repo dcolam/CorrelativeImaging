@@ -43,6 +43,11 @@ gpu = [
     "cupy-cuda12x",
     "cucim-cu12",
 ]
+dask = [
+    # Optional: process-based multi-core batch engine (RunTab "Use Dask").
+    # Without this the thread/sequential batch paths still work unchanged.
+    "dask[distributed]>=2024.1",
+]
 bioformats = [
     # covers VSI, SCN, ICS, AFM, etc.
     "bioio-bioformats",
