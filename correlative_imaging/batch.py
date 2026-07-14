@@ -4,12 +4,20 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import traceback
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from tqdm import tqdm
+
+# Two Dask LocalClusters must not spin up at the SAME instant in one process —
+# they race on shared asyncio/IOLoop state and one dies ("Cluster closed
+# without starting up"). When several plates run concurrently, each builds its
+# own cluster; this lock serializes just the (fast) startup, after which the
+# clusters run fully in parallel. Module-level so all plate threads share it.
+_DASK_CLUSTER_STARTUP_LOCK = threading.Lock()
 
 from correlative_imaging.diagnostics import bbox_from_mask, composite_rgb, save_diagnostic_image, stamp_outlines
 from correlative_imaging.io import read_image, supported_extensions
@@ -479,8 +487,11 @@ class WellBatchRunner:
         n_workers = dask_workers or max(1, (os.cpu_count() or 2) - 1)
         log.info("Starting Dask LocalCluster: %d process worker(s), 1 thread each …", n_workers)
 
-        cluster = LocalCluster(n_workers=n_workers, threads_per_worker=1, processes=True)
-        client = Client(cluster)
+        # Serialize startup only (see _DASK_CLUSTER_STARTUP_LOCK) — concurrent
+        # plates each build their own cluster, and two starting at once race.
+        with _DASK_CLUSTER_STARTUP_LOCK:
+            cluster = LocalCluster(n_workers=n_workers, threads_per_worker=1, processes=True)
+            client = Client(cluster)
         try:
             dash = cluster.dashboard_link
             log.info("Dask dashboard: %s", dash)

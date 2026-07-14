@@ -383,11 +383,12 @@ class _MultiPlateBatchWorker(QThread):
         self._max_workers_per_plate = max_workers_per_plate
         self._use_dask = use_dask
         self._dask_workers = dask_workers
-        # With Dask on, each plate's FL analysis already fans out across all
-        # dask process-workers (saturating the machine), so plates are run
-        # one at a time — spinning up several Dask clusters at once would just
-        # oversubscribe cores and multiply cluster overhead for no gain.
-        self._max_parallel_plates = 1 if use_dask else max(1, max_parallel_plates)
+        # Plates run concurrently up to this count. Under Dask each concurrent
+        # plate gets its OWN LocalCluster (dask_workers each) and its own .ilp
+        # copy, so N plates × dask_workers processes run at once — size the two
+        # numbers so their product fits the machine (e.g. 4 plates × 15 = 60
+        # on an 80-thread box).
+        self._max_parallel_plates = max(1, max_parallel_plates)
         self._force_regen = force_regen
         self._diag_cfg_base = diag_cfg_base
         self._get_plate_output_dir = get_plate_output_dir
@@ -4186,15 +4187,18 @@ class RunTab(QWidget):
             # BFPipelineTab.run_on_wells (a missing save_dir would otherwise
             # write ROI files next to the source BF image, often a slow/
             # read-only network data share).
+            max_parallel_plates = self._plate_worker_spin.value() if n_plates > 1 else 1
             if use_dask:
-                self._log(
-                    f"Dask batch: {dask_workers} process worker(s) per plate"
-                    + (", plates run one at a time." if n_plates > 1 else ".")
-                )
+                if n_plates > 1 and max_parallel_plates > 1:
+                    self._log(
+                        f"Dask batch: {max_parallel_plates} plate(s) at once × "
+                        f"{dask_workers} worker(s) each = up to "
+                        f"{max_parallel_plates * dask_workers} processes."
+                    )
+                else:
+                    self._log(f"Dask batch: {dask_workers} worker(s) per plate.")
             elif max_workers > 1:
                 self._log(f"Parallel batch (experimental): {max_workers} well-worker(s) per plate.")
-
-            max_parallel_plates = self._plate_worker_spin.value() if n_plates > 1 else 1
             self._worker = _MultiPlateBatchWorker(
                 enabled_plates, pipeline_dict_fn, bf_cfg,
                 setup.output_dir, setup.experiment,
@@ -4236,23 +4240,16 @@ class RunTab(QWidget):
         self._dask_worker_spin.setEnabled(checked)
         self._parallel_cb.setEnabled(not checked)
         self._worker_spin.setEnabled(not checked and self._parallel_cb.isChecked())
-        # "plates in parallel" is ignored under Dask (plates run serially, each
-        # fanning across ALL dask workers) — grey it out so it doesn't look
-        # like it has any effect in that mode.
-        self._plate_worker_spin.setEnabled(not checked)
-        if checked:
-            self._plate_worker_spin.setToolTip(
-                "Ignored while 'Use Dask' is on — plates run one at a time, "
-                "each fanning out across all Dask workers (running several "
-                "plates at once would just oversubscribe the same cores)."
-            )
-        else:
-            self._plate_worker_spin.setToolTip(
-                "Only relevant when multiple plates are detected in the Setup "
-                "tab. 1 = one plate at a time (safest default). Each plate "
-                "always gets its own output folder and DB regardless of this "
-                "setting."
-            )
+        # "plates in parallel" applies with or without Dask. Under Dask, each
+        # concurrent plate gets its own cluster of "workers per plate", so the
+        # total process count is plates_in_parallel × workers_per_plate.
+        self._plate_worker_spin.setToolTip(
+            "How many plates to process at the same time (when multiple are "
+            "detected). Under Dask each concurrent plate gets its own cluster "
+            "of 'workers per plate' — so total processes = "
+            "plates-in-parallel × workers-per-plate. Keep that product at or "
+            "under your thread count (e.g. 4 plates × 15 workers = 60)."
+        )
 
     def _on_abort(self) -> None:
         if self._worker: self._worker.abort(); self._log("Abort requested …")

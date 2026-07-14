@@ -319,15 +319,6 @@ def read_image(path: str | Path, scene: int = 0) -> ImageData:
     if suffix not in all_known:
         log.warning("Extension %s not in known list — attempting bioio anyway", suffix)
 
-    if suffix in bioformats_extensions:
-        log.warning(
-            "%s requires bioio-bioformats (Java). "
-            "Install with: pip install bioio-bioformats",
-            suffix,
-        )
-        # Java setup happens inside _construct_bioformats_image, under the
-        # same lock as the first JVM-starting construction (see there for why).
-
     try:
         from bioio import BioImage
     except ImportError as exc:
@@ -342,12 +333,26 @@ def read_image(path: str | Path, scene: int = 0) -> ImageData:
         # __init__ — BioImage forwards the kwarg there and it blows up.
         # Create without scene, then set it via the public API.
         if suffix in bioformats_extensions:
+            # Java setup happens inside _construct_bioformats_image, under the
+            # same lock as the first JVM-starting construction (see there for why).
             img = _construct_bioformats_image(BioImage, path, reader_cls)
         else:
             img = BioImage(str(path), reader=reader_cls)
         if scene != 0:
             img.set_scene(scene)
     else:
+        # Only warn when the format GENUINELY needs the Bio-Formats reader and
+        # it isn't installed (reader_cls is None because the import failed) —
+        # the read below will then fail, so make the real cause obvious rather
+        # than logging a scary "requires bioio-bioformats" line on every
+        # successful read (which it isn't — a working install lands in the
+        # branch above and stays silent).
+        if suffix in bioformats_extensions:
+            log.warning(
+                "%s requires the 'bioio-bioformats' reader, which is not "
+                "installed. Install with: pip install bioio-bioformats",
+                suffix,
+            )
         img = BioImage(str(path), scene=scene)
 
     # Always get a (C, Z, Y, X) array; squeeze T=0
