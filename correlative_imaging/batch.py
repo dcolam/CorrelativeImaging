@@ -459,7 +459,7 @@ class WellBatchRunner:
 
     def _run_wells_dask(
         self, wells_with_fl, pipeline_dict_fn, dask_workers, progress_fn,
-        should_abort, diag_cfg, note_missing, total, warn_fn,
+        should_abort, diag_cfg, note_missing, total, warn_fn, dashboard_fn=None,
     ) -> None:
         try:
             import dask
@@ -497,6 +497,8 @@ class WellBatchRunner:
             log.info("Dask dashboard: %s", dash)
             if warn_fn:
                 warn_fn(f"Dask dashboard: {dash}")
+            if dashboard_fn:
+                dashboard_fn(dash)
 
             # Surface unmatched selections up front (compute is remote, so we
             # can't rely on doing it as results arrive — same counts either way).
@@ -541,6 +543,7 @@ class WellBatchRunner:
         on_step_fn: Callable[[WellInfo, int, int, str], None] | None = None,
         use_dask: bool = False,
         dask_workers: int | None = None,
+        dashboard_fn: Callable[[str], None] | None = None,
     ) -> None:
         """Process every well with an FL image, using a pipeline built per well.
 
@@ -608,6 +611,7 @@ class WellBatchRunner:
             self._run_wells_dask(
                 wells_with_fl, pipeline_dict_fn, dask_workers, progress_fn,
                 should_abort, diag_cfg, _note_missing, total, warn_fn,
+                dashboard_fn,
             )
         elif max_workers <= 1:
             with ResultsDB(self.db_path) as db:

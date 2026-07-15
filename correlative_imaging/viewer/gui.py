@@ -250,6 +250,7 @@ class _WellBatchWorker(QThread):
     step_progress = Signal(str, int, int, str)   # well_id, step_index, total_steps, step_name
     log_msg  = Signal(str)
     finished = Signal(str)
+    dashboard_ready = Signal(str)   # Dask dashboard URL for this run's cluster
 
     def __init__(self, wells: list, pipeline_dict_fn, bf_cfg: dict | None,
                  output_dir: Path, experiment: str, max_workers: int = 1,
@@ -344,6 +345,7 @@ class _WellBatchWorker(QThread):
                 on_step_fn=None if self._use_dask else _on_step,
                 use_dask=self._use_dask,
                 dask_workers=self._dask_workers,
+                dashboard_fn=self.dashboard_ready.emit,
             )
             self.finished.emit("" if self._abort else str(db_path))
         except Exception:
@@ -367,6 +369,7 @@ class _MultiPlateBatchWorker(QThread):
     step_progress = Signal(str, int, int, str)
     log_msg  = Signal(str)
     finished = Signal(str)
+    dashboard_ready = Signal(str, str)   # (plate display name, dashboard URL)
 
     def __init__(self, plates: dict, pipeline_dict_fn, bf_cfg_base: dict | None,
                  base_output_dir: Path, experiment: str,
@@ -442,6 +445,7 @@ class _MultiPlateBatchWorker(QThread):
         worker.progress.connect(_cb)
         worker.step_progress.connect(_on_step)
         worker.log_msg.connect(lambda m: self.log_msg.emit(f"[{tag}] {m}"))
+        worker.dashboard_ready.connect(lambda url, t=tag: self.dashboard_ready.emit(t, url))
 
         with self._lock:
             self._active_workers.append(worker)
@@ -3646,6 +3650,67 @@ class AdvancedPipelineTab(QWidget):
         pass   # kept for API compatibility
 
 
+class _DaskDashboardDialog(QDialog):
+    """Non-modal dialog listing each plate's live Dask dashboard URL, with a
+    clickable link and a Copy button. Rows are added as each plate's cluster
+    starts (they come in staggered), and the dialog pops up on the first one.
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Dask dashboards (per plate)")
+        self.setMinimumWidth(600)
+        # Non-modal so it doesn't block the running batch.
+        self.setModal(False)
+        lay = QVBoxLayout(self)
+        intro = QLabel(
+            "Each plate runs its own Dask cluster with its own dashboard. "
+            "Click a link to open it, or Copy the URL into a browser to watch "
+            "that plate's workers live. Dashboards close when their plate finishes."
+        )
+        intro.setWordWrap(True)
+        lay.addWidget(intro)
+        self._rows = QVBoxLayout()
+        lay.addLayout(self._rows)
+        lay.addStretch()
+        self._seen: dict[str, str] = {}
+
+    def add_dashboard(self, plate: str, url: str) -> None:
+        if plate in self._seen:
+            return
+        self._seen[plate] = url
+
+        box = QGroupBox(plate)
+        # long plate names shouldn't stretch the dialog absurdly wide
+        box.setStyleSheet("QGroupBox { font-size: 10px; }")
+        row = QHBoxLayout(box)
+        link = QLabel(f'<a href="{url}">{url}</a>')
+        link.setOpenExternalLinks(True)
+        link.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        copy_btn = QPushButton("Copy")
+        copy_btn.setFixedWidth(60)
+        copy_btn.clicked.connect(lambda _=False, u=url: self._copy(u))
+        row.addWidget(link, stretch=1)
+        row.addWidget(copy_btn, stretch=0)
+        self._rows.addWidget(box)
+
+        if not self.isVisible():
+            self.show()
+        self.raise_()
+
+    def reset(self) -> None:
+        """Clear all rows for a fresh run."""
+        self._seen.clear()
+        while self._rows.count():
+            item = self._rows.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+
+    def _copy(self, url: str) -> None:
+        from qtpy.QtWidgets import QApplication
+        QApplication.clipboard().setText(url)
+
+
 # ──────────────────────────────────────────────────────────────────
 # Tab 6 – Run
 # ──────────────────────────────────────────────────────────────────
@@ -3663,6 +3728,7 @@ class RunTab(QWidget):
         self._viewer            = napari_viewer
         self._worker: _BatchWorker | _WellBatchWorker | None = None
         self._current_log_path: Path | None = None
+        self._dashboard_dialog = _DaskDashboardDialog(self)
         self._build()
 
     def _build(self) -> None:
@@ -4228,6 +4294,12 @@ class RunTab(QWidget):
         self._worker.finished.connect(self._on_finished)
         if hasattr(self._worker, "step_progress"):
             self._worker.step_progress.connect(self._on_step_progress)
+        # Dask: surface each plate's dashboard URL in a pop-up as its cluster
+        # comes up (clickable + copyable). Kept as an instance attr so it isn't
+        # garbage-collected while the run is live.
+        if use_dask and hasattr(self._worker, "dashboard_ready"):
+            self._dashboard_dialog.reset()
+            self._worker.dashboard_ready.connect(self._dashboard_dialog.add_dashboard)
         self._worker.start()
 
     def _on_parallel_toggled(self, checked: bool) -> None:
