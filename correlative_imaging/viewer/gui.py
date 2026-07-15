@@ -2015,6 +2015,16 @@ class _BFWorker(QThread):
             ilp_src = Path(cfg["ilp_path"])
             ilp_copy = tmp / f"project_copy{ilp_src.suffix}"
             shutil.copy2(ilp_src, ilp_copy)
+            # Log the per-instance copy path + size so it's verifiable in the
+            # log that each concurrent plate really got its own isolated .ilp
+            # (they share nothing — different temp dir per _BFWorker.run()).
+            try:
+                _sz = ilp_copy.stat().st_size
+            except OSError:
+                _sz = -1
+            self.log_msg.emit(
+                f"  Ilastik project copied to private temp: {ilp_copy} ({_sz} bytes)"
+            )
 
             out_pattern = str(out_dir / "{nickname}.h5")
             cmd = [
@@ -2045,9 +2055,15 @@ class _BFWorker(QThread):
                     self.finished.emit(n_ok, n_err)
                     return
                 _ilastik_stagger_wait(self.log_msg.emit)
+                self.log_msg.emit(f"  Launching Ilastik (attempt {attempt}/{max_attempts}) …")
+                _t0 = time.monotonic()
                 res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
+                _dt = time.monotonic() - _t0
+                self.log_msg.emit(
+                    f"  Ilastik exited code {res.returncode} after {_dt:.0f}s."
+                )
                 if res.returncode != 0:
-                    self.log_msg.emit(f"Ilastik failed:\n{res.stderr[-2000:]}")
+                    self.log_msg.emit(f"Ilastik failed:\n{res.stderr[-3000:]}")
                     self.finished.emit(n_ok, n_err + len(h5_in_args))
                     return
                 output_h5s = sorted(out_dir.glob("*.h5"))
@@ -2057,12 +2073,22 @@ class _BFWorker(QThread):
                         + ("" if attempt == 1 else f" (recovered on attempt {attempt})")
                     )
                     break
-                # Incomplete — the launch-race signature. Clear partials and retry.
+                # Incomplete — Ilastik exited 0 but produced too few outputs.
+                # Dump its stderr/stdout (normally discarded on a clean exit) —
+                # this is the ONLY place the real cause shows up, e.g. a
+                # single-instance lock, a bad project path, or an internal
+                # error Ilastik swallowed into a zero exit code.
                 self.log_msg.emit(
-                    f"  ⚠ Ilastik produced {len(output_h5s)}/{n_expected} outputs "
-                    f"(attempt {attempt}/{max_attempts}) — likely a concurrent-launch "
-                    f"miss; clearing partials and retrying …"
+                    f"  ⚠ Ilastik exited cleanly but produced {len(output_h5s)}/{n_expected} "
+                    f"outputs (attempt {attempt}/{max_attempts}). Ilastik output follows —"
                 )
+                if res.stderr and res.stderr.strip():
+                    self.log_msg.emit(f"  ── ilastik STDERR ──\n{res.stderr[-3000:]}")
+                if res.stdout and res.stdout.strip():
+                    self.log_msg.emit(f"  ── ilastik STDOUT ──\n{res.stdout[-3000:]}")
+                if not (res.stderr.strip() or res.stdout.strip()):
+                    self.log_msg.emit("  (ilastik printed nothing to stderr/stdout)")
+                self.log_msg.emit("  Clearing partials and retrying …")
                 for f in output_h5s:
                     try:
                         f.unlink()
