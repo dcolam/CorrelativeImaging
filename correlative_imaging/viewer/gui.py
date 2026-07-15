@@ -647,38 +647,6 @@ _STEP_COLORMAPS = ["green", "cyan", "magenta", "yellow", "red", "blue", "orange"
 
 _ROI_BADGE_COLOR = "#FFEB3B"  # border color marking a well with ROI file(s)
 
-# Concurrent Ilastik headless instances usually work (observed: 4 plates in
-# parallel, all fine) but occasionally RACE at *startup* — a second instance
-# launching at the same instant as another silently exits 0 producing NO
-# output (observed once with 2 plates whose Ilastik launched simultaneously).
-# The race is at launch, not during the run, so instead of serializing fully
-# we STAGGER the starts: each plate waits until at least _ILASTIK_STAGGER_S
-# after the previous Ilastik start before launching its own. They then run
-# concurrently (a 308-image batch takes minutes; a 30s head-start is plenty to
-# clear startup). A retry-on-incomplete-output pass (see _BFWorker.run) catches
-# the rare case the stagger doesn't prevent.
-_ILASTIK_STAGGER_S = 30.0
-_ilastik_gate_lock = threading.Lock()
-_ilastik_last_start = [0.0]   # monotonic time of the most recent Ilastik launch
-
-
-def _ilastik_stagger_wait(log_fn) -> None:
-    """Block until it's safe to launch another Ilastik instance — i.e. at
-    least _ILASTIK_STAGGER_S since the previous launch — then record this
-    launch. Serialized via _ilastik_gate_lock so concurrent plates queue their
-    *starts* (not their runs). The very first launch never waits."""
-    with _ilastik_gate_lock:
-        if _ilastik_last_start[0] > 0:
-            wait = _ILASTIK_STAGGER_S - (time.monotonic() - _ilastik_last_start[0])
-            if wait > 0:
-                log_fn(
-                    f"  Staggering Ilastik start by {wait:.0f}s "
-                    f"(avoid concurrent-launch race) …"
-                )
-                time.sleep(wait)
-        _ilastik_last_start[0] = time.monotonic()
-
-
 @dataclass
 class _PlateEntry:
     """One detected plate folder — see discover_plate_folders(). ``key`` is
@@ -2003,21 +1971,11 @@ class _BFWorker(QThread):
             )
             self.progress.emit(total, total * 3, "Ilastik running …")
 
-            # Ilastik .ilp projects are HDF5-backed — opening the same file
-            # from two concurrent headless processes is unsafe (a known
-            # HDF5 pain point, worse over network shares) even with
-            # --readonly=1, which only stops Ilastik writing state back, not
-            # concurrent opens. With multi-plate "plates in parallel" > 1,
-            # more than one plate's _BFWorker can invoke Ilastik at the same
-            # time on what would otherwise be the same project file, so each
-            # invocation runs against its own private temp copy instead —
-            # true parallelism, no shared file, nothing to serialize.
+            # Each plate's _BFWorker gets its own private .ilp copy (own temp
+            # dir per run()), so concurrent plates never share the project file.
             ilp_src = Path(cfg["ilp_path"])
             ilp_copy = tmp / f"project_copy{ilp_src.suffix}"
             shutil.copy2(ilp_src, ilp_copy)
-            # Log the per-instance copy path + size so it's verifiable in the
-            # log that each concurrent plate really got its own isolated .ilp
-            # (they share nothing — different temp dir per _BFWorker.run()).
             try:
                 _sz = ilp_copy.stat().st_size
             except OSError:
@@ -2027,7 +1985,7 @@ class _BFWorker(QThread):
             )
 
             out_pattern = str(out_dir / "{nickname}.h5")
-            cmd = [
+            base_cmd = [
                 exe, "--headless",
                 f"--project={ilp_copy}",
                 "--export_source=Simple Segmentation",
@@ -2037,82 +1995,85 @@ class _BFWorker(QThread):
                 "--readonly=1",
                 "--output_internal_path=exported_data",
                 f"--output_filename_format={out_pattern}",
-            ] + h5_in_args
+            ]
 
-            # Launch Ilastik with staggered starts across concurrent plates
-            # (see _ilastik_stagger_wait) to dodge the launch-time race, and
-            # RETRY if it comes back with fewer output files than inputs — the
-            # signature of a lost startup race is exit 0 with 0 (or partial)
-            # outputs. Each retry re-staggers so it doesn't re-collide.
+            # ── Chunk inputs to stay under the Windows command-line limit ──
+            # Windows caps a process command line at 32767 chars. With ~130
+            # chars per HDF5 input path, 308 wells = ~46000 chars — over the
+            # limit — and Ilastik dies instantly ("The filename or extension
+            # is too long", or from a GUI subprocess the cryptic "The handle
+            # is invalid"), exit 0, zero output. So we split the inputs into
+            # chunks whose command line stays under a safe budget and run
+            # Ilastik once per chunk, accumulating outputs. (This also keeps
+            # each call's memory bounded.)
+            MAX_CMDLINE = 28000  # conservative margin below the 32767 hard cap
+            base_len = sum(len(c) + 1 for c in base_cmd)
+            chunks: list[list[str]] = []
+            cur: list[str] = []
+            cur_len = base_len
+            for arg in h5_in_args:
+                if cur and cur_len + len(arg) + 1 > MAX_CMDLINE:
+                    chunks.append(cur)
+                    cur = []
+                    cur_len = base_len
+                cur.append(arg)
+                cur_len += len(arg) + 1
+            if cur:
+                chunks.append(cur)
+
             n_expected = len(h5_stems)
-            max_attempts = 3
-            timeout_s = 60 + 120 * len(h5_in_args)
-            res = None
-            output_h5s: list[Path] = []
-            for attempt in range(1, max_attempts + 1):
+            self.log_msg.emit(
+                f"  Running Ilastik in {len(chunks)} chunk(s) "
+                f"(≤{MAX_CMDLINE} chars/command, {n_expected} images total) …"
+            )
+
+            _run_kw = dict(
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            if hasattr(subprocess, "CREATE_NO_WINDOW"):  # Windows only
+                _run_kw["creationflags"] = subprocess.CREATE_NO_WINDOW
+
+            for ci, chunk in enumerate(chunks, 1):
                 if self._abort:
-                    self.log_msg.emit("Aborted before Ilastik.")
+                    self.log_msg.emit("Aborted during Ilastik.")
                     self.finished.emit(n_ok, n_err)
                     return
-                _ilastik_stagger_wait(self.log_msg.emit)
-                self.log_msg.emit(f"  Launching Ilastik (attempt {attempt}/{max_attempts}) …")
-                _t0 = time.monotonic()
-                # Give Ilastik its OWN valid standard handles instead of
-                # inheriting the GUI's. Launched from a GUI process (napari has
-                # no console), the inherited stdin handle is invalid — and
-                # capture_output only redirects stdout/stderr, leaving stdin
-                # inherited — so Ilastik's Windows launcher dies instantly with
-                # "ilastik error: The handle is invalid." (exit 0, 0 outputs).
-                # stdin=DEVNULL supplies a valid stdin; CREATE_NO_WINDOW (guarded
-                # to Windows) gives the child a clean, console-free environment
-                # so it never touches a bad inherited console handle.
-                _run_kw = dict(
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    timeout=timeout_s,
-                )
-                if hasattr(subprocess, "CREATE_NO_WINDOW"):  # Windows only
-                    _run_kw["creationflags"] = subprocess.CREATE_NO_WINDOW
-                res = subprocess.run(cmd, **_run_kw)
-                _dt = time.monotonic() - _t0
+                cmd = base_cmd + chunk
                 self.log_msg.emit(
-                    f"  Ilastik exited code {res.returncode} after {_dt:.0f}s."
+                    f"  Ilastik chunk {ci}/{len(chunks)} ({len(chunk)} images) …"
                 )
+                _t0 = time.monotonic()
+                res = subprocess.run(cmd, timeout=60 + 120 * len(chunk), **_run_kw)
+                _dt = time.monotonic() - _t0
                 if res.returncode != 0:
-                    self.log_msg.emit(f"Ilastik failed:\n{res.stderr[-3000:]}")
+                    self.log_msg.emit(
+                        f"  Ilastik chunk {ci} failed (exit {res.returncode}, {_dt:.0f}s):\n"
+                        f"{res.stderr[-3000:]}"
+                    )
                     self.finished.emit(n_ok, n_err + len(h5_in_args))
                     return
-                output_h5s = sorted(out_dir.glob("*.h5"))
-                if len(output_h5s) >= n_expected:
-                    self.log_msg.emit(
-                        "  Ilastik finished."
-                        + ("" if attempt == 1 else f" (recovered on attempt {attempt})")
-                    )
-                    break
-                # Incomplete — Ilastik exited 0 but produced too few outputs.
-                # Dump its stderr/stdout (normally discarded on a clean exit) —
-                # this is the ONLY place the real cause shows up, e.g. a
-                # single-instance lock, a bad project path, or an internal
-                # error Ilastik swallowed into a zero exit code.
+                got = len(sorted(out_dir.glob("*.h5")))
                 self.log_msg.emit(
-                    f"  ⚠ Ilastik exited cleanly but produced {len(output_h5s)}/{n_expected} "
-                    f"outputs (attempt {attempt}/{max_attempts}). Ilastik output follows —"
+                    f"    chunk {ci} done in {_dt:.0f}s — {got}/{n_expected} outputs so far."
+                )
+
+            output_h5s = sorted(out_dir.glob("*.h5"))
+            if len(output_h5s) < n_expected and res is not None:
+                # Ran every chunk without a non-zero exit, yet still short on
+                # outputs — surface Ilastik's own output from the last chunk.
+                self.log_msg.emit(
+                    f"  ⚠ Ilastik produced {len(output_h5s)}/{n_expected} outputs "
+                    f"across all chunks. Last chunk's output —"
                 )
                 if res.stderr and res.stderr.strip():
                     self.log_msg.emit(f"  ── ilastik STDERR ──\n{res.stderr[-3000:]}")
                 if res.stdout and res.stdout.strip():
                     self.log_msg.emit(f"  ── ilastik STDOUT ──\n{res.stdout[-3000:]}")
-                if not (res.stderr.strip() or res.stdout.strip()):
-                    self.log_msg.emit("  (ilastik printed nothing to stderr/stdout)")
-                self.log_msg.emit("  Clearing partials and retrying …")
-                for f in output_h5s:
-                    try:
-                        f.unlink()
-                    except OSError:
-                        pass
-                output_h5s = []
+            else:
+                self.log_msg.emit("  Ilastik finished.")
 
             # Map each well to its output HDF5 by NAME, not by position.
             # `h5_stems` is in plate-scan order (B2, B3, ..., B9, B10, B11, ...
@@ -2133,9 +2094,9 @@ class _BFWorker(QThread):
             )
             if len(output_h5s) != len(h5_stems):
                 self.log_msg.emit(
-                    f"  ERROR: Ilastik still produced {len(output_h5s)}/{len(h5_stems)} "
-                    f"output(s) after {max_attempts} attempt(s) — aborting Phase 3 for "
-                    f"this plate. Re-run it (the concurrent-launch race did not clear)."
+                    f"  ERROR: Ilastik produced {len(output_h5s)}/{len(h5_stems)} "
+                    f"output(s) — aborting Phase 3 for this plate. See the Ilastik "
+                    f"output logged above for the cause."
                 )
                 self.finished.emit(n_ok, n_err + len(h5_stems))
                 return
