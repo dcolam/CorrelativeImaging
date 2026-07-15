@@ -228,5 +228,26 @@ def gui() -> None:
     launch_gui()
 
 
+@cli.command()
+@click.argument("folder", type=click.Path(exists=True, path_type=Path), required=False)
+def results(folder: Path | None) -> None:
+    """Open the Results Explorer to inspect a finished run's output FOLDER.
+
+    Auto-discovers every result database under FOLDER, groups them by run, and
+    shows a per-plate well grid tinted by each well's dominant hole colour;
+    click a well for its measurements and diagnostic image.
+    """
+    from qtpy.QtWidgets import QApplication
+
+    from correlative_imaging.results.explorer import ResultsExplorer
+
+    app = QApplication.instance() or QApplication([])
+    win = ResultsExplorer()
+    if folder:
+        win.load_folder(folder)
+    win.show()
+    app.exec_() if hasattr(app, "exec_") else app.exec()
+
+
 if __name__ == "__main__":
     cli()
