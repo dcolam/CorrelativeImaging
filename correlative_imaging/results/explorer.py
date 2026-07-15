@@ -44,6 +44,14 @@ _ABSENT_HEX = "#1e1e1e"    # no such well in this plate
 _SELECTED_BORDER = "#ffffff"
 
 
+def _ordered_kinds(kinds) -> list[str]:
+    """Order diagnostic-image kinds for the picker: whole first, then crops
+    alphabetically. Keeps the dropdown stable and 'whole' as the natural
+    default the first time."""
+    kinds = list(kinds)
+    return sorted(kinds, key=lambda k: (k != "whole", k))
+
+
 class _LoadWorker(QThread):
     """Load a run's databases off the UI thread (a few DBs → ~1s)."""
     loaded = Signal(object)   # RunTable
@@ -216,6 +224,7 @@ class ResultsExplorer(QMainWindow):
 
         self._current_imgs: dict[str, Path] = {}
         self._current_well = None
+        self._preferred_img_kind = "whole"   # persists across well clicks
         return panel
 
     # ── Folder / run / plate selection ───────────────────────────────
@@ -310,40 +319,63 @@ class ResultsExplorer(QMainWindow):
             return
         r = sub.iloc[0]
         dom = r.get("dominant_color")
-        self._detail_form.addRow("Dominant colour:", QLabel(str(dom) if dom else "— (no hole ROI)"))
+        if bool(r.get("is_negative_hole")):
+            dom_txt = "negative / empty hole (no channel enriched over background)"
+        elif dom:
+            dom_txt = str(dom)
+        else:
+            dom_txt = "— (no hole ROI)"
+        self._detail_form.addRow("Dominant colour:", QLabel(dom_txt))
         margin = r.get("margin")
         self._detail_form.addRow("Confidence margin:",
                                  QLabel(f"{margin:.0%}" if margin is not None and margin == margin else "—"))
         self._detail_form.addRow("Particles in hole:", QLabel(str(r.get("n_particles_hole", "—"))))
+        # Per channel: hole, background, enrichment (hole−bg → the basis of the
+        # colour call), and cells detected around the hole.
         for ch in self._table.channels:
             hole = r.get(f"hole_{ch}")
             bg = r.get(f"bg_{ch}")
+            enr = r.get(f"enrich_{ch}")
             nbg = r.get(f"nbg_{ch}")
-            txt = (f"hole={hole:.4f}   bg={bg:.4f}   cells around={nbg}"
-                   if hole is not None and hole == hole else "—")
+            if hole is not None and hole == hole:
+                txt = (f"hole={hole:.4f}  bg={bg:.4f}  "
+                       f"enrich={enr:+.4f}  cells around={nbg}")
+            else:
+                txt = "—"
             lbl = QLabel(txt)
             lbl.setStyleSheet(f"color:{CHANNEL_HEX.get(ch, '#ccc')};")
             self._detail_form.addRow(f"{ch}:", lbl)
 
-        # diagnostic images
+        # diagnostic images — preserve the currently-chosen kind across wells
+        # (don't reset to the first image every time a new well is clicked).
         run = self._current_run()
         pr = next((p for p in run.plates if p.plate == plate), None) if run else None
         self._current_imgs = find_diagnostic_images(pr.diagnostics_dir if pr else None, well_id)
         self._current_well = (plate, well_id)
+        kinds = _ordered_kinds(self._current_imgs.keys())
         self._img_combo.blockSignals(True)
         self._img_combo.clear()
-        for kind in self._current_imgs:
+        for kind in kinds:
             self._img_combo.addItem(kind, kind)
+        # keep the user's previously-selected image kind if this well has it
+        target = self._preferred_img_kind if self._preferred_img_kind in kinds else (
+            kinds[0] if kinds else None
+        )
+        idx = self._img_combo.findData(target) if target else -1
+        self._img_combo.setCurrentIndex(idx if idx >= 0 else 0)
         self._img_combo.blockSignals(False)
-        if self._current_imgs:
-            self._img_combo.setCurrentIndex(0)
-            self._on_img_changed(0)
+        if kinds:
+            self._on_img_changed(self._img_combo.currentIndex())
         else:
             self._img_label.setText("(no diagnostic image on disk)")
         self._napari_btn.setEnabled(self._viewer is not None)
 
     def _on_img_changed(self, _idx: int) -> None:
         kind = self._img_combo.currentData()
+        if kind:
+            # Remember the user's choice so clicking another well keeps showing
+            # the same view (whole / hole-crop / …) instead of resetting.
+            self._preferred_img_kind = kind
         path = self._current_imgs.get(kind) if kind else None
         if path is None:
             self._img_label.setText("(no image)")

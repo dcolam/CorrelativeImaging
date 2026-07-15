@@ -197,26 +197,41 @@ def _build_well_table(
     for ch in channels:
         df[f"nbg_{ch}"] = df[f"nbg_{ch}"].fillna(0).astype(int)
 
-    # Naive dominant colour + margin, vectorised over the hole_<ch> columns.
-    hole_cols = [f"hole_{ch}" for ch in channels]
-    hvals = df[hole_cols].apply(pd.to_numeric, errors="coerce")
-    top = hvals.max(axis=1)                       # NaN for all-NA (no-hole) rows
-    valid = hvals.notna().any(axis=1)             # at least one channel present
-    has_any = valid & top.notna() & (top > 0)
-    # idxmax only on rows that have a value (raises on all-NA rows otherwise).
+    # ── Enrichment over background ──────────────────────────────────
+    # The cell colour is decided by how much brighter the hole is than its
+    # surroundings PER CHANNEL, not by raw hole brightness — a channel that's
+    # bright everywhere (autofluorescence, uneven illumination) would otherwise
+    # win the hole spuriously. enrich_<ch> = hole_<ch> - bg_<ch> (local, this
+    # well's own background ROI). A hole not enriched over background in ANY
+    # channel is a negative / empty hole.
+    for ch in channels:
+        hole = pd.to_numeric(df[f"hole_{ch}"], errors="coerce")
+        bg = pd.to_numeric(df[f"bg_{ch}"], errors="coerce")
+        df[f"enrich_{ch}"] = hole - bg
+
+    enrich_cols = [f"enrich_{ch}" for ch in channels]
+    evals = df[enrich_cols]
+    top = evals.max(axis=1)                        # NaN when no hole ROI at all
+    valid = evals.notna().any(axis=1)
+    # A real colour call needs positive enrichment over background; otherwise
+    # it's a negative/empty hole (no cell brighter than surroundings).
+    is_colored = valid & top.notna() & (top > 0)
+
     dom_ch = pd.Series(pd.NA, index=df.index, dtype=object)
     if valid.any():
         dom_ch.loc[valid] = (
-            hvals.loc[valid].idxmax(axis=1).str.replace("hole_", "", regex=False)
+            evals.loc[valid].idxmax(axis=1).str.replace("enrich_", "", regex=False)
         )
-    # second-highest per row (0 when fewer than two channels present)
-    second = hvals.apply(
+    # second-highest enrichment per row (for the confidence margin)
+    second = evals.apply(
         lambda r: r.nlargest(2).iloc[-1] if r.notna().sum() >= 2 else 0.0, axis=1
     )
-    df["dominant_channel"] = dom_ch.where(has_any)
-    df["dominant_color"] = df["dominant_channel"].map(CHANNEL_COLOR_NAME).where(has_any)
-    df["dominant_intensity"] = top.where(has_any)
-    df["margin"] = ((top - second) / top).where(has_any)
+    df["dominant_channel"] = dom_ch.where(is_colored)
+    df["dominant_color"] = df["dominant_channel"].map(CHANNEL_COLOR_NAME).where(is_colored)
+    df["dominant_enrichment"] = top.where(is_colored)
+    df["margin"] = ((top - second) / top).where(is_colored & (top > 0))
+    # Explicit negative-hole flag: a hole exists but no channel is enriched.
+    df["is_negative_hole"] = valid & ~is_colored
 
     df = df.sort_values(
         ["plate", "row", "col"],
