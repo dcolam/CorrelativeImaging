@@ -2057,7 +2057,25 @@ class _BFWorker(QThread):
                 _ilastik_stagger_wait(self.log_msg.emit)
                 self.log_msg.emit(f"  Launching Ilastik (attempt {attempt}/{max_attempts}) …")
                 _t0 = time.monotonic()
-                res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
+                # Give Ilastik its OWN valid standard handles instead of
+                # inheriting the GUI's. Launched from a GUI process (napari has
+                # no console), the inherited stdin handle is invalid — and
+                # capture_output only redirects stdout/stderr, leaving stdin
+                # inherited — so Ilastik's Windows launcher dies instantly with
+                # "ilastik error: The handle is invalid." (exit 0, 0 outputs).
+                # stdin=DEVNULL supplies a valid stdin; CREATE_NO_WINDOW (guarded
+                # to Windows) gives the child a clean, console-free environment
+                # so it never touches a bad inherited console handle.
+                _run_kw = dict(
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=timeout_s,
+                )
+                if hasattr(subprocess, "CREATE_NO_WINDOW"):  # Windows only
+                    _run_kw["creationflags"] = subprocess.CREATE_NO_WINDOW
+                res = subprocess.run(cmd, **_run_kw)
                 _dt = time.monotonic() - _t0
                 self.log_msg.emit(
                     f"  Ilastik exited code {res.returncode} after {_dt:.0f}s."
