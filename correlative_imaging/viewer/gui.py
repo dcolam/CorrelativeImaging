@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import threading
+import time
 import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -645,6 +646,37 @@ _WELL_STATUS_COLORS = {
 _STEP_COLORMAPS = ["green", "cyan", "magenta", "yellow", "red", "blue", "orange", "gray"]
 
 _ROI_BADGE_COLOR = "#FFEB3B"  # border color marking a well with ROI file(s)
+
+# Concurrent Ilastik headless instances usually work (observed: 4 plates in
+# parallel, all fine) but occasionally RACE at *startup* — a second instance
+# launching at the same instant as another silently exits 0 producing NO
+# output (observed once with 2 plates whose Ilastik launched simultaneously).
+# The race is at launch, not during the run, so instead of serializing fully
+# we STAGGER the starts: each plate waits until at least _ILASTIK_STAGGER_S
+# after the previous Ilastik start before launching its own. They then run
+# concurrently (a 308-image batch takes minutes; a 30s head-start is plenty to
+# clear startup). A retry-on-incomplete-output pass (see _BFWorker.run) catches
+# the rare case the stagger doesn't prevent.
+_ILASTIK_STAGGER_S = 30.0
+_ilastik_gate_lock = threading.Lock()
+_ilastik_last_start = [0.0]   # monotonic time of the most recent Ilastik launch
+
+
+def _ilastik_stagger_wait(log_fn) -> None:
+    """Block until it's safe to launch another Ilastik instance — i.e. at
+    least _ILASTIK_STAGGER_S since the previous launch — then record this
+    launch. Serialized via _ilastik_gate_lock so concurrent plates queue their
+    *starts* (not their runs). The very first launch never waits."""
+    with _ilastik_gate_lock:
+        if _ilastik_last_start[0] > 0:
+            wait = _ILASTIK_STAGGER_S - (time.monotonic() - _ilastik_last_start[0])
+            if wait > 0:
+                log_fn(
+                    f"  Staggering Ilastik start by {wait:.0f}s "
+                    f"(avoid concurrent-launch race) …"
+                )
+                time.sleep(wait)
+        _ilastik_last_start[0] = time.monotonic()
 
 
 @dataclass
@@ -1997,13 +2029,46 @@ class _BFWorker(QThread):
                 f"--output_filename_format={out_pattern}",
             ] + h5_in_args
 
-            res = subprocess.run(cmd, capture_output=True, text=True,
-                                 timeout=60 + 120 * len(h5_in_args))
-            if res.returncode != 0:
-                self.log_msg.emit(f"Ilastik failed:\n{res.stderr[-2000:]}")
-                self.finished.emit(n_ok, n_err + len(h5_in_args))
-                return
-            self.log_msg.emit("  Ilastik finished.")
+            # Launch Ilastik with staggered starts across concurrent plates
+            # (see _ilastik_stagger_wait) to dodge the launch-time race, and
+            # RETRY if it comes back with fewer output files than inputs — the
+            # signature of a lost startup race is exit 0 with 0 (or partial)
+            # outputs. Each retry re-staggers so it doesn't re-collide.
+            n_expected = len(h5_stems)
+            max_attempts = 3
+            timeout_s = 60 + 120 * len(h5_in_args)
+            res = None
+            output_h5s: list[Path] = []
+            for attempt in range(1, max_attempts + 1):
+                if self._abort:
+                    self.log_msg.emit("Aborted before Ilastik.")
+                    self.finished.emit(n_ok, n_err)
+                    return
+                _ilastik_stagger_wait(self.log_msg.emit)
+                res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
+                if res.returncode != 0:
+                    self.log_msg.emit(f"Ilastik failed:\n{res.stderr[-2000:]}")
+                    self.finished.emit(n_ok, n_err + len(h5_in_args))
+                    return
+                output_h5s = sorted(out_dir.glob("*.h5"))
+                if len(output_h5s) >= n_expected:
+                    self.log_msg.emit(
+                        "  Ilastik finished."
+                        + ("" if attempt == 1 else f" (recovered on attempt {attempt})")
+                    )
+                    break
+                # Incomplete — the launch-race signature. Clear partials and retry.
+                self.log_msg.emit(
+                    f"  ⚠ Ilastik produced {len(output_h5s)}/{n_expected} outputs "
+                    f"(attempt {attempt}/{max_attempts}) — likely a concurrent-launch "
+                    f"miss; clearing partials and retrying …"
+                )
+                for f in output_h5s:
+                    try:
+                        f.unlink()
+                    except OSError:
+                        pass
+                output_h5s = []
 
             # Map each well to its output HDF5 by NAME, not by position.
             # `h5_stems` is in plate-scan order (B2, B3, ..., B9, B10, B11, ...
@@ -2024,8 +2089,9 @@ class _BFWorker(QThread):
             )
             if len(output_h5s) != len(h5_stems):
                 self.log_msg.emit(
-                    f"  ERROR: expected {len(h5_stems)} output(s), "
-                    f"got {len(output_h5s)} — aborting Phase 3."
+                    f"  ERROR: Ilastik still produced {len(output_h5s)}/{len(h5_stems)} "
+                    f"output(s) after {max_attempts} attempt(s) — aborting Phase 3 for "
+                    f"this plate. Re-run it (the concurrent-launch race did not clear)."
                 )
                 self.finished.emit(n_ok, n_err + len(h5_stems))
                 return
