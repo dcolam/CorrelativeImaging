@@ -1441,7 +1441,7 @@ class BFPipelineTab(QWidget):
         cbl.addLayout(import_row)
 
         lay.addWidget(class_box)
-        self._set_n_class_rows(2, defaults=[("hole", 500, 0.1), ("background", 500, 0.1)])
+        self._set_n_class_rows(2, defaults=[("background", 500, 0.1), ("hole", 500, 0.1)])
 
         # ── 3. Output ────────────────────────────────────────────────
         out_box = QGroupBox("3. Output")
@@ -1647,6 +1647,10 @@ class BFPipelineTab(QWidget):
         self._n_classes_spin.blockSignals(True)
         self._n_classes_spin.setValue(n)
         self._n_classes_spin.blockSignals(False)
+        # Clear existing rows first so the loaded class names/params actually
+        # replace the current ones — otherwise _set_n_class_rows treats the
+        # pre-existing default rows as "current" and ignores the JSON values.
+        self._classes_table.setRowCount(0)
         self._set_n_class_rows(n, defaults=defaults)
         self._save_settings()
 
@@ -2471,6 +2475,15 @@ class ChannelPanel(QWidget):
         self._black_method = QComboBox(); self._black_method.addItems(["mode", "percentile"])
         self._black_pct = QDoubleSpinBox()
         self._black_pct.setRange(0.0, 50.0); self._black_pct.setValue(1.0); self._black_pct.setSuffix(" %")
+        self._black_before_norm = QCheckBox("run before Normalize")
+        self._black_before_norm.setChecked(True)
+        self._black_before_norm.setToolTip(
+            "On (default): align the black level on the raw/background-subtracted\n"
+            "data, BEFORE Normalize — this is what makes intensities comparable\n"
+            "across wells (per-image min-max Normalize would otherwise erase that).\n"
+            "Off: run after Normalize (rarely useful — min-max already sets the\n"
+            "floor near zero)."
+        )
 
         pfl.addRow(self._bg_en)
         pfl.addRow("  Method:",  self._bg_method)
@@ -2482,6 +2495,7 @@ class ChannelPanel(QWidget):
         pfl.addRow(self._black_en)
         pfl.addRow("  Estimator:", self._black_method)
         pfl.addRow("  Percentile:", self._black_pct)
+        pfl.addRow("  Order:", self._black_before_norm)
 
         self._bg_en.toggled.connect(lambda c: [self._bg_method.setEnabled(c), self._bg_radius.setEnabled(c)])
         self._blur_en.toggled.connect(self._blur_sigma.setEnabled)
@@ -2490,7 +2504,9 @@ class ChannelPanel(QWidget):
         def _black_toggle(c):
             self._black_method.setEnabled(c)
             self._black_pct.setEnabled(c and self._black_method.currentText() == "percentile")
+            self._black_before_norm.setEnabled(c)
         self._black_en.toggled.connect(_black_toggle)
+        self._black_before_norm.setEnabled(False)
         self._black_method.currentTextChanged.connect(
             lambda t: self._black_pct.setEnabled(self._black_en.isChecked() and t == "percentile")
         )
@@ -2618,15 +2634,21 @@ class ChannelPanel(QWidget):
         if self._blur_en.isChecked():
             steps.append({"type": "GaussianBlur", "channel": self._ch_index,
                           "sigma": self._blur_sigma.value()})
+        black_step = None
+        if self._black_en.isChecked():
+            black_step = {"type": "BlackLevelNormalization", "channel": self._ch_index,
+                          "method": self._black_method.currentText(),
+                          "percentile": self._black_pct.value()}
+        # Default: black-level BEFORE Normalize — align the floor on raw data so
+        # intensities stay comparable across wells (per-image min-max Normalize
+        # would otherwise erase that). Toggle off to run it after Normalize.
+        if black_step and self._black_before_norm.isChecked():
+            steps.append(black_step)
         if self._norm_en.isChecked():
             steps.append({"type": "Normalize", "channel": self._ch_index,
                           "method": self._norm_method.currentText()})
-        # After normalization (per user): align the background floor to zero so
-        # intensities are comparable across wells.
-        if self._black_en.isChecked():
-            steps.append({"type": "BlackLevelNormalization", "channel": self._ch_index,
-                          "method": self._black_method.currentText(),
-                          "percentile": self._black_pct.value()})
+        if black_step and not self._black_before_norm.isChecked():
+            steps.append(black_step)
         return steps
 
     def get_segment_steps(self) -> list[dict]:
@@ -2683,6 +2705,14 @@ class ChannelPanel(QWidget):
         if black:
             self._black_method.setCurrentText(black.get("method", "mode"))
             self._black_pct.setValue(black.get("percentile", 1.0))
+            # Infer before/after from the actual order in the loaded steps.
+            types_in_order = [s["type"] for s in steps]
+            if "BlackLevelNormalization" in types_in_order and "Normalize" in types_in_order:
+                before = (types_in_order.index("BlackLevelNormalization")
+                          < types_in_order.index("Normalize"))
+            else:
+                before = True
+            self._black_before_norm.setChecked(before)
 
         thresh = by_type.get("AutoThreshold")
         if thresh:
