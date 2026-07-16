@@ -1,22 +1,27 @@
-"""Persisted ground-truth labels for hole colour (multi-label, per colour).
+"""Persisted ground-truth labels + per-run channel-display config (sidecar DB).
 
-The user hand-labels a well by eye: which colours are truly present in the hole
-(blue / green / red), independently — a hole can be several colours, or none
-(a negative / empty hole). These labels are the ground truth that per-channel
-thresholds are calibrated to and that any later Random Forest trains on.
+Two things live in a small sidecar SQLite file (``ci_labels.db`` by default) in
+the results folder the user browsed — the run result databases are opened
+read-only and one folder can hold several runs, so both live outside them:
 
-Storage is a small sidecar SQLite file (``ci_labels.db`` by default) in the
-results folder the user browsed — the run result databases are opened read-only
-and one folder can hold several runs, so labels live outside them and are keyed
-by ``(run_tag, plate, well_id)``.
+1. **Ground-truth labels** (``well_labels``). The user hand-labels a well by eye:
+   which *channels* are truly positive in the hole, independently (multi-label) —
+   a hole can be several channels, or none (a negative / empty hole). These are
+   the ground truth that per-channel thresholds are calibrated to and that any
+   later Random Forest trains on. Keyed by ``(run_tag, plate, well_id)``; the
+   positive channels are a comma-joined string, so ANY channel names / counts
+   work with no schema change.
 
-The label schema mirrors the classifier output verbatim (per-colour booleans),
-so validating the classifier against the labels is a plain per-colour join.
-Labels are keyed by *colour name*, not channel, so they survive a change of
-fluorophore/channel naming; :data:`~.analysis.CHANNEL_COLOR_NAME` maps a run's
-channels onto these colours.
+2. **Channel display config** (``channel_display``). Channel↔colour assignment
+   varies between experiments, so colour/label is a pure *display* concern, kept
+   per run and editable: a display name and a tint colour per channel. Defaults
+   come from the wavelength map (:data:`~.analysis.CHANNEL_HEX`) with a fallback
+   palette for unknown channels.
 
-Everything here is plain ``sqlite3`` — no Qt — so it is testable headless.
+Both label store and classifier key by CHANNEL NAME, so validating the
+classifier against the labels is a direct per-channel comparison — no colour
+indirection. Everything here is plain ``sqlite3`` — no Qt — so it is testable
+headless.
 """
 
 from __future__ import annotations
@@ -27,25 +32,32 @@ from pathlib import Path
 
 import pandas as pd
 
-from .analysis import CHANNEL_COLOR_NAME
+from .analysis import CHANNEL_HEX
 
 DEFAULT_LABELS_FILENAME = "ci_labels.db"
 
-# The colour vocabulary, derived from the fixed channel→colour map so it stays
-# in sync with the classifier. Sorted for a stable column order.
-LABEL_COLORS: list[str] = sorted(set(CHANNEL_COLOR_NAME.values()))
+# Cycled for channels with no known wavelength colour, so every channel still
+# gets a distinct, stable tint.
+_FALLBACK_PALETTE = [
+    "#3b6bff", "#2fbf3c", "#ff3b3b", "#e8a33d", "#9b5de5", "#00b4d8",
+    "#f15bb5", "#8ac926",
+]
 
 
-def _pos_col(color: str) -> str:
-    return f"pos_{color}"
+def default_display(channel: str, index: int = 0) -> dict:
+    """The default display name + colour for a channel: the channel name itself
+    as the label, and the wavelength colour if known else a palette fallback
+    (by *index*, so a run's channels get distinct tints)."""
+    hexc = CHANNEL_HEX.get(channel) or _FALLBACK_PALETTE[index % len(_FALLBACK_PALETTE)]
+    return {"display_name": channel, "color_hex": hexc}
 
 
 class LabelStore:
-    """Read/write hand labels in a sidecar SQLite file.
+    """Read/write hand labels and channel-display config in a sidecar SQLite file.
 
-    One row per (run_tag, plate, well_id). A row's presence means the well was
-    labelled; ``is_negative`` (all colours 0) records a deliberate negative-hole
-    label, distinct from "never labelled" (no row)."""
+    One ``well_labels`` row per (run_tag, plate, well_id). A row's presence means
+    the well was labelled; an empty ``pos_channels`` records a deliberate
+    negative-hole label, distinct from "never labelled" (no row)."""
 
     def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path)
@@ -63,20 +75,30 @@ class LabelStore:
         return con
 
     def _ensure_schema(self) -> None:
-        cols = ", ".join(f"{_pos_col(c)} INTEGER NOT NULL DEFAULT 0" for c in LABEL_COLORS)
         con = self._connect()
         try:
             con.execute(
-                f"""
+                """
                 CREATE TABLE IF NOT EXISTS well_labels (
-                    run_tag   TEXT NOT NULL,
-                    plate     TEXT NOT NULL,
-                    well_id   TEXT NOT NULL,
-                    {cols},
-                    is_negative INTEGER NOT NULL DEFAULT 0,
-                    notes     TEXT,
-                    updated_at TEXT NOT NULL,
+                    run_tag      TEXT NOT NULL,
+                    plate        TEXT NOT NULL,
+                    well_id      TEXT NOT NULL,
+                    pos_channels TEXT NOT NULL DEFAULT '',
+                    is_negative  INTEGER NOT NULL DEFAULT 0,
+                    notes        TEXT,
+                    updated_at   TEXT NOT NULL,
                     PRIMARY KEY (run_tag, plate, well_id)
+                )
+                """
+            )
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS channel_display (
+                    run_tag      TEXT NOT NULL,
+                    channel      TEXT NOT NULL,
+                    display_name TEXT NOT NULL,
+                    color_hex    TEXT NOT NULL,
+                    PRIMARY KEY (run_tag, channel)
                 )
                 """
             )
@@ -84,32 +106,33 @@ class LabelStore:
         finally:
             con.close()
 
-    def set_label(self, run_tag: str, plate: str, well_id: str,
-                  colors, notes: str | None = None) -> None:
-        """Upsert the label for one well. ``colors`` is the set/iterable of
-        positive colour names; an empty set records a negative hole."""
-        colors = {c for c in colors if c in LABEL_COLORS}
-        vals = {_pos_col(c): (1 if c in colors else 0) for c in LABEL_COLORS}
-        is_negative = 1 if not colors else 0
-        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    # ── Ground-truth labels ──────────────────────────────────────────
+    @staticmethod
+    def _join(channels) -> str:
+        # Stable order, de-duplicated, no blanks.
+        return ",".join(sorted({c for c in channels if c}))
 
-        pos_cols = list(vals.keys())
-        col_names = ["run_tag", "plate", "well_id", *pos_cols,
-                     "is_negative", "notes", "updated_at"]
-        placeholders = ", ".join("?" for _ in col_names)
-        updates = ", ".join(f"{c}=excluded.{c}"
-                            for c in [*pos_cols, "is_negative", "notes", "updated_at"])
-        params = [run_tag, plate, well_id, *[vals[c] for c in pos_cols],
-                  is_negative, notes, now]
+    def set_label(self, run_tag: str, plate: str, well_id: str,
+                  channels, notes: str | None = None) -> None:
+        """Upsert the label for one well. ``channels`` is the set/iterable of
+        positive channel names; an empty set records a negative hole."""
+        joined = self._join(channels)
+        is_negative = 0 if joined else 1
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
         con = self._connect()
         try:
             con.execute(
-                f"""
-                INSERT INTO well_labels ({", ".join(col_names)})
-                VALUES ({placeholders})
-                ON CONFLICT(run_tag, plate, well_id) DO UPDATE SET {updates}
+                """
+                INSERT INTO well_labels
+                    (run_tag, plate, well_id, pos_channels, is_negative, notes, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(run_tag, plate, well_id) DO UPDATE SET
+                    pos_channels=excluded.pos_channels,
+                    is_negative=excluded.is_negative,
+                    notes=excluded.notes,
+                    updated_at=excluded.updated_at
                 """,
-                params,
+                (run_tag, plate, well_id, joined, is_negative, notes, now),
             )
             con.commit()
         finally:
@@ -127,7 +150,7 @@ class LabelStore:
             con.close()
 
     def get_label(self, run_tag: str, plate: str, well_id: str) -> dict | None:
-        """The stored label for one well as a dict (with a ``colors`` set), or
+        """The stored label for one well as a dict (with a ``channels`` set), or
         ``None`` if the well was never labelled."""
         con = self._connect()
         try:
@@ -140,7 +163,7 @@ class LabelStore:
         if row is None:
             return None
         d = dict(row)
-        d["colors"] = {c for c in LABEL_COLORS if d.get(_pos_col(c))}
+        d["channels"] = {c for c in (d.get("pos_channels") or "").split(",") if c}
         return d
 
     def load_frame(self, run_tag: str | None = None) -> pd.DataFrame:
@@ -160,3 +183,41 @@ class LabelStore:
     def count(self, run_tag: str | None = None) -> int:
         df = self.load_frame(run_tag)
         return 0 if df.empty else len(df)
+
+    # ── Channel display config (per run) ─────────────────────────────
+    def get_channel_display(self, run_tag: str, channels: list[str]) -> dict:
+        """``{channel: {"display_name", "color_hex"}}`` for *channels*, merging
+        any stored overrides over the wavelength/palette defaults. Always returns
+        an entry for every channel asked for."""
+        con = self._connect()
+        try:
+            rows = con.execute(
+                "SELECT channel, display_name, color_hex FROM channel_display WHERE run_tag=?",
+                (run_tag,),
+            ).fetchall()
+        finally:
+            con.close()
+        stored = {r["channel"]: {"display_name": r["display_name"],
+                                 "color_hex": r["color_hex"]} for r in rows}
+        out = {}
+        for i, ch in enumerate(channels):
+            out[ch] = stored.get(ch, default_display(ch, i))
+        return out
+
+    def set_channel_display(self, run_tag: str, channel: str,
+                            display_name: str, color_hex: str) -> None:
+        con = self._connect()
+        try:
+            con.execute(
+                """
+                INSERT INTO channel_display (run_tag, channel, display_name, color_hex)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(run_tag, channel) DO UPDATE SET
+                    display_name=excluded.display_name,
+                    color_hex=excluded.color_hex
+                """,
+                (run_tag, channel, display_name, color_hex),
+            )
+            con.commit()
+        finally:
+            con.close()

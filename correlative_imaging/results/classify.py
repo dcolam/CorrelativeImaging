@@ -25,21 +25,22 @@ thresholds to, and what the Phase-3 Random Forest will train on.
 Ratios, not differences (per the user): a channel bright everywhere shouldn't
 win the hole, and per-channel gain differences must cancel.
 
+Everything here is keyed by CHANNEL NAME (the wavelength string in the DB, e.g.
+``405nm``), which is the stable identity — channel↔colour assignment varies
+between experiments, so colour is a pure display concern handled elsewhere
+(:mod:`.labels` channel-display config + the Explorer). This module never names a
+colour. The label store keys by the same channel names, so validation/calibration
+is a direct per-channel join — no colour indirection.
+
 Output schema (one row per plate+well):
 
     hole_present : bool
     score_<ch>   : float      combined enrichment score
     pos_<ch>     : bool        score_<ch> >= threshold_<ch>
     margin_<ch>  : float       score_<ch> - threshold_<ch> (signed confidence)
-    colors       : str         comma-joined positive colour names, "" if none
+    pos_channels : str         comma-joined positive channel names, "" if none
     n_positive   : int
     is_negative_hole : bool    hole_present and n_positive == 0
-
-Note the classifier keys its per-channel columns by CHANNEL (``pos_405nm``),
-while the label store (:mod:`.labels`) keys by COLOUR (``pos_blue``). They are
-NOT positionally interchangeable — the bridge is the ``colors`` field / the
-:data:`~.analysis.CHANNEL_COLOR_NAME` map. Validation and calibration must join
-channel→colour through that map, never by column position.
 """
 
 from __future__ import annotations
@@ -49,7 +50,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
-from .analysis import CHANNEL_COLOR_NAME, RunTable
+from .analysis import RunTable
 
 _EPS = 1e-6
 
@@ -154,20 +155,20 @@ def classify_wells(rt: RunTable, params: ClassifierParams | None = None) -> pd.D
             rec[f"pos_{ch}"] = bool(pos)
             rec[f"margin_{ch}"] = score - thr        # signed distance from threshold
             if pos:
-                positives.append(CHANNEL_COLOR_NAME.get(ch, ch))
+                positives.append(ch)                 # channel name, never a colour
 
         if not has_hole:
             # No hole ROI at all — not a negative hole, just no data.
             for ch in channels:
                 rec[f"pos_{ch}"] = False
-            rec.update(hole_present=False, colors="", n_positive=0,
+            rec.update(hole_present=False, pos_channels="", n_positive=0,
                        is_negative_hole=False)
             rows.append(rec)
             continue
 
         rec.update(
             hole_present=True,
-            colors=",".join(positives),
+            pos_channels=",".join(positives),
             n_positive=len(positives),
             is_negative_hole=(len(positives) == 0),
         )
