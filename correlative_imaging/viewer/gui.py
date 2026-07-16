@@ -2460,6 +2460,18 @@ class ChannelPanel(QWidget):
         self._norm_en     = QCheckBox("Normalize")
         self._norm_method = QComboBox(); self._norm_method.addItems(["minmax", "percentile"])
 
+        self._black_en = QCheckBox("Black-level normalize")
+        self._black_en.setToolTip(
+            "Shift this channel's background (black) level to zero per image, so\n"
+            "intensities are comparable across wells (the background floor varies\n"
+            "widely between images). A single scalar shift, not spatial background\n"
+            "removal. 'mode' = histogram peak (typical background); 'percentile' =\n"
+            "a low percentile (dark floor)."
+        )
+        self._black_method = QComboBox(); self._black_method.addItems(["mode", "percentile"])
+        self._black_pct = QDoubleSpinBox()
+        self._black_pct.setRange(0.0, 50.0); self._black_pct.setValue(1.0); self._black_pct.setSuffix(" %")
+
         pfl.addRow(self._bg_en)
         pfl.addRow("  Method:",  self._bg_method)
         pfl.addRow("  Radius:",  self._bg_radius)
@@ -2467,10 +2479,22 @@ class ChannelPanel(QWidget):
         pfl.addRow("  Sigma:",   self._blur_sigma)
         pfl.addRow(self._norm_en)
         pfl.addRow("  Method:",  self._norm_method)
+        pfl.addRow(self._black_en)
+        pfl.addRow("  Estimator:", self._black_method)
+        pfl.addRow("  Percentile:", self._black_pct)
 
         self._bg_en.toggled.connect(lambda c: [self._bg_method.setEnabled(c), self._bg_radius.setEnabled(c)])
         self._blur_en.toggled.connect(self._blur_sigma.setEnabled)
         self._norm_en.toggled.connect(self._norm_method.setEnabled)
+
+        def _black_toggle(c):
+            self._black_method.setEnabled(c)
+            self._black_pct.setEnabled(c and self._black_method.currentText() == "percentile")
+        self._black_en.toggled.connect(_black_toggle)
+        self._black_method.currentTextChanged.connect(
+            lambda t: self._black_pct.setEnabled(self._black_en.isChecked() and t == "percentile")
+        )
+        self._black_method.setEnabled(False); self._black_pct.setEnabled(False)
         lay.addWidget(pre_box)
 
         # ── B. Segmentation ────────────────────────────────────────
@@ -2597,6 +2621,12 @@ class ChannelPanel(QWidget):
         if self._norm_en.isChecked():
             steps.append({"type": "Normalize", "channel": self._ch_index,
                           "method": self._norm_method.currentText()})
+        # After normalization (per user): align the background floor to zero so
+        # intensities are comparable across wells.
+        if self._black_en.isChecked():
+            steps.append({"type": "BlackLevelNormalization", "channel": self._ch_index,
+                          "method": self._black_method.currentText(),
+                          "percentile": self._black_pct.value()})
         return steps
 
     def get_segment_steps(self) -> list[dict]:
@@ -2647,6 +2677,12 @@ class ChannelPanel(QWidget):
         self._norm_en.setChecked(norm is not None)
         if norm:
             self._norm_method.setCurrentText(norm.get("method", "minmax"))
+
+        black = by_type.get("BlackLevelNormalization")
+        self._black_en.setChecked(black is not None)
+        if black:
+            self._black_method.setCurrentText(black.get("method", "mode"))
+            self._black_pct.setValue(black.get("percentile", 1.0))
 
         thresh = by_type.get("AutoThreshold")
         if thresh:
@@ -2832,6 +2868,7 @@ class ChannelsTab(QWidget):
         sample image already loaded, so channel count/names are known)."""
         steps = pl_dict.get("steps", [])
         per_ch_types = {"BackgroundSubtraction", "GaussianBlur", "Normalize",
+                         "BlackLevelNormalization",
                          "AutoThreshold", "WatershedSplit", "ParticleAnalysis", "IntensityMeasurement"}
         for i, panel in enumerate(self._panels):
             ch_steps = [s for s in steps if s.get("channel") == i and s.get("type") in per_ch_types]
@@ -3379,6 +3416,10 @@ def _step_repr(s: dict) -> str:
         return f"GaussianBlur(sigma={s.get('sigma')})"
     if t == "Normalize":
         return f"Normalize({s.get('method')})"
+    if t == "BlackLevelNormalization":
+        m = s.get("method")
+        detail = f"p={s.get('percentile')}" if m == "percentile" else "histogram peak"
+        return f"BlackLevelNormalization({m}, {detail})"
     if t == "AutoThreshold":
         return f"AutoThreshold({s.get('method')}, {s.get('z_projection')}, min_size={s.get('min_size')}px)"
     if t == "WatershedSplit":
@@ -3415,7 +3456,8 @@ def _format_pipeline_summary(pl_dict: dict, well=None, bf_cfg: dict | None = Non
         lines.append("No well selected — whole-image pipeline (per-well ROI selections not resolved).")
     lines.append("")
 
-    pre_seg_types = {"BackgroundSubtraction", "GaussianBlur", "Normalize", "AutoThreshold", "WatershedSplit"}
+    pre_seg_types = {"BackgroundSubtraction", "GaussianBlur", "Normalize",
+                     "BlackLevelNormalization", "AutoThreshold", "WatershedSplit"}
     pre_seg = [s for s in steps if s["type"] in pre_seg_types]
     rest    = [s for s in steps if s["type"] not in pre_seg_types]
 
@@ -3978,6 +4020,28 @@ class RunTab(QWidget):
         diag_extra_row.addStretch()
         dfl.addLayout(diag_extra_row)
 
+        mc_row = QHBoxLayout()
+        self._diag_multichannel_cb = QCheckBox("Save real multi-channel TIF (per-channel data)")
+        self._diag_multichannel_cb.setToolTip(
+            "In addition to the RGB composite, save a real multi-channel TIF\n"
+            "(<well>_whole_channels.tif / <well>_<roi>_crop_channels.tif) holding\n"
+            "each channel's actual pixel values (not a baked-in colour composite).\n"
+            "Lets the Results Explorer show channels independently and makes TIFs\n"
+            "comparable across wells. Larger files (opt-in)."
+        )
+        self._diag_bf_cb = QCheckBox("…include BF projection as an extra channel")
+        self._diag_bf_cb.setToolTip(
+            "Append this well's brightfield projection (from the BF pipeline) as\n"
+            "a labelled 'BF' channel in the multi-channel TIF, so the hole is\n"
+            "visible alongside the fluorescence. Requires the BF pipeline to have run."
+        )
+        self._diag_bf_cb.setEnabled(False)
+        self._diag_multichannel_cb.toggled.connect(self._diag_bf_cb.setEnabled)
+        mc_row.addWidget(self._diag_multichannel_cb)
+        mc_row.addWidget(self._diag_bf_cb)
+        mc_row.addStretch()
+        dfl.addLayout(mc_row)
+
         diag_note = QLabel(
             "Colors come from each channel's \"Color\" setting in the Channels tab.\n"
             "The base image is each channel's last pre-threshold (e.g. post-Normalize) "
@@ -4279,7 +4343,7 @@ class RunTab(QWidget):
                 formats.add("tiff")
             if self._diag_jpg_cb.isChecked():
                 formats.add("jpg")
-            if formats:
+            if formats or self._diag_multichannel_cb.isChecked():
                 colors = self._get_channel_colors() if self._get_channel_colors else []
                 diag_cfg = {
                     "whole": self._diag_whole_cb.isChecked(),
@@ -4289,6 +4353,8 @@ class RunTab(QWidget):
                     "colors": colors,
                     "stamp_rois": self._diag_stamp_cb.isChecked(),
                     "save_particle_labels": self._diag_particles_cb.isChecked(),
+                    "multichannel_tif": self._diag_multichannel_cb.isChecked(),
+                    "include_bf": self._diag_bf_cb.isChecked(),
                     # "output_dir" is filled in per-plate below.
                 }
             else:

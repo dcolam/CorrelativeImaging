@@ -66,6 +66,69 @@ class BackgroundSubtraction(Step):
 
 
 # ------------------------------------------------------------------
+# Black-level normalization — shift each image's background floor to a
+# common level so intensities are comparable across wells/plates.
+# ------------------------------------------------------------------
+
+@dataclass
+@register_step
+class BlackLevelNormalization(Step):
+    """Estimate a channel's background (black) level over the whole image and
+    subtract it, shifting every image's floor to ``target`` (default 0).
+
+    Motivation: in this data the background floor varies ~10× *between wells*
+    within a channel (measured), so absolute intensities aren't comparable
+    across the plate. Subtracting each image's own estimated black level makes
+    them comparable — and makes particle-detection thresholds see a consistent
+    baseline. This is a single scalar shift per channel per image (NOT spatial
+    background removal like rolling-ball, which distorts) .
+
+    Parameters
+    ----------
+    channel:     Channel index.
+    method:      'mode' (histogram peak — the *typical* background value; the
+                 usual "black point") or 'percentile' (a low percentile — the
+                 dark floor).
+    percentile:  Percentile used when method='percentile' (default 1.0).
+    bins:        Histogram bins used when method='mode' (default 256).
+    target:      Value the estimated black level is shifted to (default 0.0).
+    """
+    channel: int
+    method: str = "mode"
+    percentile: float = 1.0
+    bins: int = 256
+    target: float = 0.0
+
+    @property
+    def name(self) -> str:
+        return f"black_level_norm_ch{self.channel}"
+
+    def _estimate_black(self, ch: np.ndarray) -> float:
+        flat = ch.reshape(-1)
+        if self.method == "percentile":
+            return float(np.percentile(flat, self.percentile))
+        if self.method == "mode":
+            # Peak of the intensity histogram = most common (typical) value,
+            # which in a mostly-background image is the background level.
+            lo, hi = float(flat.min()), float(flat.max())
+            if hi <= lo:
+                return lo
+            counts, edges = np.histogram(flat, bins=self.bins, range=(lo, hi))
+            peak = int(np.argmax(counts))
+            return float((edges[peak] + edges[peak + 1]) / 2.0)
+        raise ValueError(f"Unknown black-level method: {self.method!r}")
+
+    def process(self, image: np.ndarray, context: PipelineContext) -> StepResult:
+        ch = image[self.channel].astype(np.float32)
+        black = self._estimate_black(ch)
+        shifted = np.clip(ch - black + self.target, 0.0, None)
+        result_image = image.copy()
+        result_image[self.channel] = shifted.astype(image.dtype) \
+            if np.issubdtype(image.dtype, np.integer) else shifted
+        return StepResult(image=result_image, info={"black_level": black})
+
+
+# ------------------------------------------------------------------
 # Gaussian blur
 # ------------------------------------------------------------------
 

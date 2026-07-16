@@ -190,6 +190,53 @@ def _project_planes(arr) -> "np.ndarray":
     return arr.max(axis=1) if arr.ndim == 4 else arr
 
 
+def _load_bf_projection(diag_dir, well_id: str):
+    """Load this well's brightfield projection (written by the BF pipeline to
+    ``<output>/bf_pipeline/projections/<well>_proj.tif``) for inclusion as an
+    extra channel. Returns a 2-D array, or None if not found."""
+    import numpy as np
+    import tifffile
+    proj = Path(diag_dir).parent / "bf_pipeline" / "projections" / f"{well_id}_proj.tif"
+    if not proj.exists():
+        return None
+    try:
+        arr = tifffile.imread(str(proj))
+        if arr.ndim == 3:                 # collapse any stray channel/z axis
+            arr = arr.max(axis=0)
+        return np.asarray(arr, dtype=np.float32)
+    except Exception:
+        return None
+
+
+def _save_multichannel_tif(planes, channel_names, bf_plane, path) -> None:
+    """Write real per-channel data as an ImageJ-readable multi-channel TIF
+    (axes CYX, one slice per channel, channel labels preserved). Fluorescence
+    planes are saved as float32 as-is (lossless, comparable across wells); the
+    optional BF plane is min-max scaled to [0,1] and appended as a labelled
+    channel so it shares the stack's float range without distorting the FL
+    values."""
+    import numpy as np
+    import tifffile
+
+    chans = [np.asarray(p, dtype=np.float32) for p in planes]
+    labels = list(channel_names[:len(chans)]) or [f"ch{i}" for i in range(len(chans))]
+    while len(labels) < len(chans):
+        labels.append(f"ch{len(labels)}")
+
+    if bf_plane is not None:
+        bf = np.asarray(bf_plane, dtype=np.float32)
+        mn, mx = float(bf.min()), float(bf.max())
+        bf = (bf - mn) / (mx - mn) if mx > mn else np.zeros_like(bf)
+        chans.append(bf)
+        labels.append("BF")
+
+    stack = np.stack(chans, axis=0)   # (C, Y, X)
+    tifffile.imwrite(
+        str(path), stack, imagej=True,
+        metadata={"axes": "CYX", "Labels": labels},
+    )
+
+
 def _save_well_diagnostics(
     well, final_image, pixel_size_um: float, pl_dict: dict,
     context: PipelineContext, diag_cfg: dict,
@@ -217,6 +264,15 @@ def _save_well_diagnostics(
     stamp = diag_cfg.get("stamp_rois", False)
     planes = list(_project_planes(final_image))
 
+    # Real multi-channel TIFs (opt-in): the actual per-channel pixel data (not
+    # a baked-in RGB composite), so the TIFs are comparable across wells and
+    # each channel is separable in the viewer. The stamped RGB composite is
+    # kept for the human-facing JPG only. Optionally append the BF projection
+    # as an extra labelled channel.
+    multichannel = diag_cfg.get("multichannel_tif", False)
+    channel_names = list(getattr(context, "channel_names", []) or [])
+    bf_plane = _load_bf_projection(out_dir, well.well_id) if diag_cfg.get("include_bf") else None
+
     roi_names = [
         s["roi_name"] for s in pl_dict.get("steps", [])
         if s.get("type") in ("LoadROI", "ExtractROI") and "roi_name" in s
@@ -228,6 +284,11 @@ def _save_well_diagnostics(
         if stamp and roi_masks:
             rgb = stamp_outlines(rgb, roi_masks)
         save_diagnostic_image(rgb, out_dir / f"{well.well_id}_whole", formats)
+        if multichannel:
+            _save_multichannel_tif(
+                planes, channel_names, bf_plane,
+                out_dir / f"{well.well_id}_whole_channels.tif",
+            )
 
     if diag_cfg.get("crops"):
         pad_px = round(diag_cfg.get("crop_pad_um", 0.0) / (pixel_size_um or 1.0))
@@ -241,6 +302,12 @@ def _save_well_diagnostics(
             if stamp:
                 rgb = stamp_outlines(rgb, {roi_name: mask[r0:r1, c0:c1]})
             save_diagnostic_image(rgb, out_dir / f"{well.well_id}_{roi_name}_crop", formats)
+            if multichannel:
+                bf_crop = bf_plane[r0:r1, c0:c1] if bf_plane is not None else None
+                _save_multichannel_tif(
+                    cropped_planes, channel_names, bf_crop,
+                    out_dir / f"{well.well_id}_{roi_name}_crop_channels.tif",
+                )
 
     if diag_cfg.get("save_particle_labels"):
         import tifffile

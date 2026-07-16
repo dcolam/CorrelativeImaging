@@ -1,5 +1,11 @@
 from .base import Pipeline, PipelineContext, Step, StepResult, register_step
-from .preprocess import BackgroundSubtraction, BrightnessContrast, GaussianBlur, Normalize
+from .preprocess import (
+    BackgroundSubtraction,
+    BlackLevelNormalization,
+    BrightnessContrast,
+    GaussianBlur,
+    Normalize,
+)
 from .segment import AutoThreshold, ExtractROI, WatershedSplit
 from .analyze import ParticleAnalysis
 from .colocalize import ColocalizationAnalysis
@@ -14,6 +20,7 @@ __all__ = [
     "register_step",
     # Preprocessing
     "BackgroundSubtraction",
+    "BlackLevelNormalization",
     "BrightnessContrast",
     "GaussianBlur",
     "Normalize",
