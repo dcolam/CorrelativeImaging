@@ -19,6 +19,7 @@ from qtpy.QtCore import Qt, QThread, Signal
 from qtpy.QtGui import QImage, QPixmap
 from qtpy.QtWidgets import (
     QComboBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QGroupBox,
@@ -33,6 +34,7 @@ from qtpy.QtWidgets import (
 )
 
 from .analysis import CHANNEL_HEX, RunTable, load_run
+from .classify import ClassifierParams, classify_wells
 from .discovery import RunGroup, discover_runs, find_diagnostic_images
 
 _PLATE_ROWS = list("ABCDEFGHIJKLMNOP")   # 16 rows
@@ -136,6 +138,7 @@ class ResultsExplorer(QMainWindow):
         self._viewer = napari_viewer
         self._runs: list[RunGroup] = []
         self._table: RunTable | None = None
+        self._cls = None                       # holistic classification DataFrame
         self._load_worker: _LoadWorker | None = None
         self._build()
 
@@ -180,6 +183,25 @@ class ResultsExplorer(QMainWindow):
         legend.addStretch()
         outer.addLayout(legend)
 
+        # Classification controls (holistic, tunable)
+        cls_box = QGroupBox("Classification (holistic — hole colour from all measurements)")
+        cl = QHBoxLayout(cls_box)
+        self._w_int = self._mk_weight("intensity", 1.0)
+        self._w_sum = self._mk_weight("extent (sum)", 1.0)
+        self._w_part = self._mk_weight("particle", 1.0)
+        self._min_score = QDoubleSpinBox()
+        self._min_score.setRange(0.0, 5.0); self._min_score.setSingleStep(0.05)
+        self._min_score.setValue(0.10); self._min_score.setPrefix("neg< ")
+        self._min_score.setToolTip("Top-channel score below this → negative/empty hole.")
+        cl.addWidget(QLabel("weights:"))
+        for lbl, spin in (self._w_int, self._w_sum, self._w_part):
+            cl.addWidget(QLabel(lbl)); cl.addWidget(spin)
+        cl.addWidget(self._min_score)
+        reclf = QPushButton("Reclassify"); reclf.clicked.connect(self._reclassify)
+        cl.addWidget(reclf)
+        cl.addStretch()
+        outer.addWidget(cls_box)
+
         # Main split: grid | well detail
         split = QSplitter(Qt.Horizontal)
 
@@ -192,6 +214,33 @@ class ResultsExplorer(QMainWindow):
         split.addWidget(self._build_detail_panel())
         split.setSizes([680, 520])
         outer.addWidget(split, stretch=1)
+
+    def _mk_weight(self, label: str, default: float):
+        spin = QDoubleSpinBox()
+        spin.setRange(0.0, 10.0); spin.setSingleStep(0.1); spin.setValue(default)
+        spin.setToolTip(f"Weight on the {label} enrichment signal.")
+        return (label, spin)
+
+    def _params(self) -> ClassifierParams:
+        return ClassifierParams(
+            w_intensity=self._w_int[1].value(),
+            w_sum=self._w_sum[1].value(),
+            w_particle=self._w_part[1].value(),
+            min_score=self._min_score.value(),
+        )
+
+    def _reclassify(self) -> None:
+        if self._table is None:
+            return
+        self._cls = classify_wells(self._table, self._params())
+        self._on_plate_changed(self._plate_combo.currentIndex())
+        neg = int(self._cls["is_negative_hole"].sum()) if not self._cls.empty else 0
+        amb = int(self._cls["is_ambiguous"].sum()) if not self._cls.empty else 0
+        self._status_lbl.setText(
+            f"Classified {len(self._cls)} wells — "
+            f"{self._cls['dominant_color'].notna().sum()} coloured, "
+            f"{neg} negative/empty, {amb} ambiguous."
+        )
 
     def _build_detail_panel(self) -> QWidget:
         panel = QWidget(); pl = QVBoxLayout(panel)
@@ -270,6 +319,7 @@ class ResultsExplorer(QMainWindow):
 
     def _on_run_loaded(self, table: RunTable) -> None:
         self._table = table
+        self._cls = classify_wells(table, self._params())   # holistic classification
         plates = sorted(table.wells["plate"].unique().tolist()) if not table.wells.empty else []
         self._plate_combo.blockSignals(True)
         self._plate_combo.clear()
@@ -277,9 +327,10 @@ class ResultsExplorer(QMainWindow):
             self._plate_combo.addItem(p, p)
         self._plate_combo.blockSignals(False)
         n = 0 if table.wells.empty else len(table.wells)
+        neg = int(self._cls["is_negative_hole"].sum()) if not self._cls.empty else 0
         self._status_lbl.setText(
             f"Loaded {n} wells across {len(plates)} plate(s); channels: "
-            f"{', '.join(table.channels)}."
+            f"{', '.join(table.channels)}. ({neg} negative/empty holes.)"
         )
         if plates:
             self._plate_combo.setCurrentIndex(0)
@@ -291,7 +342,11 @@ class ResultsExplorer(QMainWindow):
         plate = self._plate_combo.currentData()
         if plate is None:
             return
-        sub = self._table.wells[self._table.wells["plate"] == plate]
+        # Colour the grid from the holistic classification (falls back to the
+        # analysis-layer dominant if classification hasn't run).
+        src = self._cls if getattr(self, "_cls", None) is not None and not self._cls.empty \
+            else self._table.wells
+        sub = src[src["plate"] == plate]
         well_hex = {}
         for _, r in sub.iterrows():
             color = r.get("dominant_color")
@@ -318,28 +373,35 @@ class ResultsExplorer(QMainWindow):
             self._napari_btn.setEnabled(False)
             return
         r = sub.iloc[0]
-        dom = r.get("dominant_color")
-        if bool(r.get("is_negative_hole")):
+        # Classification row (holistic) for this well, if available.
+        cr = None
+        if getattr(self, "_cls", None) is not None and not self._cls.empty:
+            crsub = self._cls[(self._cls["plate"] == plate) & (self._cls["well_id"] == well_id)]
+            cr = crsub.iloc[0] if not crsub.empty else None
+
+        neg = bool(cr.get("is_negative_hole")) if cr is not None else bool(r.get("is_negative_hole"))
+        dom = cr.get("dominant_color") if cr is not None else r.get("dominant_color")
+        if neg:
             dom_txt = "negative / empty hole (no channel enriched over background)"
         elif dom:
-            dom_txt = str(dom)
+            amb = " — AMBIGUOUS" if (cr is not None and bool(cr.get("is_ambiguous"))) else ""
+            dom_txt = f"{dom}{amb}"
         else:
             dom_txt = "— (no hole ROI)"
-        self._detail_form.addRow("Dominant colour:", QLabel(dom_txt))
-        margin = r.get("margin")
+        self._detail_form.addRow("Hole colour (holistic):", QLabel(dom_txt))
+        conf = (cr.get("confidence") if cr is not None else r.get("margin"))
         self._detail_form.addRow("Confidence margin:",
-                                 QLabel(f"{margin:.0%}" if margin is not None and margin == margin else "—"))
+                                 QLabel(f"{conf:.0%}" if conf is not None and conf == conf else "—"))
         self._detail_form.addRow("Particles in hole:", QLabel(str(r.get("n_particles_hole", "—"))))
-        # Per channel: hole, background, enrichment (hole−bg → the basis of the
-        # colour call), and cells detected around the hole.
+        # Per channel: hole/bg intensity, enrichment, holistic score, cells around.
         for ch in self._table.channels:
             hole = r.get(f"hole_{ch}")
             bg = r.get(f"bg_{ch}")
-            enr = r.get(f"enrich_{ch}")
             nbg = r.get(f"nbg_{ch}")
+            score = cr.get(f"score_{ch}") if cr is not None else None
             if hole is not None and hole == hole:
-                txt = (f"hole={hole:.4f}  bg={bg:.4f}  "
-                       f"enrich={enr:+.4f}  cells around={nbg}")
+                stxt = f"  score={score:.2f}" if score is not None and score == score else ""
+                txt = f"hole={hole:.4f}  bg={bg:.4f}{stxt}  cells around={nbg}"
             else:
                 txt = "—"
             lbl = QLabel(txt)
