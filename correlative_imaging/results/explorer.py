@@ -18,6 +18,7 @@ from pathlib import Path
 from qtpy.QtCore import Qt, QThread, Signal
 from qtpy.QtGui import QImage, QPixmap
 from qtpy.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
@@ -25,6 +26,7 @@ from qtpy.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QPushButton,
     QScrollArea,
@@ -36,14 +38,32 @@ from qtpy.QtWidgets import (
 from .analysis import CHANNEL_HEX, RunTable, load_run
 from .classify import ClassifierParams, classify_wells
 from .discovery import RunGroup, discover_runs, find_diagnostic_images
+from .labels import LABEL_COLORS, LabelStore
 
 _PLATE_ROWS = list("ABCDEFGHIJKLMNOP")   # 16 rows
 _PLATE_COLS = list(range(1, 25))          # 24 columns
 
 _COLOR_HEX = {"blue": "#3b6bff", "green": "#2fbf3c", "red": "#ff3b3b"}
-_EMPTY_HEX = "#3a3a3a"     # well present but no dominant colour (e.g. no hole ROI)
+_NEGATIVE_HEX = "#2a2a2a"  # hole present but no channel positive (negative/empty hole)
+_EMPTY_HEX = "#3a3a3a"     # well present but no hole ROI at all
 _ABSENT_HEX = "#1e1e1e"    # no such well in this plate
 _SELECTED_BORDER = "#ffffff"
+_LABELLED_BORDER = "#ffcc33"   # well has a hand label (ground truth)
+
+
+def _blend_hex(colors: list[str]) -> str:
+    """Average the RGB of the positive colours so a multi-positive hole shows a
+    mixed tint (e.g. green+red → yellow-ish). Empty list → negative-hole grey."""
+    rgbs = [_COLOR_HEX[c] for c in colors if c in _COLOR_HEX]
+    if not rgbs:
+        return _NEGATIVE_HEX
+    if len(rgbs) == 1:
+        return rgbs[0]
+    r = g = b = 0
+    for hx in rgbs:
+        r += int(hx[1:3], 16); g += int(hx[3:5], 16); b += int(hx[5:7], 16)
+    n = len(rgbs)
+    return f"#{r // n:02x}{g // n:02x}{b // n:02x}"
 
 
 def _ordered_kinds(kinds) -> list[str]:
@@ -79,6 +99,8 @@ class _ResultsGrid(QWidget):
         super().__init__(parent)
         self._btns: dict[str, QPushButton] = {}
         self._selected: str | None = None
+        self._well_hex: dict[str, str] = {}
+        self._labelled: set[str] = set()
         self._build()
 
     def _build(self) -> None:
@@ -108,7 +130,12 @@ class _ResultsGrid(QWidget):
             lay.addLayout(rl)
 
     def _paint(self, wid: str, hex_color: str, selected: bool = False) -> None:
-        border = f"2px solid {_SELECTED_BORDER}" if selected else "1px solid #222"
+        if selected:
+            border = f"2px solid {_SELECTED_BORDER}"
+        elif wid in self._labelled:
+            border = f"2px solid {_LABELLED_BORDER}"   # ground-truth marker
+        else:
+            border = "1px solid #222"
         self._btns[wid].setStyleSheet(
             f"background-color:{hex_color}; border:{border}; border-radius:2px;"
         )
@@ -121,13 +148,25 @@ class _ResultsGrid(QWidget):
         self._paint(wid, self._well_hex.get(wid, _ABSENT_HEX), selected=True)
         self.well_clicked.emit(wid)
 
-    def set_colors(self, well_hex: dict[str, str]) -> None:
+    def set_colors(self, well_hex: dict[str, str], labelled: set[str] | None = None) -> None:
         """Repaint the whole grid: ``well_hex`` maps well_id → hex; wells not in
-        the map are painted as absent."""
+        the map are painted as absent. Wells in ``labelled`` get a gold border
+        marking that they carry a hand label."""
         self._well_hex = dict(well_hex)
+        self._labelled = set(labelled or ())
         self._selected = None
         for wid in self._btns:
             self._paint(wid, well_hex.get(wid, _ABSENT_HEX))
+
+    def mark_labelled(self, wid: str, labelled: bool, hex_color: str) -> None:
+        """Toggle one well's labelled border in place (after a save/clear),
+        keeping it selected."""
+        if labelled:
+            self._labelled.add(wid)
+        else:
+            self._labelled.discard(wid)
+        self._well_hex[wid] = hex_color
+        self._paint(wid, hex_color, selected=(wid == self._selected))
 
 
 class ResultsExplorer(QMainWindow):
@@ -139,6 +178,7 @@ class ResultsExplorer(QMainWindow):
         self._runs: list[RunGroup] = []
         self._table: RunTable | None = None
         self._cls = None                       # holistic classification DataFrame
+        self._labels: LabelStore | None = None  # ground-truth store for this folder
         self._load_worker: _LoadWorker | None = None
         self._build()
 
@@ -171,32 +211,40 @@ class ResultsExplorer(QMainWindow):
         tl.addRow(self._status_lbl)
         outer.addWidget(top)
 
-        # Legend
+        # Legend — multi-label: a hole can be several colours (mixed tint),
+        # a negative/empty hole, or have no hole ROI. Gold border = hand-labelled.
         legend = QHBoxLayout()
         for name, hexc in (("blue", _COLOR_HEX["blue"]), ("green", _COLOR_HEX["green"]),
-                           ("red", _COLOR_HEX["red"]), ("no dominant", _EMPTY_HEX),
+                           ("red", _COLOR_HEX["red"]), ("mixed", "#c8b400"),
+                           ("negative hole", _NEGATIVE_HEX), ("no hole", _EMPTY_HEX),
                            ("no well", _ABSENT_HEX)):
             dot = QLabel("■"); dot.setStyleSheet(f"color:{hexc}; font-size:14px;")
             legend.addWidget(dot)
             lbl = QLabel(name); lbl.setStyleSheet("font-size:10px;"); legend.addWidget(lbl)
             legend.addSpacing(8)
+        gold = QLabel("▢"); gold.setStyleSheet(f"color:{_LABELLED_BORDER}; font-size:14px;")
+        legend.addWidget(gold)
+        gl = QLabel("labelled"); gl.setStyleSheet("font-size:10px;"); legend.addWidget(gl)
         legend.addStretch()
         outer.addLayout(legend)
 
-        # Classification controls (holistic, tunable)
-        cls_box = QGroupBox("Classification (holistic — hole colour from all measurements)")
+        # Classification controls (holistic, multi-label, tunable)
+        cls_box = QGroupBox("Classification (multi-label — each channel called independently)")
         cl = QHBoxLayout(cls_box)
         self._w_int = self._mk_weight("intensity", 1.0)
         self._w_sum = self._mk_weight("extent (sum)", 1.0)
         self._w_part = self._mk_weight("particle", 1.0)
-        self._min_score = QDoubleSpinBox()
-        self._min_score.setRange(0.0, 5.0); self._min_score.setSingleStep(0.05)
-        self._min_score.setValue(0.10); self._min_score.setPrefix("neg< ")
-        self._min_score.setToolTip("Top-channel score below this → negative/empty hole.")
+        self._pos_thr = QDoubleSpinBox()
+        self._pos_thr.setRange(0.0, 10.0); self._pos_thr.setSingleStep(0.05)
+        self._pos_thr.setValue(0.10); self._pos_thr.setPrefix("pos≥ ")
+        self._pos_thr.setToolTip(
+            "A channel is called positive when its score clears this. Shared "
+            "default across channels — calibrate per-channel against hand labels."
+        )
         cl.addWidget(QLabel("weights:"))
         for lbl, spin in (self._w_int, self._w_sum, self._w_part):
             cl.addWidget(QLabel(lbl)); cl.addWidget(spin)
-        cl.addWidget(self._min_score)
+        cl.addWidget(self._pos_thr)
         reclf = QPushButton("Reclassify"); reclf.clicked.connect(self._reclassify)
         cl.addWidget(reclf)
         cl.addStretch()
@@ -226,7 +274,7 @@ class ResultsExplorer(QMainWindow):
             w_intensity=self._w_int[1].value(),
             w_sum=self._w_sum[1].value(),
             w_particle=self._w_part[1].value(),
-            min_score=self._min_score.value(),
+            pos_threshold=self._pos_thr.value(),
         )
 
     def _reclassify(self) -> None:
@@ -234,12 +282,15 @@ class ResultsExplorer(QMainWindow):
             return
         self._cls = classify_wells(self._table, self._params())
         self._on_plate_changed(self._plate_combo.currentIndex())
-        neg = int(self._cls["is_negative_hole"].sum()) if not self._cls.empty else 0
-        amb = int(self._cls["is_ambiguous"].sum()) if not self._cls.empty else 0
+        if self._cls.empty:
+            return
+        present = self._cls[self._cls["hole_present"]]
+        neg = int(present["is_negative_hole"].sum())
+        coloured = int((present["n_positive"] > 0).sum())
+        multi = int((present["n_positive"] > 1).sum())
         self._status_lbl.setText(
-            f"Classified {len(self._cls)} wells — "
-            f"{self._cls['dominant_color'].notna().sum()} coloured, "
-            f"{neg} negative/empty, {amb} ambiguous."
+            f"Classified {len(present)} holes — {coloured} positive "
+            f"({multi} multi-colour), {neg} negative/empty."
         )
 
     def _build_detail_panel(self) -> QWidget:
@@ -252,6 +303,40 @@ class ResultsExplorer(QMainWindow):
         self._detail_form_box = QGroupBox("Measurements")
         self._detail_form = QFormLayout(self._detail_form_box)
         pl.addWidget(self._detail_form_box)
+
+        # Ground-truth labelling — seeded from the classifier call so the user
+        # corrects rather than labels from scratch. Each colour is independent
+        # (multi-label); none ticked = negative/empty hole.
+        label_box = QGroupBox("Ground-truth label (hand)")
+        ll = QVBoxLayout(label_box)
+        self._label_status = QLabel("—"); self._label_status.setStyleSheet("font-size:11px;")
+        ll.addWidget(self._label_status)
+        chk_row = QHBoxLayout()
+        self._label_checks: dict[str, QCheckBox] = {}
+        for color in LABEL_COLORS:
+            cb = QCheckBox(color)
+            cb.setStyleSheet(f"color:{_COLOR_HEX.get(color, '#ccc')}; font-weight:bold;")
+            self._label_checks[color] = cb
+            chk_row.addWidget(cb)
+        chk_row.addStretch()
+        ll.addLayout(chk_row)
+        hint = QLabel("(none ticked = negative / empty hole)")
+        hint.setStyleSheet("font-size:10px; color:#888;"); ll.addWidget(hint)
+        self._label_notes = QLineEdit(); self._label_notes.setPlaceholderText("notes (optional)")
+        ll.addWidget(self._label_notes)
+        btn_row = QHBoxLayout()
+        self._save_label_btn = QPushButton("Save label")
+        self._save_label_btn.clicked.connect(self._on_save_label)
+        self._clear_label_btn = QPushButton("Clear label")
+        self._clear_label_btn.clicked.connect(self._on_clear_label)
+        self._seed_label_btn = QPushButton("Reset to classifier call")
+        self._seed_label_btn.clicked.connect(self._seed_label_from_classifier)
+        btn_row.addWidget(self._save_label_btn)
+        btn_row.addWidget(self._clear_label_btn)
+        btn_row.addWidget(self._seed_label_btn)
+        ll.addLayout(btn_row)
+        self._set_label_controls_enabled(False)
+        pl.addWidget(label_box)
 
         # Diagnostic image selector + view
         img_box = QGroupBox("Diagnostic image")
@@ -284,6 +369,11 @@ class ResultsExplorer(QMainWindow):
 
     def load_folder(self, folder: str | Path) -> None:
         self._folder_lbl.setText(str(folder))
+        # Ground-truth labels live in a sidecar DB beside the browsed folder.
+        try:
+            self._labels = LabelStore.for_folder(folder)
+        except Exception:
+            self._labels = None
         self._runs = discover_runs(folder)
         self._run_combo.blockSignals(True)
         self._run_combo.clear()
@@ -342,16 +432,120 @@ class ResultsExplorer(QMainWindow):
         plate = self._plate_combo.currentData()
         if plate is None:
             return
-        # Colour the grid from the holistic classification (falls back to the
-        # analysis-layer dominant if classification hasn't run).
-        src = self._cls if getattr(self, "_cls", None) is not None and not self._cls.empty \
-            else self._table.wells
-        sub = src[src["plate"] == plate]
+        # Colour the grid from the multi-label classification: a hole present &
+        # positive → mixed tint of its positive colours; present & negative →
+        # negative-hole grey; no hole ROI → empty grey.
         well_hex = {}
-        for _, r in sub.iterrows():
-            color = r.get("dominant_color")
-            well_hex[r["well_id"]] = _COLOR_HEX.get(color, _EMPTY_HEX)
-        self._grid.set_colors(well_hex)
+        if getattr(self, "_cls", None) is not None and not self._cls.empty:
+            sub = self._cls[self._cls["plate"] == plate]
+            for _, r in sub.iterrows():
+                if not r.get("hole_present"):
+                    well_hex[r["well_id"]] = _EMPTY_HEX
+                    continue
+                colors = [c for c in (r.get("colors") or "").split(",") if c]
+                well_hex[r["well_id"]] = _blend_hex(colors)
+        self._grid.set_colors(well_hex, labelled=self._labelled_wells(plate))
+
+    def _labelled_wells(self, plate: str) -> set[str]:
+        """Well ids on *plate* that carry a hand label in the current run."""
+        run = self._current_run()
+        if self._labels is None or run is None:
+            return set()
+        df = self._labels.load_frame(run.run_tag)
+        if df.empty:
+            return set()
+        return set(df[df["plate"] == plate]["well_id"].tolist())
+
+    # ── Ground-truth labelling ───────────────────────────────────────
+    def _set_label_controls_enabled(self, enabled: bool) -> None:
+        for cb in self._label_checks.values():
+            cb.setEnabled(enabled)
+        self._label_notes.setEnabled(enabled)
+        self._save_label_btn.setEnabled(enabled)
+        self._clear_label_btn.setEnabled(enabled)
+        self._seed_label_btn.setEnabled(enabled)
+
+    def _classifier_colors_for(self, cr) -> set[str]:
+        """The classifier's positive colours for a classification row."""
+        if cr is None or not cr.get("hole_present"):
+            return set()
+        return {c for c in (cr.get("colors") or "").split(",") if c}
+
+    def _set_checks(self, colors: set[str]) -> None:
+        for color, cb in self._label_checks.items():
+            cb.blockSignals(True)
+            cb.setChecked(color in colors)
+            cb.blockSignals(False)
+
+    def _refresh_label_controls(self, plate: str, well_id: str, cr) -> None:
+        """Show any stored label for this well; if none, seed the checkboxes
+        from the classifier call so the user corrects rather than starts blank."""
+        self._label_notes.setText("")
+        stored = None
+        if self._labels is not None:
+            run = self._current_run()
+            if run is not None:
+                stored = self._labels.get_label(run.run_tag, plate, well_id)
+        if stored is not None:
+            self._set_checks(stored["colors"])
+            self._label_notes.setText(stored.get("notes") or "")
+            colours = ", ".join(sorted(stored["colors"])) or "negative / empty"
+            self._label_status.setText(f"labelled: {colours}  ({stored['updated_at']})")
+        else:
+            self._set_checks(self._classifier_colors_for(cr))
+            self._label_status.setText("not labelled — seeded from classifier; edit & Save")
+        self._set_label_controls_enabled(self._labels is not None)
+
+    def _seed_label_from_classifier(self) -> None:
+        if self._current_well is None or self._cls is None:
+            return
+        plate, well_id = self._current_well
+        crsub = self._cls[(self._cls["plate"] == plate) & (self._cls["well_id"] == well_id)]
+        cr = crsub.iloc[0] if not crsub.empty else None
+        self._set_checks(self._classifier_colors_for(cr))
+
+    def _on_save_label(self) -> None:
+        if self._labels is None or self._current_well is None:
+            return
+        run = self._current_run()
+        if run is None:
+            return
+        plate, well_id = self._current_well
+        colors = {c for c, cb in self._label_checks.items() if cb.isChecked()}
+        self._labels.set_label(run.run_tag, plate, well_id, colors,
+                               notes=self._label_notes.text().strip() or None)
+        colours = ", ".join(sorted(colors)) or "negative / empty"
+        self._label_status.setText(f"saved: {colours}")
+        # gold-border the well and refresh the labelled-count in the status bar
+        self._grid.mark_labelled(well_id, True, _blend_hex(sorted(colors)))
+        self._update_label_count()
+
+    def _on_clear_label(self) -> None:
+        if self._labels is None or self._current_well is None:
+            return
+        run = self._current_run()
+        if run is None:
+            return
+        plate, well_id = self._current_well
+        self._labels.delete_label(run.run_tag, plate, well_id)
+        self._label_status.setText("label cleared")
+        # repaint the well back to its classifier tint, drop the gold border
+        cr = None
+        crsub = self._cls[(self._cls["plate"] == plate) & (self._cls["well_id"] == well_id)] \
+            if self._cls is not None and not self._cls.empty else None
+        if crsub is not None and not crsub.empty:
+            cr = crsub.iloc[0]
+        hexc = _blend_hex(sorted(self._classifier_colors_for(cr))) if cr is not None \
+            else _EMPTY_HEX
+        self._grid.mark_labelled(well_id, False, hexc)
+        self._update_label_count()
+
+    def _update_label_count(self) -> None:
+        run = self._current_run()
+        if self._labels is None or run is None:
+            return
+        n = self._labels.count(run.run_tag)
+        self.statusBar().showMessage(f"{n} wells labelled in {run.run_tag}", 4000)
 
     # ── Well detail ──────────────────────────────────────────────────
     def _on_well_clicked(self, well_id: str) -> None:
@@ -371,42 +565,55 @@ class ResultsExplorer(QMainWindow):
             self._img_combo.clear()
             self._img_label.setText("(no image)")
             self._napari_btn.setEnabled(False)
+            # Critical: drop the label target so a stray Save can't write this
+            # (empty) well's UI state onto the previously-selected well.
+            self._current_well = None
+            self._label_status.setText("— (no data for this well)")
+            self._set_checks(set())
+            self._set_label_controls_enabled(False)
             return
         r = sub.iloc[0]
-        # Classification row (holistic) for this well, if available.
+        # Multi-label classification row for this well, if available.
         cr = None
         if getattr(self, "_cls", None) is not None and not self._cls.empty:
             crsub = self._cls[(self._cls["plate"] == plate) & (self._cls["well_id"] == well_id)]
             cr = crsub.iloc[0] if not crsub.empty else None
 
-        neg = bool(cr.get("is_negative_hole")) if cr is not None else bool(r.get("is_negative_hole"))
-        dom = cr.get("dominant_color") if cr is not None else r.get("dominant_color")
-        if neg:
-            dom_txt = "negative / empty hole (no channel enriched over background)"
-        elif dom:
-            amb = " — AMBIGUOUS" if (cr is not None and bool(cr.get("is_ambiguous"))) else ""
-            dom_txt = f"{dom}{amb}"
+        if cr is not None and cr.get("hole_present"):
+            colors = [c for c in (cr.get("colors") or "").split(",") if c]
+            if colors:
+                call_txt = " + ".join(colors)
+            else:
+                call_txt = "negative / empty hole (no channel positive)"
+        elif cr is not None:
+            call_txt = "— (no hole ROI)"
         else:
-            dom_txt = "— (no hole ROI)"
-        self._detail_form.addRow("Hole colour (holistic):", QLabel(dom_txt))
-        conf = (cr.get("confidence") if cr is not None else r.get("margin"))
-        self._detail_form.addRow("Confidence margin:",
-                                 QLabel(f"{conf:.0%}" if conf is not None and conf == conf else "—"))
+            call_txt = "—"
+        self._detail_form.addRow("Call (multi-label):", QLabel(call_txt))
         self._detail_form.addRow("Particles in hole:", QLabel(str(r.get("n_particles_hole", "—"))))
-        # Per channel: hole/bg intensity, enrichment, holistic score, cells around.
+        # Per channel: hole/bg intensity, score, margin (signed dist to threshold),
+        # positive?, and cells around.
         for ch in self._table.channels:
             hole = r.get(f"hole_{ch}")
             bg = r.get(f"bg_{ch}")
             nbg = r.get(f"nbg_{ch}")
             score = cr.get(f"score_{ch}") if cr is not None else None
+            margin = cr.get(f"margin_{ch}") if cr is not None else None
+            pos = bool(cr.get(f"pos_{ch}")) if cr is not None else False
             if hole is not None and hole == hole:
                 stxt = f"  score={score:.2f}" if score is not None and score == score else ""
-                txt = f"hole={hole:.4f}  bg={bg:.4f}{stxt}  cells around={nbg}"
+                mtxt = f"  Δthr={margin:+.2f}" if margin is not None and margin == margin else ""
+                flag = "  ✓POS" if pos else ""
+                txt = f"hole={hole:.4f}  bg={bg:.4f}{stxt}{mtxt}{flag}  cells around={nbg}"
             else:
                 txt = "—"
             lbl = QLabel(txt)
-            lbl.setStyleSheet(f"color:{CHANNEL_HEX.get(ch, '#ccc')};")
+            weight = "font-weight:bold;" if pos else ""
+            lbl.setStyleSheet(f"color:{CHANNEL_HEX.get(ch, '#ccc')};{weight}")
             self._detail_form.addRow(f"{ch}:", lbl)
+
+        # Seed / show the ground-truth label controls for this well.
+        self._refresh_label_controls(plate, well_id, cr)
 
         # diagnostic images — preserve the currently-chosen kind across wells
         # (don't reset to the first image every time a new well is clicked).
