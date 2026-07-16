@@ -2407,6 +2407,75 @@ def _set_checked_metrics(lst: QListWidget, selected: list[str] | None) -> None:
 # Tab 4 – Channels  (sidebar list + per-channel settings panel)
 # ──────────────────────────────────────────────────────────────────
 
+# The reorderable per-channel preprocessing steps and their default order.
+# Default matches the recommended pipeline: background subtraction → black-level
+# normalization → min-max/percentile scaling → blur. (Z-projection runs once for
+# the whole image before any of these; thresholding/segmentation runs after —
+# both are fixed points outside this reorderable list.)
+_PREPROC_TYPES = ["BackgroundSubtraction", "BlackLevelNormalization", "Normalize", "GaussianBlur"]
+_PREPROC_LABELS = {
+    "BackgroundSubtraction": "Background subtraction",
+    "BlackLevelNormalization": "Black-level normalization",
+    "Normalize": "Min-max / percentile scaling",
+    "GaussianBlur": "Gaussian blur",
+}
+
+
+class _PreprocOrderDialog(QDialog):
+    """Drag-to-reorder the enabled preprocessing steps for a channel. Shows each
+    step's parameters; disabled steps are shown greyed and can't be dragged out
+    of place meaningfully (they're simply skipped when the pipeline is built)."""
+
+    def __init__(self, order: list[str], enabled: dict[str, bool],
+                 summaries: dict[str, str], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Preprocessing order")
+        self.setMinimumWidth(420)
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel(
+            "Drag to reorder. Z-projection runs first (whole image); "
+            "thresholding runs after these. Disabled steps are skipped."
+        ))
+        self._list = QListWidget()
+        self._list.setDragDropMode(QListWidget.InternalMove)
+        self._list.setSelectionMode(QListWidget.SingleSelection)
+        for t in order:
+            on = enabled.get(t, False)
+            label = _PREPROC_LABELS.get(t, t)
+            summary = summaries.get(t, "")
+            text = f"{label}" + (f"   ({summary})" if summary else "")
+            if not on:
+                text += "   — disabled"
+            item = QListWidgetItem(text)
+            item.setData(Qt.UserRole, t)
+            if not on:
+                item.setForeground(Qt.gray)
+            self._list.addItem(item)
+        lay.addWidget(self._list)
+
+        btns = QHBoxLayout()
+        reset = QPushButton("Reset to default")
+        reset.clicked.connect(self._reset)
+        ok = QPushButton("OK"); ok.clicked.connect(self.accept)
+        cancel = QPushButton("Cancel"); cancel.clicked.connect(self.reject)
+        btns.addWidget(reset); btns.addStretch(); btns.addWidget(cancel); btns.addWidget(ok)
+        lay.addLayout(btns)
+
+    def _reset(self) -> None:
+        # Re-add in canonical default order, preserving each item's widget data.
+        by_type = {}
+        for i in range(self._list.count()):
+            it = self._list.item(i)
+            by_type[it.data(Qt.UserRole)] = it
+        self._list.clear()
+        for t in _PREPROC_TYPES:
+            if t in by_type:
+                self._list.addItem(by_type[t])
+
+    def result_order(self) -> list[str]:
+        return [self._list.item(i).data(Qt.UserRole) for i in range(self._list.count())]
+
+
 class ChannelPanel(QWidget):
     """Settings panel for one channel: name, preprocessing, segmentation, analysis."""
 
@@ -2416,6 +2485,7 @@ class ChannelPanel(QWidget):
     def __init__(self, ch_index: int, raw_name: str, parent=None):
         super().__init__(parent)
         self._ch_index = ch_index
+        self._preproc_order = list(_PREPROC_TYPES)   # user-reorderable
         self._build(raw_name)
 
     def _build(self, raw_name: str) -> None:
@@ -2475,27 +2545,26 @@ class ChannelPanel(QWidget):
         self._black_method = QComboBox(); self._black_method.addItems(["mode", "percentile"])
         self._black_pct = QDoubleSpinBox()
         self._black_pct.setRange(0.0, 50.0); self._black_pct.setValue(1.0); self._black_pct.setSuffix(" %")
-        self._black_before_norm = QCheckBox("run before Normalize")
-        self._black_before_norm.setChecked(True)
-        self._black_before_norm.setToolTip(
-            "On (default): align the black level on the raw/background-subtracted\n"
-            "data, BEFORE Normalize — this is what makes intensities comparable\n"
-            "across wells (per-image min-max Normalize would otherwise erase that).\n"
-            "Off: run after Normalize (rarely useful — min-max already sets the\n"
-            "floor near zero)."
-        )
 
         pfl.addRow(self._bg_en)
         pfl.addRow("  Method:",  self._bg_method)
         pfl.addRow("  Radius:",  self._bg_radius)
-        pfl.addRow(self._blur_en)
-        pfl.addRow("  Sigma:",   self._blur_sigma)
         pfl.addRow(self._norm_en)
         pfl.addRow("  Method:",  self._norm_method)
         pfl.addRow(self._black_en)
         pfl.addRow("  Estimator:", self._black_method)
         pfl.addRow("  Percentile:", self._black_pct)
-        pfl.addRow("  Order:", self._black_before_norm)
+        pfl.addRow(self._blur_en)
+        pfl.addRow("  Sigma:",   self._blur_sigma)
+
+        # Effective run-order summary + reorder button.
+        self._order_summary = QLabel()
+        self._order_summary.setWordWrap(True)
+        self._order_summary.setStyleSheet("color:#888; font-size:10px;")
+        reorder_btn = QPushButton("Reorder preprocessing …")
+        reorder_btn.clicked.connect(self._open_reorder_dialog)
+        pfl.addRow(reorder_btn)
+        pfl.addRow("Order:", self._order_summary)
 
         self._bg_en.toggled.connect(lambda c: [self._bg_method.setEnabled(c), self._bg_radius.setEnabled(c)])
         self._blur_en.toggled.connect(self._blur_sigma.setEnabled)
@@ -2504,14 +2573,16 @@ class ChannelPanel(QWidget):
         def _black_toggle(c):
             self._black_method.setEnabled(c)
             self._black_pct.setEnabled(c and self._black_method.currentText() == "percentile")
-            self._black_before_norm.setEnabled(c)
         self._black_en.toggled.connect(_black_toggle)
-        self._black_before_norm.setEnabled(False)
         self._black_method.currentTextChanged.connect(
             lambda t: self._black_pct.setEnabled(self._black_en.isChecked() and t == "percentile")
         )
         self._black_method.setEnabled(False); self._black_pct.setEnabled(False)
+        # keep the order summary live as steps are toggled/tuned
+        for w in (self._bg_en, self._blur_en, self._norm_en, self._black_en):
+            w.toggled.connect(self._update_order_summary)
         lay.addWidget(pre_box)
+        self._update_order_summary()
 
         # ── B. Segmentation ────────────────────────────────────────
         seg_box = QGroupBox("B.  Segmentation  (runs once, all ROIs share the same mask)")
@@ -2605,7 +2676,8 @@ class ChannelPanel(QWidget):
         self._black_en.setChecked(other._black_en.isChecked())
         self._black_method.setCurrentText(other._black_method.currentText())
         self._black_pct.setValue(other._black_pct.value())
-        self._black_before_norm.setChecked(other._black_before_norm.isChecked())
+        self._preproc_order = list(other._preproc_order)   # copy step order too
+        self._update_order_summary()
         self._thresh.setCurrentText(other._thresh.currentText())
         self._z_proj.setCurrentText(other._z_proj.currentText())
         self._min_obj.setValue(other._min_obj.value())
@@ -2630,30 +2702,66 @@ class ChannelPanel(QWidget):
     def display_color(self) -> str:
         return self._color_combo.currentText()
 
+    # ── Preprocessing step registry (build / enabled / summary) ──────
+
+    def _build_preproc_step(self, step_type: str) -> dict | None:
+        """Return the step dict for *step_type* if its widget is enabled, else
+        None. Central definition so ordering is data-driven."""
+        if step_type == "BackgroundSubtraction" and self._bg_en.isChecked():
+            return {"type": step_type, "channel": self._ch_index,
+                    "radius": self._bg_radius.value(), "method": self._bg_method.currentText()}
+        if step_type == "BlackLevelNormalization" and self._black_en.isChecked():
+            return {"type": step_type, "channel": self._ch_index,
+                    "method": self._black_method.currentText(),
+                    "percentile": self._black_pct.value()}
+        if step_type == "Normalize" and self._norm_en.isChecked():
+            return {"type": step_type, "channel": self._ch_index,
+                    "method": self._norm_method.currentText()}
+        if step_type == "GaussianBlur" and self._blur_en.isChecked():
+            return {"type": step_type, "channel": self._ch_index, "sigma": self._blur_sigma.value()}
+        return None
+
+    def _preproc_enabled(self, step_type: str) -> bool:
+        return {
+            "BackgroundSubtraction": self._bg_en,
+            "BlackLevelNormalization": self._black_en,
+            "Normalize": self._norm_en,
+            "GaussianBlur": self._blur_en,
+        }[step_type].isChecked()
+
+    def _preproc_summary(self, step_type: str) -> str:
+        if step_type == "BackgroundSubtraction":
+            return f"{self._bg_method.currentText()}, r={self._bg_radius.value()}px"
+        if step_type == "BlackLevelNormalization":
+            m = self._black_method.currentText()
+            return m if m != "percentile" else f"percentile {self._black_pct.value()}%"
+        if step_type == "Normalize":
+            return self._norm_method.currentText()
+        if step_type == "GaussianBlur":
+            return f"sigma={self._blur_sigma.value()}"
+        return ""
+
     def get_preprocess_steps(self) -> list[dict]:
+        """Enabled preprocessing steps, emitted in the user-chosen order."""
         steps: list[dict] = []
-        if self._bg_en.isChecked():
-            steps.append({"type": "BackgroundSubtraction", "channel": self._ch_index,
-                          "radius": self._bg_radius.value(), "method": self._bg_method.currentText()})
-        if self._blur_en.isChecked():
-            steps.append({"type": "GaussianBlur", "channel": self._ch_index,
-                          "sigma": self._blur_sigma.value()})
-        black_step = None
-        if self._black_en.isChecked():
-            black_step = {"type": "BlackLevelNormalization", "channel": self._ch_index,
-                          "method": self._black_method.currentText(),
-                          "percentile": self._black_pct.value()}
-        # Default: black-level BEFORE Normalize — align the floor on raw data so
-        # intensities stay comparable across wells (per-image min-max Normalize
-        # would otherwise erase that). Toggle off to run it after Normalize.
-        if black_step and self._black_before_norm.isChecked():
-            steps.append(black_step)
-        if self._norm_en.isChecked():
-            steps.append({"type": "Normalize", "channel": self._ch_index,
-                          "method": self._norm_method.currentText()})
-        if black_step and not self._black_before_norm.isChecked():
-            steps.append(black_step)
+        for step_type in self._preproc_order:
+            s = self._build_preproc_step(step_type)
+            if s is not None:
+                steps.append(s)
         return steps
+
+    def _update_order_summary(self) -> None:
+        active = [_PREPROC_LABELS.get(t, t) for t in self._preproc_order
+                  if self._preproc_enabled(t)]
+        self._order_summary.setText(" → ".join(active) if active else "(no preprocessing)")
+
+    def _open_reorder_dialog(self) -> None:
+        enabled = {t: self._preproc_enabled(t) for t in _PREPROC_TYPES}
+        summaries = {t: self._preproc_summary(t) for t in _PREPROC_TYPES}
+        dlg = _PreprocOrderDialog(self._preproc_order, enabled, summaries, self)
+        if dlg.exec_() if hasattr(dlg, "exec_") else dlg.exec():
+            self._preproc_order = dlg.result_order()
+            self._update_order_summary()
 
     def get_segment_steps(self) -> list[dict]:
         steps = [{"type": "AutoThreshold", "channel": self._ch_index,
@@ -2709,14 +2817,15 @@ class ChannelPanel(QWidget):
         if black:
             self._black_method.setCurrentText(black.get("method", "mode"))
             self._black_pct.setValue(black.get("percentile", 1.0))
-            # Infer before/after from the actual order in the loaded steps.
-            types_in_order = [s["type"] for s in steps]
-            if "BlackLevelNormalization" in types_in_order and "Normalize" in types_in_order:
-                before = (types_in_order.index("BlackLevelNormalization")
-                          < types_in_order.index("Normalize"))
-            else:
-                before = True
-            self._black_before_norm.setChecked(before)
+
+        # Reconstruct the preprocessing order from the loaded step sequence:
+        # preprocessing types appear in their run order; any type not present is
+        # appended (disabled) so the reorder dialog still lists it.
+        seen_order = [s["type"] for s in steps if s["type"] in _PREPROC_TYPES]
+        order = list(dict.fromkeys(seen_order))   # de-dup, preserve order
+        order += [t for t in _PREPROC_TYPES if t not in order]
+        self._preproc_order = order
+        self._update_order_summary()
 
         thresh = by_type.get("AutoThreshold")
         if thresh:
@@ -2838,8 +2947,37 @@ class ChannelsTab(QWidget):
         colors_btn = QPushButton("Assign channel colors …")
         colors_btn.clicked.connect(self._on_assign_colors)
         top_row.addWidget(colors_btn)
+        top_row.addStretch()
+        # Z-projection runs ONCE for the whole image, before any per-channel
+        # preprocessing — so it's a tab-level control, not per channel. On by
+        # default: collapsing the Z-stack up front makes every downstream step
+        # (rolling-ball etc.) run on one plane instead of every slice — much
+        # faster, and matches "project → correct → analyse".
+        self._zproj_cb = QCheckBox("Project Z→2D first")
+        self._zproj_cb.setChecked(True)
+        self._zproj_cb.setToolTip(
+            "Collapse the Z-stack to a single 2-D plane (all channels) as the\n"
+            "very first pipeline step. Strongly recommended: preprocessing then\n"
+            "runs once per channel instead of once per Z-slice."
+        )
+        self._zproj_method = QComboBox(); self._zproj_method.addItems(["max", "mean", "sum", "min"])
+        self._zproj_cb.toggled.connect(self._zproj_method.setEnabled)
+        top_row.addWidget(self._zproj_cb)
+        top_row.addWidget(self._zproj_method)
         root.addLayout(top_row)
         root.addWidget(splitter)
+
+    def get_zprojection_step(self) -> dict | None:
+        """The whole-image Z-projection step to prepend to the pipeline, or None
+        if disabled. channel=-1 → all channels collapsed once."""
+        if not self._zproj_cb.isChecked():
+            return None
+        return {"type": "ZProjection", "channel": -1, "method": self._zproj_method.currentText()}
+
+    def set_zprojection(self, step: dict | None) -> None:
+        self._zproj_cb.setChecked(step is not None)
+        if step:
+            self._zproj_method.setCurrentText(step.get("method", "max"))
 
     def _on_assign_colors(self) -> None:
         if not self._panels:
@@ -2901,6 +3039,9 @@ class ChannelsTab(QWidget):
         channel panel (set_channels must have been called first — i.e. a
         sample image already loaded, so channel count/names are known)."""
         steps = pl_dict.get("steps", [])
+        # Whole-image Z-projection (channel == -1), if present.
+        zproj = next((s for s in steps if s.get("type") == "ZProjection"), None)
+        self.set_zprojection(zproj)
         per_ch_types = {"BackgroundSubtraction", "GaussianBlur", "Normalize",
                          "BlackLevelNormalization",
                          "AutoThreshold", "WatershedSplit", "ParticleAnalysis", "IntensityMeasurement"}
@@ -3444,6 +3585,8 @@ def _metrics_suffix(selected: list[str] | None, all_choices: list[str]) -> str:
 def _step_repr(s: dict) -> str:
     """One-line human-readable summary of a single pipeline step dict."""
     t = s.get("type", "?")
+    if t == "ZProjection":
+        return f"ZProjection({s.get('method')}, all channels → 2-D)"
     if t == "BackgroundSubtraction":
         return f"BackgroundSubtraction({s.get('method')}, r={s.get('radius')}px)"
     if t == "GaussianBlur":
@@ -3490,7 +3633,7 @@ def _format_pipeline_summary(pl_dict: dict, well=None, bf_cfg: dict | None = Non
         lines.append("No well selected — whole-image pipeline (per-well ROI selections not resolved).")
     lines.append("")
 
-    pre_seg_types = {"BackgroundSubtraction", "GaussianBlur", "Normalize",
+    pre_seg_types = {"ZProjection", "BackgroundSubtraction", "GaussianBlur", "Normalize",
                      "BlackLevelNormalization", "AutoThreshold", "WatershedSplit"}
     pre_seg = [s for s in steps if s["type"] in pre_seg_types]
     rest    = [s for s in steps if s["type"] not in pre_seg_types]
@@ -4190,9 +4333,14 @@ class RunTab(QWidget):
                 self._preview_btn.setText("Running BF pipeline …")
                 self._bf_preview_worker = _BFWorker([well], bf_cfg, test_mode=False)
                 self._bf_preview_worker.log_msg.connect(lambda m: self._log(f"[BF] {m}"))
-                self._bf_preview_worker.finished.connect(
-                    lambda n_ok, n_err: self._run_well_preview(img_data, well, pipeline_dict_fn)
-                )
+
+                def _bf_done(n_ok, n_err):
+                    # Diagnostic: confirms the BF worker's finished signal was
+                    # delivered to the main thread and the FL preview is starting.
+                    self._log(f"[BF] done ({n_ok} ok, {n_err} err) → starting FL preview …")
+                    self._run_well_preview(img_data, well, pipeline_dict_fn)
+
+                self._bf_preview_worker.finished.connect(_bf_done)
                 self._bf_preview_worker.start()
                 return
             self._run_well_preview(img_data, well, pipeline_dict_fn)
@@ -4206,6 +4354,7 @@ class RunTab(QWidget):
             self._run_preview_with_dict(img_data, self._get_pipeline_dict())
 
     def _run_well_preview(self, img_data, well, pipeline_dict_fn) -> None:
+        self._log(f"Building FL preview pipeline for {well.well_id} …")
         pl_dict, missing = pipeline_dict_fn(well)
         if missing:
             self._log(
@@ -4228,6 +4377,7 @@ class RunTab(QWidget):
             with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
                 json.dump(pl_dict, f); tmp = f.name
             pl = Pipeline.load(tmp); os.unlink(tmp)
+            self._log("Preview steps: " + " → ".join(s.name for s in pl.steps))
 
             channel_colors = self._get_channel_colors() if self._get_channel_colors else []
             def _color_for(ch_idx: int) -> str:
@@ -4344,6 +4494,7 @@ class RunTab(QWidget):
                 msg = str(exc_info[1]) if isinstance(exc_info, tuple) else str(exc_info)
                 self._log(f"Error: {msg}")
 
+            self._log("Running FL pipeline in background thread …")
             worker = _run()
             worker.yielded.connect(_on_step)
             worker.finished.connect(_on_done)
@@ -4817,6 +4968,11 @@ class CorrelativeImagingWidget(QWidget):
         sels   = self._roi_tab.get_selections()
         steps: list[dict] = []
 
+        # ── 0. Z-projection (whole image, once) ──
+        zproj = self._channels_tab.get_zprojection_step()
+        if zproj:
+            steps.append(zproj)
+
         # ── 1. Preprocessing ──
         for p in panels:
             steps.extend(p.get_preprocess_steps())
@@ -4872,6 +5028,7 @@ class CorrelativeImagingWidget(QWidget):
         dataclasses, which are safe to read from any thread.
         """
         panels = self._channels_tab.get_panels()
+        zproj = self._channels_tab.get_zprojection_step()   # whole-image, once
         preprocess_steps: list[dict] = []
         segment_steps: list[dict] = []
         for p in panels:
@@ -4890,7 +5047,7 @@ class CorrelativeImagingWidget(QWidget):
             per_sel_tail.append((sel, tail))
 
         def _fn(well) -> tuple[dict, list[str]]:
-            steps = list(preprocess_steps) + list(segment_steps)
+            steps = ([zproj] if zproj else []) + list(preprocess_steps) + list(segment_steps)
             missing: list[str] = []
             for sel, tail in per_sel_tail:
                 roi_step = sel.get_roi_step(well)

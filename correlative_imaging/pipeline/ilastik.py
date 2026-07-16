@@ -41,22 +41,18 @@ class ZProjection(Step):
 
     def process(self, image: np.ndarray, context: PipelineContext) -> StepResult:
         if image.ndim != 4:
-            return StepResult()   # already 2-D — nothing to do
+            return StepResult()   # already 2-D per channel — nothing to do
 
         ops = {"min": np.min, "max": np.max, "mean": np.mean, "sum": np.sum}
         fn = ops.get(self.method, np.min)
 
-        out = image.copy()
-        channels = range(out.shape[0]) if self.channel == -1 else [self.channel]
-        for c in channels:
-            proj = fn(out[c], axis=0)   # (Z,Y,X) → (Y,X)
-            out[c] = proj[np.newaxis]   # keep shape (1,Y,X) for one Z-slice
-
-        # Squeeze the trivial Z axis so downstream steps see (C,Y,X)
-        if out.shape[1] == 1:
-            out = out[:, 0, :, :]
-
-        return StepResult(image=out)
+        # Collapse the Z axis for every channel: (C, Z, Y, X) → (C, Y, X).
+        # Projection is independent per channel, so a single reduction over
+        # axis=1 handles all channels at once. (channel != -1 is accepted for
+        # API symmetry but still collapses the whole stack — leaving some
+        # channels 3-D and others 2-D would be an invalid mixed-rank array.)
+        out = fn(image, axis=1)
+        return StepResult(image=out.astype(image.dtype, copy=False))
 
 
 # ──────────────────────────────────────────────────────────────────────────────
