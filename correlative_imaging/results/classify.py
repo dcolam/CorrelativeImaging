@@ -35,8 +35,9 @@ is a direct per-channel join — no colour indirection.
 Output schema (one row per plate+well):
 
     hole_present : bool
-    score_<ch>   : float      combined enrichment score
-    pos_<ch>     : bool        score_<ch> >= threshold_<ch>
+    score_<ch>   : float      combined enrichment score (population-scaled)
+    occ_<ch>     : float       occupancy: fraction of hole ROI covered (0–1)
+    pos_<ch>     : bool        score_<ch> >= threshold AND occ_<ch> >= min_area
     margin_<ch>  : float       score_<ch> - threshold_<ch> (signed confidence)
     pos_channels : str         comma-joined positive channel names, "" if none
     n_positive   : int
@@ -60,13 +61,26 @@ class ClassifierParams:
     """Tunable knobs for the multi-label classifier (sensible defaults).
 
     ``pos_threshold`` is the default score a channel must clear to be called
-    positive; ``thresholds`` overrides it per channel (this is what calibration
-    against the hand labels fills in — one threshold per channel)."""
+    positive; ``thresholds`` overrides it per channel (what calibration against
+    the hand labels fills in). ``min_area`` is an independent occupancy floor
+    (fraction of the hole ROI covered by this channel's particles) — an
+    intensity bump with no real object in the hole is rejected regardless of
+    score, which is scale-robust by construction (occupancy is already 0–1).
+
+    ``population_scale`` divides each channel's score by that channel's SD
+    (uncentered) over the wells in ``scale_group``, so a fixed threshold means
+    the same thing across a dim and a bright channel and across plates.
+    ``scale_per_plate`` scopes that SD to each plate (batch-effect sanity check);
+    the default (False) pools across all plates of the run — "across experiment",
+    which is what preserves cross-plate/timepoint differences."""
     w_intensity: float = 1.0     # weight on hole/bg mean-intensity enrichment
     w_sum: float = 1.0           # weight on hole/bg sum-intensity enrichment
     w_particle: float = 1.0      # weight on brightest-particle enrichment
     pos_threshold: float = 0.10  # default per-channel positive-call threshold
     thresholds: dict[str, float] = field(default_factory=dict)  # per-channel overrides
+    min_area: float = 0.0        # occupancy floor (0 = off); fraction of hole covered
+    population_scale: bool = True   # divide score by per-channel SD (cross-well comparability)
+    scale_per_plate: bool = False   # SD per (channel, plate) instead of per channel across the run
 
     def threshold_for(self, channel: str) -> float:
         return float(self.thresholds.get(channel, self.pos_threshold))
@@ -103,6 +117,32 @@ def _roi_sum(intensity: pd.DataFrame, roi: str) -> dict:
     return g.to_dict()
 
 
+def _hole_occupancy(particles: pd.DataFrame, intensity: pd.DataFrame) -> dict:
+    """{(plate, well, channel): occupancy} — fraction of the hole ROI covered by
+    that channel's detected particles: Σ(particle area_px) / hole-ROI area_px.
+
+    A 0–1 fraction (may slightly exceed 1 if particle masks overlap the ROI edge),
+    inherently comparable across wells/plates. Missing pieces → occupancy absent
+    (treated as 0 by the caller)."""
+    if (particles is None or particles.empty
+            or intensity is None or intensity.empty
+            or "area_px" not in particles.columns or "area_px" not in intensity.columns):
+        return {}
+    p = particles[particles["roi_mask"] == "roi_hole"]
+    roi = intensity[intensity["roi_mask"] == "roi_hole"]
+    if p.empty or roi.empty:
+        return {}
+    part_area = p.groupby(["plate", "well_id", "channel"])["area_px"].sum()
+    # ROI area is the same object per well, recorded per channel row — take the mean.
+    roi_area = roi.groupby(["plate", "well_id", "channel"])["area_px"].mean()
+    out = {}
+    for key, num in part_area.items():
+        den = roi_area.get(key)
+        if den is not None and np.isfinite(den) and den > 0:
+            out[key] = float(num) / float(den)
+    return out
+
+
 def channel_score(hole, bg, hole_sum, bg_sum, part, params: ClassifierParams) -> dict:
     """The three enrichment components and their weighted sum for one channel.
 
@@ -117,11 +157,35 @@ def channel_score(hole, bg, hole_sum, bg_sum, part, params: ClassifierParams) ->
     return {"s_int": s_int, "s_sum": s_sum, "s_part": s_part, "score": score}
 
 
+def _channel_scale_factors(raw: dict, params: ClassifierParams) -> dict:
+    """Per-channel (or per channel×plate) uncentered SD used to population-scale
+    scores. ``raw`` maps (plate, well, channel) → raw score. Returns a dict keyed
+    by the same grouping as scaling: channel, or (channel, plate)."""
+    if not params.population_scale or not raw:
+        return {}
+    groups: dict = {}
+    for (plate, _well, ch), score in raw.items():
+        key = (ch, plate) if params.scale_per_plate else ch
+        groups.setdefault(key, []).append(score)
+    factors = {}
+    for key, vals in groups.items():
+        arr = np.asarray(vals, dtype=float)
+        sd = float(np.nanstd(arr))          # uncentered scale (R-style ÷SD)
+        factors[key] = sd if np.isfinite(sd) and sd > 0 else 1.0
+    return factors
+
+
 def classify_wells(rt: RunTable, params: ClassifierParams | None = None) -> pd.DataFrame:
     """Return a per-well **multi-label** classification table: one independent
     positive/negative call per channel, an explicit negative-hole flag, and every
-    per-channel component score + distance-from-threshold (for inspection and
-    calibration). One row per (plate, well)."""
+    per-channel score / occupancy / distance-from-threshold (for inspection and
+    calibration). One row per (plate, well).
+
+    A channel is positive when its (optionally population-scaled) score clears the
+    threshold AND its occupancy clears ``min_area`` — two independent gates, so a
+    bright-but-empty hole is rejected. Population scaling divides each channel's
+    score by that channel's SD across the run (or per plate), so one threshold is
+    comparable across dim/bright channels and across plates."""
     params = params or ClassifierParams()
     channels = rt.channels
     wells = rt.wells
@@ -131,33 +195,58 @@ def classify_wells(rt: RunTable, params: ClassifierParams | None = None) -> pd.D
     pb = _hole_particle_brightness(rt.particles)         # brightest hole particle
     hole_sum = _roi_sum(rt.intensity, "roi_hole")        # extent signal
     bg_sum = _roi_sum(rt.intensity, "roi_background")
+    occ = _hole_occupancy(rt.particles, rt.intensity)    # occupancy gate
 
+    # ── Pass 1: raw per-(well, channel) scores + occupancy, and hole presence.
+    raw_score: dict = {}
+    occupancy: dict = {}
+    has_hole: dict = {}
+    for r in wells.itertuples(index=False):
+        wkey = (r.plate, r.well_id)
+        present = False
+        for ch in channels:
+            hole = getattr(r, f"hole_{ch}", None)
+            bg = getattr(r, f"bg_{ch}", None)
+            if hole is not None and np.isfinite(hole):
+                present = True
+            key = (r.plate, r.well_id, ch)
+            comp = channel_score(
+                hole, bg, hole_sum.get(key), bg_sum.get(key), pb.get(key), params,
+            )
+            raw_score[key] = comp["score"]
+            occupancy[key] = float(occ.get(key, 0.0))
+        has_hole[wkey] = present
+
+    # ── Population scaling factors (per channel across the run, or per plate).
+    factors = _channel_scale_factors(raw_score, params)
+
+    def _scaled(plate, ch, score):
+        if not params.population_scale:
+            return score
+        key = (ch, plate) if params.scale_per_plate else ch
+        return score / factors.get(key, 1.0)
+
+    # ── Pass 2: apply threshold + occupancy gates, assemble rows.
     rows = []
     for r in wells.itertuples(index=False):
         rec = {"plate": r.plate, "well_id": r.well_id,
                "row": getattr(r, "row", None), "col": getattr(r, "col", None),
                "experiment": getattr(r, "experiment", None)}
-        has_hole = False
         positives = []
         for ch in channels:
-            hole = getattr(r, f"hole_{ch}", None)
-            bg = getattr(r, f"bg_{ch}", None)
-            if hole is not None and np.isfinite(hole):
-                has_hole = True
             key = (r.plate, r.well_id, ch)
-            comp = channel_score(
-                hole, bg, hole_sum.get(key), bg_sum.get(key), pb.get(key), params,
-            )
+            score = _scaled(r.plate, ch, raw_score[key])
+            occ_ch = occupancy[key]
             thr = params.threshold_for(ch)
-            score = comp["score"]
-            pos = score >= thr
+            pos = (score >= thr) and (occ_ch >= params.min_area)
             rec[f"score_{ch}"] = score
+            rec[f"occ_{ch}"] = occ_ch
             rec[f"pos_{ch}"] = bool(pos)
             rec[f"margin_{ch}"] = score - thr        # signed distance from threshold
             if pos:
                 positives.append(ch)                 # channel name, never a colour
 
-        if not has_hole:
+        if not has_hole[(r.plate, r.well_id)]:
             # No hole ROI at all — not a negative hole, just no data.
             for ch in channels:
                 rec[f"pos_{ch}"] = False

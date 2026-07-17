@@ -314,15 +314,32 @@ class ResultsExplorer(QMainWindow):
         self._w_part = self._mk_weight("particle", 1.0)
         self._pos_thr = QDoubleSpinBox()
         self._pos_thr.setRange(0.0, 10.0); self._pos_thr.setSingleStep(0.05)
-        self._pos_thr.setValue(0.10); self._pos_thr.setPrefix("pos≥ ")
+        self._pos_thr.setValue(0.50); self._pos_thr.setPrefix("pos≥ ")
         self._pos_thr.setToolTip(
-            "A channel is called positive when its score clears this. Shared "
-            "default across channels — calibrate per-channel against hand labels."
+            "A channel is positive when its score clears this. With scaling on, "
+            "the score is in per-channel SD units. Calibrate against hand labels."
+        )
+        self._min_area = QDoubleSpinBox()
+        self._min_area.setRange(0.0, 1.0); self._min_area.setSingleStep(0.01)
+        self._min_area.setValue(0.05); self._min_area.setPrefix("occ≥ ")
+        self._min_area.setToolTip(
+            "Occupancy floor: fraction of the hole ROI that this channel's objects "
+            "must cover to be called positive. Rejects bright-but-empty holes."
+        )
+        self._scale_combo = QComboBox()
+        self._scale_combo.addItem("scale: across run", "run")
+        self._scale_combo.addItem("scale: per plate", "plate")
+        self._scale_combo.addItem("scale: off", "off")
+        self._scale_combo.setToolTip(
+            "Population scaling of scores. 'across run' pools all plates (preserves "
+            "cross-plate/timepoint differences); 'per plate' removes plate batch drift."
         )
         cl.addWidget(QLabel("weights:"))
         for lbl, spin in (self._w_int, self._w_sum, self._w_part):
             cl.addWidget(QLabel(lbl)); cl.addWidget(spin)
         cl.addWidget(self._pos_thr)
+        cl.addWidget(self._min_area)
+        cl.addWidget(self._scale_combo)
         reclf = QPushButton("Reclassify"); reclf.clicked.connect(self._reclassify)
         cl.addWidget(reclf)
         cl.addStretch()
@@ -348,11 +365,15 @@ class ResultsExplorer(QMainWindow):
         return (label, spin)
 
     def _params(self) -> ClassifierParams:
+        scale = self._scale_combo.currentData()
         return ClassifierParams(
             w_intensity=self._w_int[1].value(),
             w_sum=self._w_sum[1].value(),
             w_particle=self._w_part[1].value(),
             pos_threshold=self._pos_thr.value(),
+            min_area=self._min_area.value(),
+            population_scale=(scale != "off"),
+            scale_per_plate=(scale == "plate"),
         )
 
     def _reclassify(self) -> None:
@@ -755,12 +776,14 @@ class ResultsExplorer(QMainWindow):
             nbg = r.get(f"nbg_{ch}")
             score = cr.get(f"score_{ch}") if cr is not None else None
             margin = cr.get(f"margin_{ch}") if cr is not None else None
+            occ = cr.get(f"occ_{ch}") if cr is not None else None
             pos = bool(cr.get(f"pos_{ch}")) if cr is not None else False
             if hole is not None and hole == hole:
                 stxt = f"  score={score:.2f}" if score is not None and score == score else ""
+                otxt = f"  occ={occ:.0%}" if occ is not None and occ == occ else ""
                 mtxt = f"  Δthr={margin:+.2f}" if margin is not None and margin == margin else ""
                 flag = "  ✓POS" if pos else ""
-                txt = f"hole={hole:.4f}  bg={bg:.4f}{stxt}{mtxt}{flag}  cells around={nbg}"
+                txt = f"hole={hole:.4f}  bg={bg:.4f}{stxt}{otxt}{mtxt}{flag}  cells around={nbg}"
             else:
                 txt = "—"
             lbl = QLabel(txt)
