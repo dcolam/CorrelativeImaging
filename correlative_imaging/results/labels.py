@@ -32,7 +32,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from .analysis import CHANNEL_HEX
+from .analysis import CHANNEL_COLOR_NAME, CHANNEL_HEX
 
 DEFAULT_LABELS_FILENAME = "ci_labels.db"
 
@@ -102,9 +102,37 @@ class LabelStore:
                 )
                 """
             )
+            self._migrate_legacy_labels(con)
             con.commit()
         finally:
             con.close()
+
+    def _migrate_legacy_labels(self, con) -> None:
+        """Upgrade a ``well_labels`` table written by the earlier per-COLOUR
+        schema (``pos_blue``/``pos_green``/``pos_red``) to the channel-keyed
+        ``pos_channels`` column, backfilling existing labels by mapping each
+        stored colour back to its channel via :data:`~.analysis.CHANNEL_COLOR_NAME`.
+        A no-op on a fresh (already channel-keyed) database."""
+        cols = [r[1] for r in con.execute("PRAGMA table_info(well_labels)")]
+        if "pos_channels" in cols:
+            return
+        con.execute("ALTER TABLE well_labels ADD COLUMN pos_channels TEXT NOT NULL DEFAULT ''")
+        legacy = [c for c in cols if c.startswith("pos_") and c != "pos_channels"]
+        if not legacy:
+            return
+        colour_to_channel = {v: k for k, v in CHANNEL_COLOR_NAME.items()}
+        rows = con.execute(
+            f"SELECT rowid, {', '.join(legacy)} FROM well_labels"
+        ).fetchall()
+        for row in rows:
+            chans = [
+                colour_to_channel.get(c[len("pos_"):], c[len("pos_"):])
+                for c in legacy if row[c]
+            ]
+            con.execute(
+                "UPDATE well_labels SET pos_channels=? WHERE rowid=?",
+                (self._join(chans), row["rowid"]),
+            )
 
     # ── Ground-truth labels ──────────────────────────────────────────
     @staticmethod
