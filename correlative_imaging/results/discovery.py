@@ -148,6 +148,32 @@ def find_channel_stack(diagnostics_dir: Path | None, well_id: str, kind: str) ->
     return p if p.is_file() else None
 
 
+def diagnostic_view_sources(diagnostics_dir: Path | None, well_id: str, kind: str) -> dict[str, Path]:
+    """Available ways to view one well+kind, keyed by a view name:
+
+    * ``"per-channel"`` → the multi-channel stack (raw per-channel data + BF),
+    * ``"composite (jpg)"`` / ``"composite (tiff)"`` → the baked RGB composite in
+      each format that exists (the composite is what carries any stamped ROI
+      outline; the per-channel stack does not).
+
+    Only views whose files exist are included, so the UI can offer a jpg/tiff/
+    per-channel toggle limited to what the run actually wrote."""
+    out: dict[str, Path] = {}
+    if diagnostics_dir is None or not diagnostics_dir.is_dir():
+        return out
+    stack = find_channel_stack(diagnostics_dir, well_id, kind)
+    if stack is not None:
+        out["per-channel"] = stack
+    for name, exts in (("composite (jpg)", (".jpg", ".jpeg")),
+                       ("composite (tiff)", (".tif", ".tiff"))):
+        for ext in exts:
+            p = diagnostics_dir / f"{well_id}_{kind}{ext}"
+            if p.is_file():
+                out[name] = p
+                break
+    return out
+
+
 def find_bf_projection(diagnostics_dir: Path | None, well_id: str) -> Path | None:
     """The brightfield z-projection for one well, written by the BF pipeline to
     ``<plate>/bf_pipeline/projections/<well>_proj.tif`` (a sibling of the
