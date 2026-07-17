@@ -48,12 +48,22 @@ class FeatureMatrix:
         return self.X.shape[0]
 
 
-def umap_available() -> bool:
+def umap_import_error() -> str | None:
+    """``None`` if ``umap`` imports cleanly, else a short description of WHY it
+    failed. umap-learn frequently installs but fails to import (numba/llvmlite or
+    numpy ABI mismatch, wrong conda env), and a bare "not installed" hides that —
+    so surface the real error to the UI."""
     try:
         import umap  # noqa: F401
-        return True
-    except Exception:
-        return False
+        return None
+    except ModuleNotFoundError as e:
+        return f"not installed ({e})"
+    except Exception as e:   # installed but broken import (numba, numpy ABI, …)
+        return f"installed but failed to import — {type(e).__name__}: {e}"
+
+
+def umap_available() -> bool:
+    return umap_import_error() is None
 
 
 def _standardize_per_run(df: pd.DataFrame, feat_cols: list[str]) -> pd.DataFrame:
@@ -71,12 +81,15 @@ def _standardize_per_run(df: pd.DataFrame, feat_cols: list[str]) -> pd.DataFrame
 def build_feature_matrix(
     run_tables: dict[str, RunTable],
     params: ClassifierParams | None = None,
+    omit_empty: bool = False,
 ) -> FeatureMatrix | None:
     """Assemble the per-cell feature matrix across one or more loaded runs.
 
     Features per cell = ``score_<ch>`` (population-scaled) + ``occ_<ch>`` for each
     channel *shared* by all runs, aligned by name. Only wells with a hole are
-    included. Returns ``None`` if there is nothing to embed."""
+    included; with ``omit_empty=True`` wells the classifier calls negative/empty
+    (no channel positive) are dropped too, so the embedding focuses on cells that
+    carry signal. Returns ``None`` if there is nothing to embed."""
     params = params or ClassifierParams()
     frames: list[tuple[str, pd.DataFrame]] = []
     channel_sets: list[set] = []
@@ -87,6 +100,8 @@ def build_feature_matrix(
         if cls.empty:
             continue
         cls = cls[cls["hole_present"]]
+        if omit_empty and "is_negative_hole" in cls.columns:
+            cls = cls[~cls["is_negative_hole"].astype(bool)]
         if cls.empty:
             continue
         frames.append((run_tag, cls))
@@ -151,4 +166,6 @@ def cluster_labels(X: np.ndarray, min_cluster_size: int = 15) -> np.ndarray:
     if n < 3:
         return np.zeros(n, dtype=int)
     mcs = int(max(2, min(min_cluster_size, max(2, n // 2))))
-    return HDBSCAN(min_cluster_size=mcs).fit_predict(X)
+    # copy=True is the future sklearn default; set it explicitly to silence the
+    # FutureWarning and avoid mutating the caller's array.
+    return HDBSCAN(min_cluster_size=mcs, copy=True).fit_predict(X)

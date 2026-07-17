@@ -122,13 +122,15 @@ class _ClusterWorker(QThread):
     done = Signal(object)     # dict of results
     error = Signal(str)
 
-    def __init__(self, run_groups, params, fit_plate, want_umap, min_cluster_size):
+    def __init__(self, run_groups, params, fit_plate, want_umap, min_cluster_size,
+                 omit_empty=False):
         super().__init__()
         self._run_groups = run_groups
         self._params = params
         self._fit_plate = fit_plate
         self._want_umap = want_umap
         self._min_cluster_size = min_cluster_size
+        self._omit_empty = omit_empty
 
     def run(self) -> None:
         try:
@@ -139,7 +141,7 @@ class _ClusterWorker(QThread):
                     tables[rg.run_tag] = load_run(rg)
                 except Exception:
                     continue
-            fm = _cluster.build_feature_matrix(tables, self._params)
+            fm = _cluster.build_feature_matrix(tables, self._params, self._omit_empty)
             if fm is None or len(fm) < 3:
                 self.done.emit({"empty": True})
                 return
@@ -1281,6 +1283,11 @@ class ResultsExplorer(QMainWindow):
             "Fit the embedding on the selected plate alone. Off = fit on the whole "
             "set so it stays fixed as you change the plate filter. Needs Recompute."
         )
+        self._cl_omit_empty = QCheckBox("omit empty wells")
+        self._cl_omit_empty.setToolTip(
+            "Exclude wells the classifier calls negative/empty (no channel positive) "
+            "so the embedding focuses on cells with signal. Needs Recompute."
+        )
         self._cl_minsize = QSpinBox()
         self._cl_minsize.setRange(2, 500); self._cl_minsize.setValue(15)
         self._cl_minsize.setPrefix("min clust ")
@@ -1289,6 +1296,7 @@ class ResultsExplorer(QMainWindow):
         recompute.clicked.connect(self._cluster_recompute)
         ctrl.addWidget(QLabel("view:")); ctrl.addWidget(self._cl_method)
         ctrl.addWidget(self._cl_all_runs); ctrl.addWidget(self._cl_fit_plate)
+        ctrl.addWidget(self._cl_omit_empty)
         ctrl.addWidget(self._cl_minsize); ctrl.addWidget(recompute)
         ctrl.addStretch()
         lay.addLayout(ctrl)
@@ -1343,14 +1351,21 @@ class ResultsExplorer(QMainWindow):
             self._cl_status.setText("No run selected.")
             return
         fit_plate = plate if self._cl_fit_plate.isChecked() else None
-        want_umap = _cluster.umap_available()
+        umap_err = _cluster.umap_import_error()
+        want_umap = umap_err is None
         scope = "all runs" if all_runs else "current run"
         fitdesc = f"fit on plate {plate}" if fit_plate else f"fit on {scope}"
-        self._cl_status.setText(f"Computing embedding ({scope}; {fitdesc}) …")
+        empty_note = "; empty wells omitted" if self._cl_omit_empty.isChecked() else ""
+        msg = f"Computing embedding ({scope}; {fitdesc}{empty_note}) …"
+        # If UMAP is the chosen view but unavailable, say WHY (the real import error).
+        if self._cl_method.currentData() == "umap" and umap_err is not None:
+            msg = f"UMAP unavailable — {umap_err}. Showing PCA. {msg}"
+        self._cl_status.setText(msg)
         if self._cluster_worker and self._cluster_worker.isRunning():
             self._cluster_worker.wait()
         self._cluster_worker = _ClusterWorker(
-            groups, self._params(), fit_plate, want_umap, self._cl_minsize.value())
+            groups, self._params(), fit_plate, want_umap, self._cl_minsize.value(),
+            self._cl_omit_empty.isChecked())
         self._cluster_worker.done.connect(self._on_cluster_done)
         self._cluster_worker.error.connect(
             lambda m: self._cl_status.setText(f"Cluster error:\n{m}"))
