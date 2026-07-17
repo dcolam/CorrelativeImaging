@@ -68,6 +68,70 @@ def composite_rgb(channel_planes: list, colors: list[str]) -> np.ndarray:
     return (np.clip(out, 0.0, 1.0) * 255).astype(np.uint8)
 
 
+def load_channel_stack(path) -> tuple[np.ndarray, list[str]]:
+    """Read a multi-channel diagnostic TIF written by the batch runner
+    (``_save_multichannel_tif``): axes CYX float, one slice per channel, with the
+    channel names in the ImageJ ``Labels`` metadata. Returns ``(stack, labels)``
+    where ``stack`` is ``(C, Y, X)`` and ``labels`` has one name per channel
+    (falls back to ``ch0, ch1, …`` if the labels are missing/mismatched)."""
+    import tifffile
+
+    arr = tifffile.imread(str(path))
+    if arr.ndim == 2:
+        arr = arr[None]
+    labels = None
+    try:
+        with tifffile.TiffFile(str(path)) as tf:
+            ij = tf.imagej_metadata or {}
+        labels = ij.get("Labels")
+    except Exception:
+        labels = None
+    if not labels or len(labels) != arr.shape[0]:
+        labels = [f"ch{i}" for i in range(arr.shape[0])]
+    return np.asarray(arr), list(labels)
+
+
+def render_channels(
+    planes: list[np.ndarray],
+    colors: list[tuple[float, float, float]],
+    gains: list[float] | None = None,
+    limits: list[tuple[float, float]] | None = None,
+) -> np.ndarray | None:
+    """Composite selected channel planes into an RGB uint8 image for display.
+
+    Like :func:`composite_rgb` but per-channel: each plane is auto-contrast
+    stretched, multiplied by a display ``gain`` (brightness; 1.0 = the plain
+    auto-contrast), tinted by an ``(r,g,b)`` colour in 0–1, and additively
+    combined. Display-only — never touches the values the classifier reads.
+
+    ``limits`` optionally supplies the per-channel ``(lo, hi)`` contrast bounds;
+    pass them precomputed so dragging a gain slider (which only rescales the
+    already-normalised image) doesn't recompute a percentile over the full plane
+    each tick. ``None`` → computed here. ``None`` return if no planes given."""
+    if not planes:
+        return None
+    gains = gains if gains is not None else [1.0] * len(planes)
+    limits = limits if limits is not None else [auto_contrast_limits(p) for p in planes]
+    h, w = planes[0].shape
+    out = np.zeros((h, w, 3), dtype=np.float32)
+    for data, (r, g, b), gain, (lo, hi) in zip(planes, colors, gains, limits):
+        norm = np.clip((data.astype(np.float32) - lo) / max(hi - lo, 1e-9), 0.0, 1.0)
+        norm = np.clip(norm * float(gain), 0.0, 1.0)
+        out[..., 0] += norm * r
+        out[..., 1] += norm * g
+        out[..., 2] += norm * b
+    return (np.clip(out, 0.0, 1.0) * 255).astype(np.uint8)
+
+
+def hex_to_rgb01(hexc: str) -> tuple[float, float, float]:
+    """'#rrggbb' → (r,g,b) floats in 0–1. Falls back to white on a bad string."""
+    try:
+        h = hexc.lstrip("#")
+        return (int(h[0:2], 16) / 255, int(h[2:4], 16) / 255, int(h[4:6], 16) / 255)
+    except Exception:
+        return (1.0, 1.0, 1.0)
+
+
 def save_diagnostic_image(rgb: np.ndarray, path_no_ext: Path, formats: set[str]) -> None:
     """Save an RGB uint8 composite in whichever of {"tiff", "jpg"} formats
     are requested."""

@@ -128,9 +128,32 @@ def find_diagnostic_images(diagnostics_dir: Path | None, well_id: str) -> dict[s
         stem = f.name[len(well_id) + 1:].rsplit(".", 1)[0]  # strip "<well>_" and ext
         if stem.startswith("particles_"):
             continue  # particle label maps aren't display composites
+        if stem.endswith("_channels"):
+            continue  # real per-channel stacks are handled by find_channel_stack
         # Prefer .jpg; only take .tif if no .jpg already recorded for this kind.
         if stem in out and out[stem].suffix.lower() == ".jpg":
             continue
         if f.suffix.lower() in (".jpg", ".jpeg", ".tif", ".tiff"):
             out[stem] = f
     return out
+
+
+def find_channel_stack(diagnostics_dir: Path | None, well_id: str, kind: str) -> Path | None:
+    """The real per-channel multi-channel TIF for one well+kind, if the run wrote
+    it (opt-in ``multichannel_tif``). Named ``<well>_<kind>_channels.tif`` — e.g.
+    for kind ``"whole"`` → ``<well>_whole_channels.tif``. ``None`` if absent."""
+    if diagnostics_dir is None or not diagnostics_dir.is_dir():
+        return None
+    p = diagnostics_dir / f"{well_id}_{kind}_channels.tif"
+    return p if p.is_file() else None
+
+
+def find_bf_projection(diagnostics_dir: Path | None, well_id: str) -> Path | None:
+    """The brightfield z-projection for one well, written by the BF pipeline to
+    ``<plate>/bf_pipeline/projections/<well>_proj.tif`` (a sibling of the
+    diagnostics folder). Present even when multi-channel TIFs are not, so BF can
+    still be viewed. ``None`` if absent."""
+    if diagnostics_dir is None:
+        return None
+    p = diagnostics_dir.parent / "bf_pipeline" / "projections" / f"{well_id}_proj.tif"
+    return p if p.is_file() else None
