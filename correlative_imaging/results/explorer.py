@@ -327,6 +327,311 @@ class _ChannelDisplayDialog(QDialog):
                 for ch in self._names}
 
 
+class _DiagnosticViewer(QWidget):
+    """Reusable diagnostic-image viewer: a *kind* selector (whole / hole crop /
+    background crop), a *view* selector (per-channel / composite jpg|tiff /
+    brightfield), per-channel toggle + brightness controls, and the rendered
+    image. Dropped into BOTH the Plate-tab detail panel and the Clusters-tab
+    preview so a clicked cluster point shows the same rich view as a clicked well.
+
+    Channel display (name + tint) is injected via :meth:`set_channel_display`, so
+    the widget doesn't depend on the run's channel-display config directly."""
+
+    def __init__(self, parent=None, min_height: int = 300):
+        super().__init__(parent)
+        self._channel_name_fn = lambda ch: ch
+        self._channel_hex_fn = lambda ch: "#cccccc"
+        self._well_id: str | None = None
+        self._diag_dir: Path | None = None
+        self._current_imgs: dict[str, Path] = {}
+        self._view_sources: dict[str, Path] = {}
+        self._chan_rows: dict[str, tuple] = {}
+        self._preferred_img_kind = "whole"
+        self._preferred_view = "per-channel"
+        self._stack_cache: dict = {}
+        self._bf_cache: dict = {}
+        self._limits_cache: dict = {}
+        self._build(min_height)
+
+    def _build(self, min_height: int) -> None:
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        box = QGroupBox("Diagnostic image")
+        outer.addWidget(box)
+        il = QVBoxLayout(box)
+        sel_row = QHBoxLayout()
+        self._img_combo = QComboBox()
+        self._img_combo.currentIndexChanged.connect(self._on_img_changed)
+        sel_row.addWidget(self._img_combo, stretch=1)
+        self._view_combo = QComboBox()
+        self._view_combo.setToolTip(
+            "How to view this image: per-channel (raw channels + BF, adjustable), "
+            "or the baked RGB composite (jpg/tiff — carries any ROI outline)."
+        )
+        self._view_combo.currentIndexChanged.connect(self._on_view_changed)
+        sel_row.addWidget(self._view_combo, stretch=1)
+        il.addLayout(sel_row)
+
+        self._chan_ctrl = QWidget()
+        self._chan_ctrl_lay = QVBoxLayout(self._chan_ctrl)
+        self._chan_ctrl_lay.setContentsMargins(0, 0, 0, 0)
+        self._chan_ctrl_lay.setSpacing(1)
+        il.addWidget(self._chan_ctrl)
+        self._diag_hint = QLabel("")
+        self._diag_hint.setStyleSheet("font-size:10px; color:#888;")
+        self._diag_hint.setWordWrap(True)
+        il.addWidget(self._diag_hint)
+        self._img_label = QLabel("(no cell selected)")
+        self._img_label.setAlignment(Qt.AlignCenter)
+        self._img_label.setMinimumHeight(min_height)
+        self._img_label.setStyleSheet("background:#111; color:#888;")
+        il.addWidget(self._img_label, stretch=1)
+
+    def set_channel_display(self, name_fn, hex_fn) -> None:
+        self._channel_name_fn = name_fn
+        self._channel_hex_fn = hex_fn
+
+    def clear(self) -> None:
+        self._well_id = None
+        self._img_combo.blockSignals(True); self._img_combo.clear(); self._img_combo.blockSignals(False)
+        self._view_combo.blockSignals(True); self._view_combo.clear(); self._view_combo.blockSignals(False)
+        self._clear_controls(); self._diag_hint.setText("")
+        self._img_label.setPixmap(QPixmap()); self._img_label.setText("(no cell selected)")
+
+    def show_well(self, diag_dir, well_id: str) -> None:
+        """Load and render the diagnostic image(s) for one well, preserving the
+        user's chosen kind/view across wells."""
+        self._diag_dir = diag_dir
+        self._well_id = well_id
+        self._current_imgs = find_diagnostic_images(diag_dir, well_id)
+        self._stack_cache = {}          # per-well; multichannel stacks are large
+        self._bf_cache = {}
+        self._limits_cache = {}
+        kinds = _ordered_kinds(self._current_imgs.keys())
+        self._img_combo.blockSignals(True)
+        self._img_combo.clear()
+        for kind in kinds:
+            self._img_combo.addItem(kind, kind)
+        target = self._preferred_img_kind if self._preferred_img_kind in kinds else (
+            kinds[0] if kinds else None)
+        idx = self._img_combo.findData(target) if target else -1
+        self._img_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self._img_combo.blockSignals(False)
+        if kinds:
+            self._on_img_changed(self._img_combo.currentIndex())
+        else:
+            self._clear_controls()
+            self._diag_hint.setText("")
+            self._img_label.setPixmap(QPixmap())
+            self._img_label.setText("(no diagnostic image on disk)")
+
+    # ── kind → view → per-channel controls ───────────────────────────
+    def _on_img_changed(self, _idx: int) -> None:
+        kind = self._img_combo.currentData()
+        if kind:
+            self._preferred_img_kind = kind
+        self._rebuild_view_combo(kind)
+
+    def _rebuild_view_combo(self, kind) -> None:
+        self._view_combo.blockSignals(True)
+        self._view_combo.clear()
+        self._view_sources = {}
+        if self._well_id and kind:
+            sources = diagnostic_view_sources(self._diag_dir, self._well_id, kind)
+            if "per-channel" not in sources and self._get_bf(self._well_id) is not None:
+                sources["brightfield"] = None
+            self._view_sources = sources
+            order = ["per-channel", "composite (tiff)", "composite (jpg)", "brightfield"]
+            views = [v for v in order if v in sources]
+            for v in views:
+                self._view_combo.addItem(v, v)
+            target = (self._preferred_view if self._preferred_view in views
+                      else (views[0] if views else None))
+            idx = self._view_combo.findData(target) if target else -1
+            self._view_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self._view_combo.blockSignals(False)
+        if self._view_combo.count():
+            self._on_view_changed(self._view_combo.currentIndex())
+        else:
+            self._clear_controls()
+            self._diag_hint.setText("")
+            self._img_label.setPixmap(QPixmap())
+            self._img_label.setText("(no diagnostic image on disk)")
+
+    def _on_view_changed(self, _idx: int) -> None:
+        view = self._view_combo.currentData()
+        if view:
+            self._preferred_view = view
+        self._rebuild_channel_controls(view)
+        self._render_diag()
+
+    def _get_stack(self, well_id: str, kind: str):
+        key = (well_id, kind)
+        if key not in self._stack_cache:
+            p = find_channel_stack(self._diag_dir, well_id, kind)
+            try:
+                self._stack_cache[key] = load_channel_stack(p) if p else None
+            except Exception:
+                self._stack_cache[key] = None
+        return self._stack_cache[key]
+
+    def _get_bf(self, well_id: str):
+        if well_id not in self._bf_cache:
+            p = find_bf_projection(self._diag_dir, well_id)
+            arr = None
+            if p is not None:
+                try:
+                    import numpy as np
+                    import tifffile
+                    arr = tifffile.imread(str(p))
+                    if arr.ndim == 3:
+                        arr = arr.max(axis=0)
+                    arr = np.asarray(arr, dtype="float32")
+                except Exception:
+                    arr = None
+            self._bf_cache[well_id] = arr
+        return self._bf_cache[well_id]
+
+    def _clear_controls(self) -> None:
+        while self._chan_ctrl_lay.count():
+            item = self._chan_ctrl_lay.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+            elif item.layout() is not None:
+                self._clear_sublayout(item.layout())
+        self._chan_rows = {}
+
+    @staticmethod
+    def _clear_sublayout(layout) -> None:
+        while layout.count():
+            item = layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+            elif item.layout() is not None:
+                _DiagnosticViewer._clear_sublayout(item.layout())
+
+    def _add_channel_row(self, label: str, source: tuple, checked: bool = True) -> None:
+        row = QHBoxLayout(); row.setSpacing(4)
+        name = "BF (brightfield)" if label == "BF" else self._channel_name_fn(label)
+        hexc = "#cccccc" if label == "BF" else self._channel_hex_fn(label)
+        cb = QCheckBox(name); cb.setChecked(checked)
+        cb.setStyleSheet(f"color:{hexc}; font-weight:bold; font-size:11px;")
+        cb.toggled.connect(self._render_diag)
+        sld = QSlider(Qt.Horizontal); sld.setRange(0, 300); sld.setValue(100)
+        sld.setFixedWidth(110)
+        sld.setToolTip("display brightness (gain) — display-only, does not affect classification")
+        sld.valueChanged.connect(self._render_diag)
+        row.addWidget(cb); row.addWidget(sld); row.addStretch()
+        self._chan_ctrl_lay.addLayout(row)
+        self._chan_rows[label] = (cb, sld, source)
+
+    def _rebuild_channel_controls(self, view) -> None:
+        self._clear_controls()
+        if not self._well_id:
+            self._diag_hint.setText("")
+            return
+        well = self._well_id
+        kind = self._img_combo.currentData()
+        if view == "per-channel":
+            stack = self._get_stack(well, kind)
+            if stack is not None:
+                _arr, labels = stack
+                for i, lab in enumerate(labels):
+                    self._add_channel_row(lab, source=("stack", i), checked=(lab != "BF"))
+            self._diag_hint.setText(
+                "Per-channel view: untick channels to view singly; sliders adjust "
+                "display brightness (display-only). The ROI outline is only on the "
+                "composite views."
+            )
+        elif view == "brightfield":
+            self._add_channel_row("BF", source=("bf", None), checked=True)
+            self._diag_hint.setText("Brightfield projection — slider adjusts display brightness.")
+        else:
+            self._diag_hint.setText(
+                "Baked RGB composite (carries the stamped ROI outline, if the run enabled it)."
+            )
+
+    def _render_diag(self, *_args) -> None:
+        if not self._well_id:
+            return
+        well = self._well_id
+        kind = self._img_combo.currentData()
+        view = self._view_combo.currentData()
+        if view == "per-channel":
+            stack = self._get_stack(well, kind)
+            if stack is not None and self._chan_rows:
+                arr, _labels = stack
+                lkey = (well, kind)
+                if lkey not in self._limits_cache:
+                    self._limits_cache[lkey] = [auto_contrast_limits(arr[i])
+                                                for i in range(arr.shape[0])]
+                all_limits = self._limits_cache[lkey]
+                planes, colors, gains, limits = [], [], [], []
+                for lab, (cb, sld, source) in self._chan_rows.items():
+                    if source[0] != "stack" or not cb.isChecked():
+                        continue
+                    planes.append(arr[source[1]])
+                    colors.append((1.0, 1.0, 1.0) if lab == "BF"
+                                  else hex_to_rgb01(self._channel_hex_fn(lab)))
+                    gains.append(sld.value() / 100.0)
+                    limits.append(all_limits[source[1]])
+                rgb = render_channels(planes, colors, gains, limits)
+                if rgb is None:
+                    self._img_label.setPixmap(QPixmap())
+                    self._img_label.setText("(all channels hidden)")
+                    return
+                self._show_rgb(rgb)
+                return
+        if view == "brightfield":
+            bf = self._get_bf(well)
+            row = self._chan_rows.get("BF")
+            gain = (row[1].value() / 100.0) if row else 1.0
+            if bf is not None:
+                self._show_rgb(render_channels([bf], [(1.0, 1.0, 1.0)], [gain]))
+                return
+        path = self._view_sources.get(view)
+        if path is None:
+            self._img_label.setPixmap(QPixmap()); self._img_label.setText("(no image)")
+            return
+        pix = self._load_pixmap(path)
+        if pix is None:
+            self._img_label.setText(f"(could not load {path.name})")
+            return
+        self._img_label.setText("")
+        self._img_label.setPixmap(
+            pix.scaled(self._img_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+
+    def _show_rgb(self, rgb) -> None:
+        import numpy as np
+        rgb = np.ascontiguousarray(rgb.astype("uint8"))
+        h, w = rgb.shape[:2]
+        img = QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888)
+        pix = QPixmap.fromImage(img.copy())
+        self._img_label.setText("")
+        self._img_label.setPixmap(
+            pix.scaled(self._img_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+
+    @staticmethod
+    def _load_pixmap(path: Path):
+        pix = QPixmap(str(path))
+        if not pix.isNull():
+            return pix
+        try:
+            import numpy as np
+            import tifffile
+            arr = tifffile.imread(str(path))
+            if arr.ndim == 2:
+                arr = np.stack([arr] * 3, axis=-1)
+            arr = np.ascontiguousarray(arr[..., :3].astype("uint8"))
+            h, w = arr.shape[:2]
+            img = QImage(arr.data, w, h, 3 * w, QImage.Format_RGB888)
+            return QPixmap.fromImage(img.copy())
+        except Exception:
+            return None
+
+
 class _ClusterConfigDialog(QDialog):
     """Choose which feature families to include and how to standardise them for
     the Clusters tab. Returns ``(families, scaling)`` on accept."""
@@ -614,58 +919,17 @@ class ResultsExplorer(QMainWindow):
         self._set_label_controls_enabled(False)
         pl.addWidget(label_box)
 
-        # Diagnostic image selector + view. When a run wrote real per-channel
-        # TIFs (multichannel_tif), the channel controls below let you view each
-        # channel singly and adjust its display brightness; otherwise the RGB
-        # composite is shown, with brightfield still viewable if its projection
-        # exists.
-        img_box = QGroupBox("Diagnostic image")
-        il = QVBoxLayout(img_box)
-        sel_row = QHBoxLayout()
-        self._img_combo = QComboBox()        # kind: whole / hole crop / background crop
-        self._img_combo.currentIndexChanged.connect(self._on_img_changed)
-        sel_row.addWidget(self._img_combo, stretch=1)
-        self._view_combo = QComboBox()       # per-channel / composite (jpg|tiff) / brightfield
-        self._view_combo.setToolTip(
-            "How to view this image: per-channel (raw channels + BF, adjustable), "
-            "or the baked RGB composite (jpg/tiff — carries any ROI outline)."
-        )
-        self._view_combo.currentIndexChanged.connect(self._on_view_changed)
-        sel_row.addWidget(self._view_combo, stretch=1)
-        il.addLayout(sel_row)
-
-        self._chan_ctrl = QWidget()          # per-channel checkbox + brightness rows
-        self._chan_ctrl_lay = QVBoxLayout(self._chan_ctrl)
-        self._chan_ctrl_lay.setContentsMargins(0, 0, 0, 0)
-        self._chan_ctrl_lay.setSpacing(1)
-        il.addWidget(self._chan_ctrl)
-        self._chan_rows: dict[str, tuple] = {}   # label → (checkbox, slider, source)
-        self._diag_hint = QLabel("")
-        self._diag_hint.setStyleSheet("font-size:10px; color:#888;")
-        self._diag_hint.setWordWrap(True)
-        il.addWidget(self._diag_hint)
-
-        self._img_label = QLabel("(no image)")
-        self._img_label.setAlignment(Qt.AlignCenter)
-        self._img_label.setMinimumHeight(320)
-        self._img_label.setStyleSheet("background:#111; color:#888;")
-        il.addWidget(self._img_label, stretch=1)
-        pl.addWidget(img_box, stretch=1)
+        # Diagnostic image viewer (reusable widget — same one used in the
+        # Clusters-tab preview). Per-channel/composite/brightfield + brightness.
+        self._diag_viewer = _DiagnosticViewer(min_height=320)
+        pl.addWidget(self._diag_viewer, stretch=1)
 
         self._napari_btn = QPushButton("Open raw image + ROI in napari")
         self._napari_btn.setEnabled(False)
         self._napari_btn.clicked.connect(self._on_open_napari)
         pl.addWidget(self._napari_btn)
 
-        self._current_imgs: dict[str, Path] = {}
         self._current_well = None
-        self._preferred_img_kind = "whole"   # persists across well clicks
-        self._preferred_view = "per-channel"  # persists across wells/kinds
-        self._view_sources: dict[str, Path] = {}
-        self._diag_dir: Path | None = None
-        self._stack_cache: dict = {}         # (well, kind) → (arr, labels)
-        self._bf_cache: dict = {}            # well → bf plane | None
-        self._limits_cache: dict = {}        # (well, kind) → per-channel (lo,hi)
         return panel
 
     # ── Folder / run / plate selection ───────────────────────────────
@@ -1020,8 +1284,7 @@ class ResultsExplorer(QMainWindow):
             self._detail_form.removeRow(0)
         if sub.empty:
             self._detail_form.addRow(QLabel("no data for this well"))
-            self._img_combo.clear()
-            self._img_label.setText("(no image)")
+            self._diag_viewer.clear()
             self._napari_btn.setEnabled(False)
             # Critical: drop the label target so a stray Save can't write this
             # (empty) well's UI state onto the previously-selected well.
@@ -1082,246 +1345,14 @@ class ResultsExplorer(QMainWindow):
         # after a Channels… edit repainted the grid).
         self._grid.select(well_id)
 
-        # diagnostic images — preserve the currently-chosen kind across wells
-        # (don't reset to the first image every time a new well is clicked).
+        # diagnostic images — the reusable viewer preserves the chosen kind/view
+        # across wells and shares behaviour with the Clusters-tab preview.
+        self._current_well = (plate, well_id)
         run = self._current_run()
         pr = next((p for p in run.plates if p.plate == plate), None) if run else None
-        self._diag_dir = pr.diagnostics_dir if pr else None
-        self._current_imgs = find_diagnostic_images(self._diag_dir, well_id)
-        self._current_well = (plate, well_id)
-        self._stack_cache = {}          # per-well; multichannel stacks are large
-        self._bf_cache = {}
-        self._limits_cache = {}         # (well,kind) → per-channel (lo,hi), so gain drags are cheap
-        kinds = _ordered_kinds(self._current_imgs.keys())
-        self._img_combo.blockSignals(True)
-        self._img_combo.clear()
-        for kind in kinds:
-            self._img_combo.addItem(kind, kind)
-        # keep the user's previously-selected image kind if this well has it
-        target = self._preferred_img_kind if self._preferred_img_kind in kinds else (
-            kinds[0] if kinds else None
-        )
-        idx = self._img_combo.findData(target) if target else -1
-        self._img_combo.setCurrentIndex(idx if idx >= 0 else 0)
-        self._img_combo.blockSignals(False)
-        if kinds:
-            self._on_img_changed(self._img_combo.currentIndex())
-        else:
-            self._clear_channel_controls()
-            self._diag_hint.setText("")
-            self._img_label.setText("(no diagnostic image on disk)")
+        self._diag_viewer.set_channel_display(self._channel_name, self._channel_hex)
+        self._diag_viewer.show_well(pr.diagnostics_dir if pr else None, well_id)
         self._napari_btn.setEnabled(self._viewer is not None)
-
-    # ── Diagnostic image: kind → view → per-channel controls ─────────
-    def _on_img_changed(self, _idx: int) -> None:
-        """The *kind* (whole / hole-crop / …) changed → rebuild the view menu."""
-        kind = self._img_combo.currentData()
-        if kind:
-            # Remember the choice so clicking another well keeps the same kind.
-            self._preferred_img_kind = kind
-        self._rebuild_view_combo(kind)
-
-    def _rebuild_view_combo(self, kind) -> None:
-        """Populate the view dropdown (per-channel / composite jpg|tiff /
-        brightfield) with whatever this well+kind actually has on disk."""
-        self._view_combo.blockSignals(True)
-        self._view_combo.clear()
-        self._view_sources = {}
-        if self._current_well and kind:
-            _, well = self._current_well
-            sources = diagnostic_view_sources(self._diag_dir, well, kind)
-            # BF-only view when there's no per-channel stack but a BF projection.
-            if "per-channel" not in sources and self._get_bf(well) is not None:
-                sources["brightfield"] = None
-            self._view_sources = sources
-            order = ["per-channel", "composite (tiff)", "composite (jpg)", "brightfield"]
-            views = [v for v in order if v in sources]
-            for v in views:
-                self._view_combo.addItem(v, v)
-            target = (self._preferred_view if self._preferred_view in views
-                      else (views[0] if views else None))
-            idx = self._view_combo.findData(target) if target else -1
-            self._view_combo.setCurrentIndex(idx if idx >= 0 else 0)
-        self._view_combo.blockSignals(False)
-        if self._view_combo.count():
-            self._on_view_changed(self._view_combo.currentIndex())
-        else:
-            self._clear_channel_controls()
-            self._diag_hint.setText("")
-            self._img_label.setPixmap(QPixmap())
-            self._img_label.setText("(no diagnostic image on disk)")
-
-    def _on_view_changed(self, _idx: int) -> None:
-        view = self._view_combo.currentData()
-        if view:
-            self._preferred_view = view
-        self._rebuild_channel_controls(view)
-        self._render_diag()
-
-    def _get_stack(self, well_id: str, kind: str):
-        """Cached (arr CYX, labels) for this well+kind, or None."""
-        key = (well_id, kind)
-        if key not in self._stack_cache:
-            p = find_channel_stack(self._diag_dir, well_id, kind)
-            try:
-                self._stack_cache[key] = load_channel_stack(p) if p else None
-            except Exception:
-                self._stack_cache[key] = None
-        return self._stack_cache[key]
-
-    def _get_bf(self, well_id: str):
-        """Cached brightfield projection plane (2-D) for this well, or None."""
-        if well_id not in self._bf_cache:
-            p = find_bf_projection(self._diag_dir, well_id)
-            arr = None
-            if p is not None:
-                try:
-                    import numpy as np
-                    import tifffile
-                    arr = tifffile.imread(str(p))
-                    if arr.ndim == 3:
-                        arr = arr.max(axis=0)
-                    arr = np.asarray(arr, dtype="float32")
-                except Exception:
-                    arr = None
-            self._bf_cache[well_id] = arr
-        return self._bf_cache[well_id]
-
-    def _clear_channel_controls(self) -> None:
-        self._clear_layout(self._chan_ctrl_lay)
-        self._chan_rows = {}
-
-    def _add_channel_row(self, label: str, source: tuple, checked: bool = True) -> None:
-        row = QHBoxLayout(); row.setSpacing(4)
-        name = "BF (brightfield)" if label == "BF" else self._channel_name(label)
-        hexc = "#cccccc" if label == "BF" else self._channel_hex(label)
-        cb = QCheckBox(name); cb.setChecked(checked)
-        cb.setStyleSheet(f"color:{hexc}; font-weight:bold; font-size:11px;")
-        cb.toggled.connect(self._render_diag)
-        sld = QSlider(Qt.Horizontal); sld.setRange(0, 300); sld.setValue(100)
-        sld.setFixedWidth(110)
-        sld.setToolTip("display brightness (gain) — display-only, does not affect classification")
-        sld.valueChanged.connect(self._render_diag)
-        row.addWidget(cb); row.addWidget(sld); row.addStretch()
-        self._chan_ctrl_lay.addLayout(row)
-        self._chan_rows[label] = (cb, sld, source)
-
-    def _rebuild_channel_controls(self, view) -> None:
-        """Build the controls for the selected *view*: per-channel toggles+sliders
-        (stack), a single BF slider (brightfield), or none (composite)."""
-        self._clear_channel_controls()
-        if not self._current_well:
-            self._diag_hint.setText("")
-            return
-        _, well = self._current_well
-        kind = self._img_combo.currentData()
-        if view == "per-channel":
-            stack = self._get_stack(well, kind)
-            if stack is not None:
-                _arr, labels = stack
-                for i, lab in enumerate(labels):
-                    # FL channels on by default; BF off so its white plane doesn't
-                    # veil the FL colours the user opened the view to see.
-                    self._add_channel_row(lab, source=("stack", i), checked=(lab != "BF"))
-            self._diag_hint.setText(
-                "Per-channel view: untick channels to view singly; sliders adjust "
-                "display brightness (display-only). The ROI outline is only drawn on "
-                "the composite views."
-            )
-        elif view == "brightfield":
-            self._add_channel_row("BF", source=("bf", None), checked=True)
-            self._diag_hint.setText("Brightfield projection — slider adjusts display brightness.")
-        else:
-            self._diag_hint.setText(
-                "Baked RGB composite (carries the stamped ROI outline, if the run enabled it)."
-            )
-
-    def _render_diag(self, *_args) -> None:
-        if not self._current_well:
-            return
-        _, well = self._current_well
-        kind = self._img_combo.currentData()
-        view = self._view_combo.currentData()
-
-        # 1) per-channel stack → composite the enabled channels.
-        if view == "per-channel":
-            stack = self._get_stack(well, kind)
-            if stack is not None and self._chan_rows:
-                arr, _labels = stack
-                lkey = (well, kind)
-                if lkey not in self._limits_cache:
-                    self._limits_cache[lkey] = [auto_contrast_limits(arr[i])
-                                                for i in range(arr.shape[0])]
-                all_limits = self._limits_cache[lkey]
-                planes, colors, gains, limits = [], [], [], []
-                for lab, (cb, sld, source) in self._chan_rows.items():
-                    if source[0] != "stack" or not cb.isChecked():
-                        continue
-                    planes.append(arr[source[1]])
-                    colors.append((1.0, 1.0, 1.0) if lab == "BF"
-                                  else hex_to_rgb01(self._channel_hex(lab)))
-                    gains.append(sld.value() / 100.0)
-                    limits.append(all_limits[source[1]])
-                rgb = render_channels(planes, colors, gains, limits)
-                if rgb is None:
-                    self._img_label.setPixmap(QPixmap())
-                    self._img_label.setText("(all channels hidden)")
-                    return
-                self._show_rgb(rgb)
-                return
-
-        # 2) brightfield projection (single adjustable gray channel).
-        if view == "brightfield":
-            bf = self._get_bf(well)
-            row = self._chan_rows.get("BF")
-            gain = (row[1].value() / 100.0) if row else 1.0
-            if bf is not None:
-                self._show_rgb(render_channels([bf], [(1.0, 1.0, 1.0)], [gain]))
-                return
-
-        # 3) baked RGB composite (jpg / tiff).
-        path = self._view_sources.get(view)
-        if path is None:
-            self._img_label.setPixmap(QPixmap()); self._img_label.setText("(no image)")
-            return
-        pix = self._load_pixmap(path)
-        if pix is None:
-            self._img_label.setText(f"(could not load {path.name})")
-            return
-        self._img_label.setText("")
-        self._img_label.setPixmap(
-            pix.scaled(self._img_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        )
-
-    def _show_rgb(self, rgb) -> None:
-        import numpy as np
-        rgb = np.ascontiguousarray(rgb.astype("uint8"))
-        h, w = rgb.shape[:2]
-        img = QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888)
-        pix = QPixmap.fromImage(img.copy())
-        self._img_label.setText("")
-        self._img_label.setPixmap(
-            pix.scaled(self._img_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        )
-
-    @staticmethod
-    def _load_pixmap(path: Path):
-        # jpg loads directly; tif needs a manual QImage via tifffile.
-        pix = QPixmap(str(path))
-        if not pix.isNull():
-            return pix
-        try:
-            import numpy as np
-            import tifffile
-            arr = tifffile.imread(str(path))
-            if arr.ndim == 2:
-                arr = np.stack([arr] * 3, axis=-1)
-            arr = np.ascontiguousarray(arr[..., :3].astype("uint8"))
-            h, w = arr.shape[:2]
-            img = QImage(arr.data, w, h, 3 * w, QImage.Format_RGB888)
-            return QPixmap.fromImage(img.copy())
-        except Exception:
-            return None
 
     # ── Clusters tab: feature-space embedding + unbiased clustering ───
     def _build_clusters_tab(self) -> QWidget:
@@ -1427,11 +1458,8 @@ class ResultsExplorer(QMainWindow):
         self._cl_prev_title.setWordWrap(True)
         self._cl_prev_title.setStyleSheet("font-weight:bold; font-size:12px;")
         pv.addWidget(self._cl_prev_title)
-        self._cl_prev_img = QLabel("(no cell selected)")
-        self._cl_prev_img.setAlignment(Qt.AlignCenter)
-        self._cl_prev_img.setMinimumSize(260, 260)
-        self._cl_prev_img.setStyleSheet("background:#111; color:#888;")
-        pv.addWidget(self._cl_prev_img, stretch=1)
+        self._cl_diag_viewer = _DiagnosticViewer(min_height=260)
+        pv.addWidget(self._cl_diag_viewer, stretch=1)
         split.addWidget(prev)
         split.setStretchFactor(0, 1); split.setStretchFactor(1, 0)
         split.setSizes([640, 340])
@@ -1685,19 +1713,10 @@ class ResultsExplorer(QMainWindow):
     def _cluster_show_preview(self, run_tag: str, plate: str, well_id: str) -> None:
         self._cl_prev_title.setText(f"{plate} — well {well_id}\n({run_tag})")
         diag = self._diag_dir_for(run_tag, plate)
-        imgs = find_diagnostic_images(diag, well_id)
-        path = imgs.get("roi_hole_crop") or imgs.get("whole") or next(iter(imgs.values()), None)
-        if path is None:
-            self._cl_prev_img.setPixmap(QPixmap())
-            self._cl_prev_img.setText("(no diagnostic image on disk)")
-            return
-        pix = self._load_pixmap(path)
-        if pix is None:
-            self._cl_prev_img.setText(f"(could not load {path.name})")
-            return
-        self._cl_prev_img.setText("")
-        self._cl_prev_img.setPixmap(
-            pix.scaled(self._cl_prev_img.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        # Same rich viewer as the Plate tab: kind/view selectors, per-channel
+        # toggles + brightness, jpg/tiff, BF.
+        self._cl_diag_viewer.set_channel_display(self._channel_name, self._channel_hex)
+        self._cl_diag_viewer.show_well(diag, well_id)
 
     def _on_open_napari(self) -> None:
         if self._viewer is None or self._current_well is None or self._table is None:
