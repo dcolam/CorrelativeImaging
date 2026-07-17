@@ -43,6 +43,11 @@ ml = [
     # LDA now, Random Forest later. Optional — the rule-based classifier and the
     # rest of the Explorer work without it; the LDA code errors clearly if absent.
     "scikit-learn>=1.3",
+    # Feature-space dimensionality reduction + clustering (Clusters tab). PCA and
+    # HDBSCAN come from scikit-learn; UMAP is optional on top (the tab degrades to
+    # PCA-only if it is absent). matplotlib powers the interactive scatter.
+    "umap-learn>=0.5",
+    "matplotlib>=3.8",
 ]
 test = [
     "pytest>=7.0",

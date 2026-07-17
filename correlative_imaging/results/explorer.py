@@ -36,7 +36,9 @@ from qtpy.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSlider,
+    QSpinBox,
     QSplitter,
+    QTabWidget,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -48,6 +50,7 @@ from ..diagnostics import (
     load_channel_stack,
     render_channels,
 )
+from . import cluster as _cluster
 from . import lda as _lda
 from .analysis import RunTable, load_run
 from .classify import ClassifierParams, classify_wells
@@ -107,6 +110,56 @@ class _LoadWorker(QThread):
     def run(self) -> None:
         try:
             self.loaded.emit(load_run(self._run))
+        except Exception:
+            import traceback
+            self.error.emit(traceback.format_exc())
+
+
+class _ClusterWorker(QThread):
+    """Compute the feature matrix + PCA/UMAP embeddings + HDBSCAN labels off the
+    UI thread (UMAP on thousands of cells takes seconds). Loads whatever runs are
+    requested itself so the GUI stays responsive."""
+    done = Signal(object)     # dict of results
+    error = Signal(str)
+
+    def __init__(self, run_groups, params, fit_plate, want_umap, min_cluster_size):
+        super().__init__()
+        self._run_groups = run_groups
+        self._params = params
+        self._fit_plate = fit_plate
+        self._want_umap = want_umap
+        self._min_cluster_size = min_cluster_size
+
+    def run(self) -> None:
+        try:
+            import numpy as np
+            tables = {}
+            for rg in self._run_groups:
+                try:
+                    tables[rg.run_tag] = load_run(rg)
+                except Exception:
+                    continue
+            fm = _cluster.build_feature_matrix(tables, self._params)
+            if fm is None or len(fm) < 3:
+                self.done.emit({"empty": True})
+                return
+            if self._fit_plate is not None:
+                mask = (fm.meta["plate"] == self._fit_plate).to_numpy()
+            else:
+                mask = np.ones(len(fm), dtype=bool)
+            if mask.sum() < 3:
+                self.done.emit({"empty": True})
+                return
+            Xf = fm.X[mask]
+            meta_f = fm.meta[mask].reset_index(drop=True)
+            coords = {"pca": _cluster.embed(Xf, "pca")}
+            if self._want_umap:
+                coords["umap"] = _cluster.embed(Xf, "umap")
+            labels = _cluster.cluster_labels(Xf, self._min_cluster_size)
+            self.done.emit({
+                "empty": False, "meta": meta_f, "coords": coords,
+                "labels": labels, "channels": fm.channels, "n_total": len(fm),
+            })
         except Exception:
             import traceback
             self.error.emit(traceback.format_exc())
@@ -278,6 +331,9 @@ class ResultsExplorer(QMainWindow):
         self._labels: LabelStore | None = None  # ground-truth store for this folder
         self._chan_display: dict[str, dict] = {}  # {channel: {display_name, color_hex}}
         self._load_worker: _LoadWorker | None = None
+        # Clusters tab state
+        self._cluster_worker: _ClusterWorker | None = None
+        self._cluster_result: dict | None = None   # last worker payload
         self._build()
 
     def _channel_hex(self, channel: str) -> str:
@@ -317,6 +373,13 @@ class ResultsExplorer(QMainWindow):
         tl.addRow(self._status_lbl)
         outer.addWidget(top)
 
+        # Folder/run/plate selectors are shared above; the rest lives in tabs:
+        # "Plate" (grid + detail) and "Clusters" (feature-space embedding).
+        self._tabs = QTabWidget()
+        outer.addWidget(self._tabs, stretch=1)
+        plate_tab = QWidget()
+        ptl = QVBoxLayout(plate_tab)
+
         # Legend — rebuilt per run from the channel-display config (a swatch per
         # channel), plus the fixed states. Gold border = hand-labelled. A
         # "Channels…" button opens the per-run display editor.
@@ -329,7 +392,7 @@ class ResultsExplorer(QMainWindow):
         self._channels_btn.clicked.connect(self._edit_channels)
         self._channels_btn.setEnabled(False)
         legend_row.addWidget(self._channels_btn)
-        outer.addLayout(legend_row)
+        ptl.addLayout(legend_row)
         self._rebuild_legend()
 
         # Classification controls (holistic, multi-label, tunable)
@@ -382,7 +445,7 @@ class ResultsExplorer(QMainWindow):
         self._use_lda.toggled.connect(self._toggle_call_source)
         cl.addWidget(self._use_lda)
         cl.addStretch()
-        outer.addWidget(cls_box)
+        ptl.addWidget(cls_box)
 
         # Main split: plate grid | well detail — each in its own scroll area so a
         # small window scrolls instead of clipping.
@@ -402,7 +465,10 @@ class ResultsExplorer(QMainWindow):
         split.setStretchFactor(0, 0)     # plate keeps its size
         split.setStretchFactor(1, 1)     # detail takes the extra width
         split.setSizes([520, 680])
-        outer.addWidget(split, stretch=1)
+        ptl.addWidget(split, stretch=1)
+
+        self._tabs.addTab(plate_tab, "Plate")
+        self._tabs.addTab(self._build_clusters_tab(), "Clusters")
 
     def _mk_weight(self, label: str, default: float):
         spin = QDoubleSpinBox()
@@ -633,6 +699,9 @@ class ResultsExplorer(QMainWindow):
                 chans = [c for c in (r.get("pos_channels") or "").split(",") if c]
                 well_hex[r["well_id"]] = _blend_hex([self._channel_hex(c) for c in chans])
         self._grid.set_colors(well_hex, labelled=self._labelled_wells(plate))
+        # keep the cluster scatter's plate filter in sync (redraw only, no refit)
+        if getattr(self, "_cluster_result", None) is not None:
+            self._cluster_draw()
 
     def _labelled_wells(self, plate: str) -> set[str]:
         """Well ids on *plate* that carry a hand label in the current run."""
@@ -1191,6 +1260,200 @@ class ResultsExplorer(QMainWindow):
             return QPixmap.fromImage(img.copy())
         except Exception:
             return None
+
+    # ── Clusters tab: feature-space embedding + unbiased clustering ───
+    def _build_clusters_tab(self) -> QWidget:
+        tab = QWidget()
+        lay = QVBoxLayout(tab)
+
+        ctrl = QHBoxLayout()
+        self._cl_method = QComboBox()
+        self._cl_method.addItem("PCA", "pca")
+        self._cl_method.addItem("UMAP", "umap")
+        self._cl_method.currentIndexChanged.connect(self._cluster_draw)
+        self._cl_all_runs = QCheckBox("all runs")
+        self._cl_all_runs.setToolTip(
+            "Include every run in the folder (unchecked = only the selected plate). "
+            "Changing this needs Recompute."
+        )
+        self._cl_fit_plate = QCheckBox("reduce on this plate only")
+        self._cl_fit_plate.setToolTip(
+            "Fit the embedding on the selected plate alone. Off = fit on the whole "
+            "set so it stays fixed as you change the plate filter. Needs Recompute."
+        )
+        self._cl_minsize = QSpinBox()
+        self._cl_minsize.setRange(2, 500); self._cl_minsize.setValue(15)
+        self._cl_minsize.setPrefix("min clust ")
+        self._cl_minsize.setToolTip("HDBSCAN minimum cluster size (unbiased clustering).")
+        recompute = QPushButton("Recompute")
+        recompute.clicked.connect(self._cluster_recompute)
+        ctrl.addWidget(QLabel("view:")); ctrl.addWidget(self._cl_method)
+        ctrl.addWidget(self._cl_all_runs); ctrl.addWidget(self._cl_fit_plate)
+        ctrl.addWidget(self._cl_minsize); ctrl.addWidget(recompute)
+        ctrl.addStretch()
+        lay.addLayout(ctrl)
+
+        self._cl_status = QLabel("Load a run, then press Recompute to embed the cells.")
+        self._cl_status.setStyleSheet("font-size:11px; color:#aaa;")
+        self._cl_status.setWordWrap(True)
+        lay.addWidget(self._cl_status)
+
+        split = QSplitter(Qt.Horizontal)
+        self._cl_canvas = None
+        try:
+            import matplotlib
+            matplotlib.use("qtagg")
+            from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+            from matplotlib.figure import Figure
+            self._cl_fig = Figure(figsize=(5, 5), layout="tight")
+            self._cl_ax = self._cl_fig.add_subplot(111)
+            self._cl_canvas = FigureCanvasQTAgg(self._cl_fig)
+            self._cl_canvas.mpl_connect("pick_event", self._on_cluster_pick)
+            split.addWidget(self._cl_canvas)
+        except Exception as exc:
+            split.addWidget(QLabel(f"matplotlib unavailable — clustering plot disabled:\n{exc}"))
+
+        prev = QWidget(); pv = QVBoxLayout(prev)
+        self._cl_prev_title = QLabel("Click a point to see its cell.")
+        self._cl_prev_title.setWordWrap(True)
+        self._cl_prev_title.setStyleSheet("font-weight:bold; font-size:12px;")
+        pv.addWidget(self._cl_prev_title)
+        self._cl_prev_img = QLabel("(no cell selected)")
+        self._cl_prev_img.setAlignment(Qt.AlignCenter)
+        self._cl_prev_img.setMinimumSize(260, 260)
+        self._cl_prev_img.setStyleSheet("background:#111; color:#888;")
+        pv.addWidget(self._cl_prev_img, stretch=1)
+        split.addWidget(prev)
+        split.setStretchFactor(0, 1); split.setStretchFactor(1, 0)
+        split.setSizes([640, 340])
+        lay.addWidget(split, stretch=1)
+
+        self._cl_disp_idx = None      # scatter-point index → meta row index
+        return tab
+
+    def _cluster_recompute(self) -> None:
+        if not self._runs:
+            self._cl_status.setText("No runs loaded.")
+            return
+        run = self._current_run()
+        plate = self._plate_combo.currentData()
+        all_runs = self._cl_all_runs.isChecked()
+        groups = list(self._runs) if all_runs else ([run] if run else [])
+        if not groups:
+            self._cl_status.setText("No run selected.")
+            return
+        fit_plate = plate if self._cl_fit_plate.isChecked() else None
+        want_umap = _cluster.umap_available()
+        scope = "all runs" if all_runs else "current run"
+        fitdesc = f"fit on plate {plate}" if fit_plate else f"fit on {scope}"
+        self._cl_status.setText(f"Computing embedding ({scope}; {fitdesc}) …")
+        if self._cluster_worker and self._cluster_worker.isRunning():
+            self._cluster_worker.wait()
+        self._cluster_worker = _ClusterWorker(
+            groups, self._params(), fit_plate, want_umap, self._cl_minsize.value())
+        self._cluster_worker.done.connect(self._on_cluster_done)
+        self._cluster_worker.error.connect(
+            lambda m: self._cl_status.setText(f"Cluster error:\n{m}"))
+        self._cluster_worker.start()
+
+    def _on_cluster_done(self, result: dict) -> None:
+        if result.get("empty"):
+            self._cluster_result = None
+            self._cl_status.setText("Not enough cells with holes to embed (need ≥3).")
+            self._cluster_draw()
+            return
+        import numpy as np
+        self._cluster_result = result
+        labs = result["labels"]
+        n_clusters = len({int(x) for x in labs} - {-1})
+        n_noise = int((labs == -1).sum())
+        umap_note = "" if "umap" in result["coords"] else " (UMAP unavailable — PCA only)"
+        self._cl_status.setText(
+            f"{len(result['meta'])} cells embedded of {result['n_total']} total — "
+            f"{n_clusters} clusters, {n_noise} unclustered. Features: per-channel "
+            f"score+occupancy, z-scored per run{umap_note}. "
+            "Note: clustering across runs can reflect batch as well as biology."
+        )
+        self._cluster_draw()
+
+    def _cluster_draw(self, *_args) -> None:
+        if self._cl_canvas is None:
+            return
+        import numpy as np
+        import matplotlib
+        ax = self._cl_ax
+        ax.clear()
+        res = self._cluster_result
+        if not res:
+            ax.text(0.5, 0.5, "press Recompute", ha="center", va="center",
+                    transform=ax.transAxes, color="#888")
+            ax.set_xticks([]); ax.set_yticks([])
+            self._cl_canvas.draw_idle()
+            return
+        method = self._cl_method.currentData()
+        coords = res["coords"].get(method)
+        if coords is None:
+            ax.text(0.5, 0.5, f"{method.upper()} not computed\n(install umap-learn, then Recompute)",
+                    ha="center", va="center", transform=ax.transAxes, color="#888")
+            ax.set_xticks([]); ax.set_yticks([])
+            self._cl_canvas.draw_idle()
+            return
+        meta = res["meta"]; labels = res["labels"]
+        plate = self._plate_combo.currentData()
+        if self._cl_all_runs.isChecked():
+            disp = np.ones(len(meta), dtype=bool)
+        else:
+            disp = (meta["plate"] == plate).to_numpy()
+        self._cl_disp_idx = np.where(disp)[0]
+        if disp.sum() == 0:
+            ax.text(0.5, 0.5, "no cells for this plate", ha="center", va="center",
+                    transform=ax.transAxes, color="#888")
+            ax.set_xticks([]); ax.set_yticks([])
+            self._cl_canvas.draw_idle()
+            return
+        cmap = matplotlib.colormaps["tab10"]
+        labs = labels[disp]
+        colors = ["#666666" if int(l) == -1 else cmap(int(l) % 10) for l in labs]
+        ax.scatter(coords[disp, 0], coords[disp, 1], c=colors, s=18,
+                   picker=5, linewidths=0)
+        ax.set_title(f"{method.upper()} — {int(disp.sum())} cells, coloured by cluster")
+        ax.set_xticks([]); ax.set_yticks([])
+        self._cl_canvas.draw_idle()
+
+    def _on_cluster_pick(self, event) -> None:
+        if self._cluster_result is None or self._cl_disp_idx is None:
+            return
+        ind = list(getattr(event, "ind", []))
+        if not ind:
+            return
+        meta_idx = int(self._cl_disp_idx[int(ind[0])])
+        row = self._cluster_result["meta"].iloc[meta_idx]
+        self._cluster_show_preview(row["run_tag"], row["plate"], row["well_id"])
+
+    def _diag_dir_for(self, run_tag: str, plate: str):
+        for rg in self._runs:
+            if rg.run_tag == run_tag:
+                for pr in rg.plates:
+                    if pr.plate == plate:
+                        return pr.diagnostics_dir
+        return None
+
+    def _cluster_show_preview(self, run_tag: str, plate: str, well_id: str) -> None:
+        self._cl_prev_title.setText(f"{plate} — well {well_id}\n({run_tag})")
+        diag = self._diag_dir_for(run_tag, plate)
+        imgs = find_diagnostic_images(diag, well_id)
+        path = imgs.get("roi_hole_crop") or imgs.get("whole") or next(iter(imgs.values()), None)
+        if path is None:
+            self._cl_prev_img.setPixmap(QPixmap())
+            self._cl_prev_img.setText("(no diagnostic image on disk)")
+            return
+        pix = self._load_pixmap(path)
+        if pix is None:
+            self._cl_prev_img.setText(f"(could not load {path.name})")
+            return
+        self._cl_prev_img.setText("")
+        self._cl_prev_img.setPixmap(
+            pix.scaled(self._cl_prev_img.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
     def _on_open_napari(self) -> None:
         if self._viewer is None or self._current_well is None or self._table is None:
