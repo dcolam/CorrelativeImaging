@@ -123,7 +123,8 @@ class _ClusterWorker(QThread):
     error = Signal(str)
 
     def __init__(self, run_groups, params, fit_plate, want_umap, min_cluster_size,
-                 omit_empty=False):
+                 omit_empty=False, families=("score",), scaling="run_plate",
+                 cluster_method="hdbscan", n_clusters=5):
         super().__init__()
         self._run_groups = run_groups
         self._params = params
@@ -131,6 +132,10 @@ class _ClusterWorker(QThread):
         self._want_umap = want_umap
         self._min_cluster_size = min_cluster_size
         self._omit_empty = omit_empty
+        self._families = families
+        self._scaling = scaling
+        self._cluster_method = cluster_method
+        self._n_clusters = n_clusters
 
     def run(self) -> None:
         try:
@@ -141,7 +146,8 @@ class _ClusterWorker(QThread):
                     tables[rg.run_tag] = load_run(rg)
                 except Exception:
                     continue
-            fm = _cluster.build_feature_matrix(tables, self._params, self._omit_empty)
+            fm = _cluster.build_feature_matrix(
+                tables, self._params, self._families, self._scaling, self._omit_empty)
             if fm is None or len(fm) < 3:
                 self.done.emit({"empty": True})
                 return
@@ -157,10 +163,12 @@ class _ClusterWorker(QThread):
             coords = {"pca": _cluster.embed(Xf, "pca")}
             if self._want_umap:
                 coords["umap"] = _cluster.embed(Xf, "umap")
-            labels = _cluster.cluster_labels(Xf, self._min_cluster_size)
+            labels = _cluster.cluster_labels(
+                Xf, self._cluster_method, self._min_cluster_size, self._n_clusters)
             self.done.emit({
                 "empty": False, "meta": meta_f, "coords": coords,
                 "labels": labels, "channels": fm.channels, "n_total": len(fm),
+                "X": Xf, "feature_names": fm.feature_names,
             })
         except Exception:
             import traceback
@@ -319,6 +327,56 @@ class _ChannelDisplayDialog(QDialog):
                 for ch in self._names}
 
 
+class _ClusterConfigDialog(QDialog):
+    """Choose which feature families to include and how to standardise them for
+    the Clusters tab. Returns ``(families, scaling)`` on accept."""
+
+    _SCALING_LABELS = [
+        ("per run × plate", "run_plate"),
+        ("per run", "run"),
+        ("global (no batch grouping)", "global"),
+        ("per plate  — ⚠ erases DIV-timepoint biology", "plate"),
+    ]
+
+    def __init__(self, families, scaling, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Cluster features & scaling")
+        lay = QVBoxLayout(self)
+
+        lay.addWidget(QLabel("Feature families to include:"))
+        self._checks: dict[str, QCheckBox] = {}
+        for fam in _cluster.FEATURE_FAMILIES:
+            cb = QCheckBox(fam)
+            cb.setChecked(fam in families)
+            self._checks[fam] = cb
+            lay.addWidget(cb)
+
+        lay.addWidget(QLabel("Standardise (z-score each feature within):"))
+        self._scaling = QComboBox()
+        for label, key in self._SCALING_LABELS:
+            self._scaling.addItem(label, key)
+        idx = self._scaling.findData(scaling)
+        self._scaling.setCurrentIndex(idx if idx >= 0 else 0)
+        lay.addWidget(self._scaling)
+
+        note = QLabel(
+            "Per-column standardisation always happens (so no feature dominates by "
+            "raw scale); the grouping only sets global-vs-within-batch. Per-run is "
+            "the safe default; per-plate removes plate/DIV-timepoint differences."
+        )
+        note.setWordWrap(True); note.setStyleSheet("font-size:10px; color:#888;")
+        lay.addWidget(note)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        lay.addWidget(buttons)
+
+    def result_config(self):
+        fams = [f for f, cb in self._checks.items() if cb.isChecked()]
+        return (fams or list(_cluster.DEFAULT_FAMILIES)), self._scaling.currentData()
+
+
 class ResultsExplorer(QMainWindow):
     def __init__(self, napari_viewer=None, parent=None):
         super().__init__(parent)
@@ -336,6 +394,8 @@ class ResultsExplorer(QMainWindow):
         # Clusters tab state
         self._cluster_worker: _ClusterWorker | None = None
         self._cluster_result: dict | None = None   # last worker payload
+        self._cl_families = list(_cluster.DEFAULT_FAMILIES)   # feature families (pop-up)
+        self._cl_scaling = _cluster.DEFAULT_SCALING           # standardisation grouping
         self._build()
 
     def _channel_hex(self, channel: str) -> str:
@@ -1268,38 +1328,79 @@ class ResultsExplorer(QMainWindow):
         tab = QWidget()
         lay = QVBoxLayout(tab)
 
-        ctrl = QHBoxLayout()
+        # Row 1: view + colour-by + scope toggles
+        row1 = QHBoxLayout()
         self._cl_method = QComboBox()
         self._cl_method.addItem("PCA", "pca")
         self._cl_method.addItem("UMAP", "umap")
+        self._cl_method.addItem("LDA (supervised)", "lda")
+        self._cl_method.setToolTip(
+            "PCA/UMAP are unsupervised; LDA is a supervised LD1-vs-LD2 projection "
+            "fit on your hand labels (needs ≥3 labelled classes)."
+        )
         self._cl_method.currentIndexChanged.connect(self._cluster_draw)
+        self._cl_colorby = QComboBox()
+        for label, key in (("cluster", "cluster"), ("classifier call", "call"),
+                           ("hand label", "label"), ("run", "run"), ("plate", "plate"),
+                           ("feature…", "feature")):
+            self._cl_colorby.addItem(f"colour: {label}", key)
+        self._cl_colorby.setToolTip(
+            "Colour points by posthoc cluster, the classifier's call, your hand "
+            "labels, run or plate (batch check), or a chosen feature."
+        )
+        self._cl_colorby.currentIndexChanged.connect(self._on_colorby_changed)
+        self._cl_feature = QComboBox()
+        self._cl_feature.setToolTip("Feature to colour by (continuous).")
+        self._cl_feature.setEnabled(False)
+        self._cl_feature.currentIndexChanged.connect(self._cluster_draw)
         self._cl_all_runs = QCheckBox("all runs")
         self._cl_all_runs.setToolTip(
             "Include every run in the folder (unchecked = only the selected plate). "
-            "Changing this needs Recompute."
-        )
+            "Changing this needs Recompute.")
         self._cl_fit_plate = QCheckBox("reduce on this plate only")
         self._cl_fit_plate.setToolTip(
             "Fit the embedding on the selected plate alone. Off = fit on the whole "
-            "set so it stays fixed as you change the plate filter. Needs Recompute."
-        )
+            "set so it stays fixed as you change the plate filter. Needs Recompute.")
         self._cl_omit_empty = QCheckBox("omit empty wells")
         self._cl_omit_empty.setToolTip(
-            "Exclude wells the classifier calls negative/empty (no channel positive) "
-            "so the embedding focuses on cells with signal. Needs Recompute."
-        )
+            "Exclude wells the classifier calls negative/empty. Needs Recompute.")
+        row1.addWidget(QLabel("view:")); row1.addWidget(self._cl_method)
+        row1.addWidget(self._cl_colorby); row1.addWidget(self._cl_feature)
+        row1.addWidget(self._cl_all_runs); row1.addWidget(self._cl_fit_plate)
+        row1.addWidget(self._cl_omit_empty)
+        row1.addStretch()
+        lay.addLayout(row1)
+
+        # Row 2: features/scaling + clustering + recompute/export
+        row2 = QHBoxLayout()
+        cfg_btn = QPushButton("Features / scaling …")
+        cfg_btn.setToolTip("Choose which feature families to include and how to standardise them.")
+        cfg_btn.clicked.connect(self._edit_cluster_config)
+        self._cl_algo = QComboBox()
+        for label, key in (("HDBSCAN", "hdbscan"), ("KMeans", "kmeans"),
+                           ("Agglomerative", "agglomerative")):
+            self._cl_algo.addItem(label, key)
+        self._cl_algo.setToolTip("Posthoc clustering of the FEATURE space (not the 2-D coords).")
+        self._cl_algo.currentIndexChanged.connect(self._on_algo_changed)
+        self._cl_k = QSpinBox()
+        self._cl_k.setRange(2, 50); self._cl_k.setValue(5); self._cl_k.setPrefix("k ")
+        self._cl_k.setToolTip("Number of clusters (KMeans / Agglomerative).")
+        self._cl_k.setEnabled(False)
         self._cl_minsize = QSpinBox()
         self._cl_minsize.setRange(2, 500); self._cl_minsize.setValue(15)
         self._cl_minsize.setPrefix("min clust ")
-        self._cl_minsize.setToolTip("HDBSCAN minimum cluster size (unbiased clustering).")
+        self._cl_minsize.setToolTip("HDBSCAN minimum cluster size.")
         recompute = QPushButton("Recompute")
         recompute.clicked.connect(self._cluster_recompute)
-        ctrl.addWidget(QLabel("view:")); ctrl.addWidget(self._cl_method)
-        ctrl.addWidget(self._cl_all_runs); ctrl.addWidget(self._cl_fit_plate)
-        ctrl.addWidget(self._cl_omit_empty)
-        ctrl.addWidget(self._cl_minsize); ctrl.addWidget(recompute)
-        ctrl.addStretch()
-        lay.addLayout(ctrl)
+        self._cl_export = QPushButton("Export CSV")
+        self._cl_export.setToolTip("Save coords + cluster + label + features to CSV.")
+        self._cl_export.clicked.connect(self._export_clusters)
+        row2.addWidget(cfg_btn)
+        row2.addWidget(QLabel("cluster:")); row2.addWidget(self._cl_algo)
+        row2.addWidget(self._cl_k); row2.addWidget(self._cl_minsize)
+        row2.addWidget(recompute); row2.addWidget(self._cl_export)
+        row2.addStretch()
+        lay.addLayout(row2)
 
         self._cl_status = QLabel("Load a run, then press Recompute to embed the cells.")
         self._cl_status.setStyleSheet("font-size:11px; color:#aaa;")
@@ -1365,7 +1466,8 @@ class ResultsExplorer(QMainWindow):
             self._cluster_worker.wait()
         self._cluster_worker = _ClusterWorker(
             groups, self._params(), fit_plate, want_umap, self._cl_minsize.value(),
-            self._cl_omit_empty.isChecked())
+            self._cl_omit_empty.isChecked(), tuple(self._cl_families), self._cl_scaling,
+            self._cl_algo.currentData(), self._cl_k.value())
         self._cluster_worker.done.connect(self._on_cluster_done)
         self._cluster_worker.error.connect(
             lambda m: self._cl_status.setText(f"Cluster error:\n{m}"))
@@ -1383,19 +1485,87 @@ class ResultsExplorer(QMainWindow):
         n_clusters = len({int(x) for x in labs} - {-1})
         n_noise = int((labs == -1).sum())
         umap_note = "" if "umap" in result["coords"] else " (UMAP unavailable — PCA only)"
+        scale_note = "; ⚠ per-plate scaling removes DIV-timepoint biology" \
+            if self._cl_scaling in ("plate", "run_plate") else ""
         self._cl_status.setText(
             f"{len(result['meta'])} cells embedded of {result['n_total']} total — "
-            f"{n_clusters} clusters, {n_noise} unclustered. Features: per-channel "
-            f"score+occupancy, z-scored per run{umap_note}. "
-            "Note: clustering across runs can reflect batch as well as biology."
+            f"{self._cl_algo.currentText()}: {n_clusters} clusters, {n_noise} unclustered. "
+            f"Features: {', '.join(self._cl_families)}; scaled {self._cl_scaling}"
+            f"{umap_note}{scale_note}. "
+            "Clustering across runs can reflect batch as well as biology."
         )
+        # Populate the colour-by-feature dropdown from this result's features.
+        self._cl_feature.blockSignals(True)
+        self._cl_feature.clear()
+        for name in result.get("feature_names", []):
+            self._cl_feature.addItem(name, name)
+        self._cl_feature.blockSignals(False)
         self._cluster_draw()
+
+    def _cluster_point_colors(self, disp):
+        """Return (colors list, title suffix, legend pairs) for the displayed
+        points under the current colour-by mode."""
+        import numpy as np
+        import matplotlib
+        res = self._cluster_result
+        meta = res["meta"]
+        mode = self._cl_colorby.currentData()
+        tab = matplotlib.colormaps["tab10"]
+
+        def categorical(values, label):
+            cats = sorted({str(v) for v in values})
+            cmap = {c: tab(i % 10) for i, c in enumerate(cats)}
+            colors = [cmap[str(v)] for v in values]
+            legend = [(c, cmap[c]) for c in cats][:10]
+            return colors, label, legend
+
+        if mode == "cluster":
+            labs = res["labels"][disp]
+            colors = ["#666666" if int(l) == -1 else tab(int(l) % 10) for l in labs]
+            cats = sorted({int(l) for l in labs})
+            legend = [("noise" if c == -1 else f"c{c}",
+                       "#666666" if c == -1 else tab(c % 10)) for c in cats][:11]
+            return colors, "cluster", legend
+        if mode == "call":
+            vals = [v or "negative" for v in meta["pos_channels"][disp]]
+            return categorical(vals, "classifier call")
+        if mode == "run":
+            return categorical(list(meta["run_tag"][disp]), "run")
+        if mode == "plate":
+            return categorical(list(meta["plate"][disp]), "plate")
+        if mode == "label":
+            vals = [self._hand_label_str(meta.iloc[i]) for i in np.where(disp)[0]]
+            return categorical(vals, "hand label")
+        if mode == "feature":
+            fname = self._cl_feature.currentData()
+            X = res.get("X"); names = res.get("feature_names", [])
+            if fname in names and X is not None:
+                col = X[disp, names.index(fname)]
+                norm = matplotlib.colors.Normalize()
+                colors = matplotlib.colormaps["viridis"](norm(col))
+                return colors, f"feature {fname}", None
+        return ["#4477aa"] * int(disp.sum()), "", None
+
+    def _hand_label_str(self, meta_row) -> str:
+        """The hand label for a meta row as a channel-set string, or 'unlabelled'."""
+        v = self._hand_label_or_none(meta_row)
+        return v if v is not None else "unlabelled"
+
+    def _hand_label_or_none(self, meta_row):
+        """Hand-label class string for a meta row, or ``None`` if unlabelled
+        (so the multi-class LDA fits only on genuinely labelled cells)."""
+        if self._labels is None:
+            return None
+        lab = self._labels.get_label(meta_row["run_tag"], meta_row["plate"], meta_row["well_id"])
+        if lab is None:
+            return None
+        chans = lab.get("channels") or set()
+        return ",".join(sorted(chans)) if chans else "negative"
 
     def _cluster_draw(self, *_args) -> None:
         if self._cl_canvas is None:
             return
         import numpy as np
-        import matplotlib
         ax = self._cl_ax
         ax.clear()
         res = self._cluster_result
@@ -1406,14 +1576,24 @@ class ResultsExplorer(QMainWindow):
             self._cl_canvas.draw_idle()
             return
         method = self._cl_method.currentData()
+        # LDA is a supervised embedding computed lazily from the current hand
+        # labels (fast; no worker). PCA/UMAP come from the worker payload.
+        if method == "lda" and "lda" not in res["coords"]:
+            classes = [self._hand_label_or_none(res["meta"].iloc[i])
+                       for i in range(len(res["meta"]))]
+            lda_coords, note = _cluster.lda_embedding(res["X"], classes)
+            res["coords"]["lda"] = lda_coords
+            res["lda_note"] = note
         coords = res["coords"].get(method)
         if coords is None:
-            ax.text(0.5, 0.5, f"{method.upper()} not computed\n(install umap-learn, then Recompute)",
-                    ha="center", va="center", transform=ax.transAxes, color="#888")
+            reason = res.get("lda_note", "") if method == "lda" \
+                else "(install umap-learn, then Recompute)"
+            ax.text(0.5, 0.5, f"{method.upper()} not available\n{reason}",
+                    ha="center", va="center", transform=ax.transAxes, color="#888", wrap=True)
             ax.set_xticks([]); ax.set_yticks([])
             self._cl_canvas.draw_idle()
             return
-        meta = res["meta"]; labels = res["labels"]
+        meta = res["meta"]
         plate = self._plate_combo.currentData()
         if self._cl_all_runs.isChecked():
             disp = np.ones(len(meta), dtype=bool)
@@ -1426,14 +1606,63 @@ class ResultsExplorer(QMainWindow):
             ax.set_xticks([]); ax.set_yticks([])
             self._cl_canvas.draw_idle()
             return
-        cmap = matplotlib.colormaps["tab10"]
-        labs = labels[disp]
-        colors = ["#666666" if int(l) == -1 else cmap(int(l) % 10) for l in labs]
-        ax.scatter(coords[disp, 0], coords[disp, 1], c=colors, s=18,
-                   picker=5, linewidths=0)
-        ax.set_title(f"{method.upper()} — {int(disp.sum())} cells, coloured by cluster")
+        colors, by, legend = self._cluster_point_colors(disp)
+        sc = ax.scatter(coords[disp, 0], coords[disp, 1], c=colors, s=18,
+                        picker=5, linewidths=0)
+        if legend:
+            from matplotlib.lines import Line2D
+            handles = [Line2D([0], [0], marker="o", linestyle="", markersize=6,
+                              markerfacecolor=c, markeredgecolor="none", label=str(name))
+                       for name, c in legend]
+            ax.legend(handles=handles, fontsize=7, loc="best", framealpha=0.8)
+        ax.set_title(f"{method.upper()} — {int(disp.sum())} cells, coloured by {by}")
+        if method == "lda":
+            ax.set_xlabel("LD1"); ax.set_ylabel("LD2")
         ax.set_xticks([]); ax.set_yticks([])
         self._cl_canvas.draw_idle()
+
+    def _on_colorby_changed(self, *_a) -> None:
+        self._cl_feature.setEnabled(self._cl_colorby.currentData() == "feature")
+        self._cluster_draw()
+
+    def _on_algo_changed(self, *_a) -> None:
+        algo = self._cl_algo.currentData()
+        self._cl_k.setEnabled(algo in ("kmeans", "agglomerative"))
+        self._cl_minsize.setEnabled(algo == "hdbscan")
+
+    def _edit_cluster_config(self) -> None:
+        dlg = _ClusterConfigDialog(self._cl_families, self._cl_scaling, self)
+        if dlg.exec_() if hasattr(dlg, "exec_") else dlg.exec():
+            self._cl_families, self._cl_scaling = dlg.result_config()
+            self._cl_status.setText(
+                f"Features: {', '.join(self._cl_families)}; scaled {self._cl_scaling}. "
+                "Press Recompute to apply.")
+
+    def _export_clusters(self) -> None:
+        res = self._cluster_result
+        if not res:
+            self._cl_status.setText("Nothing to export — Recompute first.")
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Export cluster table", "clusters.csv",
+                                              "CSV (*.csv)")
+        if not path:
+            return
+        import numpy as np
+        import pandas as pd
+        df = res["meta"].copy()
+        df["cluster"] = res["labels"]
+        for m, coords in res["coords"].items():
+            df[f"{m}1"] = coords[:, 0]; df[f"{m}2"] = coords[:, 1]
+        X = res.get("X"); names = res.get("feature_names", [])
+        if X is not None:
+            for i, name in enumerate(names):
+                df[name] = X[:, i]
+        df["hand_label"] = [self._hand_label_str(df.iloc[i]) for i in range(len(df))]
+        try:
+            df.to_csv(path, index=False)
+            self._cl_status.setText(f"Exported {len(df)} cells → {path}")
+        except Exception as exc:
+            self._cl_status.setText(f"Export failed: {exc}")
 
     def _on_cluster_pick(self, event) -> None:
         if self._cluster_result is None or self._cl_disp_idx is None:
