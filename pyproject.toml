@@ -38,6 +38,16 @@ dependencies = [
 viewer = [
     "napari[all]>=0.4.19",
 ]
+ml = [
+    # Supervised classification of hole colour (results Explorer): per-channel
+    # LDA now, Random Forest later. Optional — the rule-based classifier and the
+    # rest of the Explorer work without it; the LDA code errors clearly if absent.
+    "scikit-learn>=1.3",
+]
+test = [
+    "pytest>=7.0",
+    "scikit-learn>=1.3",   # tests/test_lda.py importorskips this
+]
 gpu = [
     # drop-in GPU replacements — install only if CUDA available
     "cupy-cuda12x",
@@ -76,6 +86,9 @@ ci = "correlative_imaging.cli:cli"
 
 [tool.setuptools.packages.find]
 where = ["."]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
 
 [tool.ruff]
 target-version = "py311"

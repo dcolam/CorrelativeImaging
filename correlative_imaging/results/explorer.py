@@ -36,10 +36,12 @@ from qtpy.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSplitter,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
+from . import lda as _lda
 from .analysis import RunTable, load_run
 from .classify import ClassifierParams, classify_wells
 from .discovery import RunGroup, discover_runs, find_diagnostic_images
@@ -248,7 +250,9 @@ class ResultsExplorer(QMainWindow):
         self._viewer = napari_viewer
         self._runs: list[RunGroup] = []
         self._table: RunTable | None = None
-        self._cls = None                       # holistic classification DataFrame
+        self._cls = None                       # ACTIVE classification frame (grid/detail read this)
+        self._cls_rule = None                  # rule-based classification
+        self._cls_lda = None                   # LDA-predicted classification (after Evaluate LDA)
         self._labels: LabelStore | None = None  # ground-truth store for this folder
         self._chan_display: dict[str, dict] = {}  # {channel: {display_name, color_hex}}
         self._load_worker: _LoadWorker | None = None
@@ -342,6 +346,19 @@ class ResultsExplorer(QMainWindow):
         cl.addWidget(self._scale_combo)
         reclf = QPushButton("Reclassify"); reclf.clicked.connect(self._reclassify)
         cl.addWidget(reclf)
+        cl.addSpacing(12)
+        self._lda_btn = QPushButton("Evaluate LDA")
+        self._lda_btn.setToolTip(
+            "Train one LDA per channel on the hand labels and report honest "
+            "cross-validated accuracy/kappa vs the rule-based baseline."
+        )
+        self._lda_btn.clicked.connect(self._evaluate_lda)
+        cl.addWidget(self._lda_btn)
+        self._use_lda = QCheckBox("use LDA calls")
+        self._use_lda.setToolTip("Colour the grid by the LDA prediction instead of the rule.")
+        self._use_lda.setEnabled(False)
+        self._use_lda.toggled.connect(self._toggle_call_source)
+        cl.addWidget(self._use_lda)
         cl.addStretch()
         outer.addWidget(cls_box)
 
@@ -379,7 +396,14 @@ class ResultsExplorer(QMainWindow):
     def _reclassify(self) -> None:
         if self._table is None:
             return
-        self._cls = classify_wells(self._table, self._params())
+        self._cls_rule = classify_wells(self._table, self._params())
+        # Params changed → any prior LDA prediction is stale; drop back to rule.
+        self._cls_lda = None
+        self._use_lda.blockSignals(True)
+        self._use_lda.setChecked(False)
+        self._use_lda.setEnabled(False)
+        self._use_lda.blockSignals(False)
+        self._cls = self._cls_rule
         self._on_plate_changed(self._plate_combo.currentIndex())
         if self._cls.empty:
             return
@@ -503,7 +527,12 @@ class ResultsExplorer(QMainWindow):
 
     def _on_run_loaded(self, table: RunTable) -> None:
         self._table = table
-        self._cls = classify_wells(table, self._params())   # holistic classification
+        self._cls_rule = classify_wells(table, self._params())   # rule-based classification
+        self._cls_lda = None
+        self._cls = self._cls_rule
+        self._use_lda.blockSignals(True)
+        self._use_lda.setChecked(False); self._use_lda.setEnabled(False)
+        self._use_lda.blockSignals(False)
         self._load_channel_display()          # per-run display names + tints
         self._rebuild_legend()
         self._rebuild_label_checks()
@@ -724,6 +753,66 @@ class ResultsExplorer(QMainWindow):
         n = self._labels.count(run.run_tag)
         self.statusBar().showMessage(f"{n} wells labelled in {run.run_tag}", 4000)
 
+    # ── LDA (supervised) ─────────────────────────────────────────────
+    def _evaluate_lda(self) -> None:
+        """Train one LDA per channel on the hand labels, show the honest CV report,
+        and cache the whole-run prediction so it can tint the grid."""
+        run = self._current_run()
+        if self._table is None or self._labels is None or run is None:
+            return
+        params = self._params()
+        try:
+            reports = _lda.evaluate(self._table, self._labels, run.run_tag, params)
+            text = _lda.format_report(reports, self._chan_display)
+        except ImportError as exc:
+            self._show_text_dialog("LDA — scikit-learn missing", str(exc))
+            return
+        except ValueError as exc:      # no labels yet
+            self._show_text_dialog("LDA", str(exc))
+            return
+        except Exception:
+            import traceback
+            self._show_text_dialog("LDA — error", traceback.format_exc())
+            return
+        # Cache whole-run prediction for the grid toggle (best-effort).
+        try:
+            self._cls_lda = _lda.predict(self._table, self._labels, run.run_tag, params)
+            self._use_lda.setEnabled(self._cls_lda is not None and not self._cls_lda.empty)
+        except Exception:
+            self._cls_lda = None
+            self._use_lda.setEnabled(False)
+        # If the grid is already showing LDA calls, repoint it at the freshly
+        # trained model instead of leaving stale predictions on screen.
+        if self._use_lda.isChecked():
+            self._toggle_call_source(True)
+        self._show_text_dialog("LDA — per-channel evaluation", text)
+
+    def _toggle_call_source(self, use_lda: bool) -> None:
+        """Switch the grid/detail between the rule-based call and the LDA prediction."""
+        if use_lda and self._cls_lda is not None and not self._cls_lda.empty:
+            self._cls = self._cls_lda
+        else:
+            self._cls = self._cls_rule
+        self._on_plate_changed(self._plate_combo.currentIndex())
+        if self._current_well is not None:
+            self._on_well_clicked(self._current_well[1])
+
+    def _show_text_dialog(self, title: str, text: str) -> None:
+        dlg = QDialog(self)
+        dlg.setWindowTitle(title)
+        dlg.resize(620, 560)
+        lay = QVBoxLayout(dlg)
+        box = QTextEdit()
+        box.setReadOnly(True)
+        box.setStyleSheet("font-family: monospace; font-size: 12px;")
+        box.setPlainText(text)
+        lay.addWidget(box)
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.rejected.connect(dlg.reject)
+        buttons.accepted.connect(dlg.accept)
+        lay.addWidget(buttons)
+        dlg.exec_() if hasattr(dlg, "exec_") else dlg.exec()
+
     # ── Well detail ──────────────────────────────────────────────────
     def _on_well_clicked(self, well_id: str) -> None:
         if self._table is None:
@@ -777,13 +866,15 @@ class ResultsExplorer(QMainWindow):
             score = cr.get(f"score_{ch}") if cr is not None else None
             margin = cr.get(f"margin_{ch}") if cr is not None else None
             occ = cr.get(f"occ_{ch}") if cr is not None else None
+            proba = cr.get(f"proba_{ch}") if cr is not None else None
             pos = bool(cr.get(f"pos_{ch}")) if cr is not None else False
             if hole is not None and hole == hole:
                 stxt = f"  score={score:.2f}" if score is not None and score == score else ""
                 otxt = f"  occ={occ:.0%}" if occ is not None and occ == occ else ""
                 mtxt = f"  Δthr={margin:+.2f}" if margin is not None and margin == margin else ""
+                ptxt = f"  P={proba:.0%}" if proba is not None and proba == proba else ""
                 flag = "  ✓POS" if pos else ""
-                txt = f"hole={hole:.4f}  bg={bg:.4f}{stxt}{otxt}{mtxt}{flag}  cells around={nbg}"
+                txt = f"hole={hole:.4f}  bg={bg:.4f}{stxt}{otxt}{ptxt}{mtxt}{flag}  cells around={nbg}"
             else:
                 txt = "—"
             lbl = QLabel(txt)
