@@ -99,8 +99,15 @@ class _LoadWorker(QThread):
 
 
 class _ResultsGrid(QWidget):
-    """16×24 plate grid, each well tinted by an assigned colour."""
+    """16×24 plate grid, each well tinted by an assigned colour.
+
+    Laid out as one rigid :class:`QGridLayout` (row/column headers + wells) with a
+    trailing row/column stretch, so the matrix stays tight in the top-left and the
+    wells always line up — rather than drifting apart when the scroll area is
+    wider than the plate."""
     well_clicked = Signal(str)
+
+    _CELL = 19          # px per well button (compact, keeps the whole plate small)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -111,30 +118,31 @@ class _ResultsGrid(QWidget):
         self._build()
 
     def _build(self) -> None:
-        lay = QVBoxLayout(self)
-        lay.setSpacing(2)
-        lay.setContentsMargins(4, 4, 4, 4)
+        grid = QGridLayout(self)
+        grid.setSpacing(1)
+        grid.setContentsMargins(4, 4, 4, 4)
 
-        hdr = QHBoxLayout(); hdr.setSpacing(2)
-        corner = QLabel(""); corner.setFixedWidth(18); hdr.addWidget(corner)
-        for col in _PLATE_COLS:
-            l = QLabel(str(col)); l.setFixedWidth(22); l.setAlignment(Qt.AlignCenter)
-            l.setStyleSheet("font-size:9px; color:#aaa;"); hdr.addWidget(l)
-        lay.addLayout(hdr)
-
-        for row in _PLATE_ROWS:
-            rl = QHBoxLayout(); rl.setSpacing(2)
-            lbl = QLabel(row); lbl.setFixedWidth(18); lbl.setAlignment(Qt.AlignCenter)
-            lbl.setStyleSheet("font-size:9px; color:#aaa;"); rl.addWidget(lbl)
-            for col in _PLATE_COLS:
+        # Column headers (1..24) in row 0; row headers (A..P) in column 0.
+        for c, col in enumerate(_PLATE_COLS, start=1):
+            l = QLabel(str(col)); l.setAlignment(Qt.AlignCenter)
+            l.setStyleSheet("font-size:9px; color:#aaa;")
+            grid.addWidget(l, 0, c)
+        for r, row in enumerate(_PLATE_ROWS, start=1):
+            rl = QLabel(row); rl.setAlignment(Qt.AlignCenter); rl.setFixedWidth(14)
+            rl.setStyleSheet("font-size:9px; color:#aaa;")
+            grid.addWidget(rl, r, 0)
+            for c, col in enumerate(_PLATE_COLS, start=1):
                 wid = f"{row}{col}"
-                b = QPushButton(""); b.setFixedSize(22, 22)
+                b = QPushButton(""); b.setFixedSize(self._CELL, self._CELL)
                 b.setToolTip(wid)
                 b.clicked.connect(lambda _=False, w=wid: self._on_click(w))
                 self._btns[wid] = b
                 self._paint(wid, _ABSENT_HEX)
-                rl.addWidget(b)
-            lay.addLayout(rl)
+                grid.addWidget(b, r, c)
+
+        # Pool any extra space bottom-right so the plate stays compact top-left.
+        grid.setRowStretch(len(_PLATE_ROWS) + 1, 1)
+        grid.setColumnStretch(len(_PLATE_COLS) + 1, 1)
 
     def _paint(self, wid: str, hex_color: str, selected: bool = False) -> None:
         if selected:
@@ -362,17 +370,24 @@ class ResultsExplorer(QMainWindow):
         cl.addStretch()
         outer.addWidget(cls_box)
 
-        # Main split: grid | well detail
+        # Main split: plate grid | well detail — each in its own scroll area so a
+        # small window scrolls instead of clipping.
         split = QSplitter(Qt.Horizontal)
 
         grid_scroll = QScrollArea(); grid_scroll.setWidgetResizable(True)
+        grid_scroll.setAlignment(Qt.AlignTop | Qt.AlignLeft)   # keep plate top-left
         self._grid = _ResultsGrid()
         self._grid.well_clicked.connect(self._on_well_clicked)
         grid_scroll.setWidget(self._grid)
         split.addWidget(grid_scroll)
 
-        split.addWidget(self._build_detail_panel())
-        split.setSizes([680, 520])
+        detail_scroll = QScrollArea(); detail_scroll.setWidgetResizable(True)
+        detail_scroll.setWidget(self._build_detail_panel())
+        split.addWidget(detail_scroll)
+
+        split.setStretchFactor(0, 0)     # plate keeps its size
+        split.setStretchFactor(1, 1)     # detail takes the extra width
+        split.setSizes([520, 680])
         outer.addWidget(split, stretch=1)
 
     def _mk_weight(self, label: str, default: float):
@@ -421,6 +436,7 @@ class ResultsExplorer(QMainWindow):
 
         self._detail_title = QLabel("Click a well")
         self._detail_title.setStyleSheet("font-weight:bold; font-size:13px;")
+        self._detail_title.setWordWrap(True)   # long plate names wrap, not overflow
         pl.addWidget(self._detail_title)
 
         self._detail_form_box = QGroupBox("Measurements")
