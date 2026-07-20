@@ -65,8 +65,49 @@ from .discovery import (
 )
 from .labels import LabelStore, default_display
 
+try:
+    import pyqtgraph as _pg
+except Exception:                          # pragma: no cover
+    _pg = None
+
 _PLATE_ROWS = list("ABCDEFGHIJKLMNOP")   # 16 rows
 _PLATE_COLS = list(range(1, 25))          # 24 columns
+
+
+if _pg is not None:
+    class _LassoViewBox(_pg.ViewBox):
+        """A pyqtgraph ViewBox that, in lasso mode, turns a left-drag into a
+        freeform selection polygon (pan/zoom otherwise). Emits the polygon (view
+        coords) on release so the Clusters tab can select the enclosed points."""
+        lassoFinished = Signal(object)
+
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            self._lasso_on = False
+            self._pts: list = []
+            self._curve = _pg.PlotCurveItem(pen=_pg.mkPen((255, 210, 0), width=2))
+            self.addItem(self._curve)
+
+        def set_lasso(self, on: bool) -> None:
+            self._lasso_on = bool(on)
+            self.setMouseEnabled(not on, not on)   # disable pan/zoom while lassoing
+
+        def mouseDragEvent(self, ev, axis=None):
+            if not self._lasso_on:
+                return super().mouseDragEvent(ev, axis)
+            ev.accept()
+            p = self.mapToView(ev.pos())
+            if ev.isStart():
+                self._pts = []
+            self._pts.append((float(p.x()), float(p.y())))
+            self._curve.setData([q[0] for q in self._pts], [q[1] for q in self._pts])
+            if ev.isFinish():
+                pts = list(self._pts)
+                self._curve.setData([], [])
+                if len(pts) >= 3:
+                    self.lassoFinished.emit(pts)
+else:                                       # pragma: no cover
+    _LassoViewBox = None
 
 _NEGATIVE_HEX = "#2a2a2a"  # hole present but no channel positive (negative/empty hole)
 _EMPTY_HEX = "#3a3a3a"     # well present but no hole ROI at all
@@ -125,7 +166,8 @@ class _ClusterWorker(QThread):
 
     def __init__(self, rt, params, fit_plate, want_umap, min_cluster_size,
                  omit_empty=False, selected_columns=None, scaling="run",
-                 cluster_method="hdbscan", n_clusters=5):
+                 cluster_method="hdbscan", n_clusters=5, scale_method="zscore",
+                 particle_filter=None):
         super().__init__()
         self._rt = rt
         self._params = params
@@ -137,13 +179,16 @@ class _ClusterWorker(QThread):
         self._scaling = scaling
         self._cluster_method = cluster_method
         self._n_clusters = n_clusters
+        self._scale_method = scale_method
+        self._particle_filter = particle_filter
 
     def run(self) -> None:
         try:
             import numpy as np
             fm = _cluster.build_feature_matrix(
                 self._rt, self._selected_columns, self._scaling,
-                self._omit_empty, self._params)
+                self._omit_empty, self._params, scale_method=self._scale_method,
+                particle_filter=self._particle_filter)
             if fm is None or len(fm) < 3:
                 self.done.emit({"empty": True})
                 return
@@ -156,7 +201,8 @@ class _ClusterWorker(QThread):
                 return
             Xf = fm.X[mask]
             meta_f = fm.meta[mask].reset_index(drop=True)
-            coords = {"pca": _cluster.embed(Xf, "pca")}
+            pca_coords, loadings, var_ratio = _cluster.pca_embed(Xf)
+            coords = {"pca": pca_coords}
             if self._want_umap:
                 coords["umap"] = _cluster.embed(Xf, "umap")
             labels = _cluster.cluster_labels(
@@ -165,6 +211,7 @@ class _ClusterWorker(QThread):
                 "empty": False, "meta": meta_f, "coords": coords,
                 "labels": labels, "channels": fm.channels, "n_total": len(fm),
                 "X": Xf, "feature_names": fm.feature_names,
+                "pca_loadings": loadings, "pca_var": var_ratio,
             })
         except Exception:
             import traceback
@@ -635,13 +682,14 @@ class _FeatureSelectDialog(QDialog):
 
     _SCALING_LABELS = [
         ("whole run — per channel across plates (matches R figures)", "run"),
-        ("per plate — ⚠ removes plate / DIV-timepoint differences", "run_plate"),
+        ("per plate — ⚠ removes between-plate differences", "run_plate"),
     ]
 
-    def __init__(self, columns, groups, selected, scaling, n_wells, parent=None):
+    def __init__(self, columns, groups, selected, scaling, n_wells,
+                 scale_method="zscore", particle_filter=None, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Cluster features & scaling")
-        self.resize(520, 620)
+        self.setWindowTitle("Cluster features, scaling & particle filter")
+        self.resize(540, 680)
         self._n_wells = n_wells
         self._checks: dict[str, QCheckBox] = {}
         selected = set(selected or [])
@@ -686,6 +734,44 @@ class _FeatureSelectDialog(QDialog):
         srow.addWidget(self._scaling, stretch=1)
         lay.addLayout(srow)
 
+        mrow = QHBoxLayout()
+        mrow.addWidget(QLabel("Standardise method:"))
+        self._method = QComboBox()
+        for key, label in _cluster.SCALE_METHODS.items():
+            self._method.addItem(label, key)
+        mi = self._method.findData(scale_method)
+        self._method.setCurrentIndex(mi if mi >= 0 else 0)
+        mrow.addWidget(self._method, stretch=1)
+        lay.addLayout(mrow)
+
+        # Optional particle pre-filter (ephacRTools filterParticles).
+        pf = particle_filter or {}
+        self._pf_on = QCheckBox("Filter background particles before aggregating "
+                                "(sharpens intensity / occupancy)")
+        self._pf_on.setChecked(bool(particle_filter))
+        lay.addWidget(self._pf_on)
+        prow = QHBoxLayout()
+        prow.addWidget(QLabel("    method:"))
+        self._pf_method = QComboBox()
+        self._pf_method.addItem("z-score (keep ≥ threshold)", "zscore")
+        self._pf_method.addItem("median-ratio (÷SD; keep ≥ threshold)", "median_ratio")
+        mmi = self._pf_method.findData(pf.get("method", "zscore"))
+        self._pf_method.setCurrentIndex(mmi if mmi >= 0 else 0)
+        prow.addWidget(self._pf_method)
+        prow.addWidget(QLabel("threshold:"))
+        self._pf_thr = QDoubleSpinBox()
+        self._pf_thr.setRange(-5.0, 10.0); self._pf_thr.setSingleStep(0.1)
+        self._pf_thr.setValue(float(pf.get("threshold", 0.0)))
+        self._pf_thr.setToolTip("Particles with scaled mean-intensity below this are "
+                                "dropped (z-score 0 = above the group mean).")
+        prow.addWidget(self._pf_thr)
+        prow.addStretch()
+        lay.addLayout(prow)
+        self._pf_on.toggled.connect(lambda on: (self._pf_method.setEnabled(on),
+                                                self._pf_thr.setEnabled(on)))
+        self._pf_method.setEnabled(self._pf_on.isChecked())
+        self._pf_thr.setEnabled(self._pf_on.isChecked())
+
         self._count = QLabel("")
         self._count.setWordWrap(True)
         lay.addWidget(self._count)
@@ -711,7 +797,11 @@ class _FeatureSelectDialog(QDialog):
 
     def result_config(self):
         sel = [c for c, cb in self._checks.items() if cb.isChecked()]
-        return sel, self._scaling.currentData()
+        pf = None
+        if self._pf_on.isChecked():
+            pf = {"method": self._pf_method.currentData(),
+                  "threshold": float(self._pf_thr.value())}
+        return sel, self._scaling.currentData(), self._method.currentData(), pf
 
 
 class ResultsExplorer(QMainWindow):
@@ -733,6 +823,8 @@ class ResultsExplorer(QMainWindow):
         self._cluster_result: dict | None = None   # last worker payload
         self._cl_selected_cols = None    # catalog columns to cluster on (None → default subset)
         self._cl_scaling = _cluster.DEFAULT_SCALING           # standardisation grouping
+        self._cl_scale_method = _cluster.DEFAULT_SCALE_METHOD  # standardisation method
+        self._cl_particle_filter = None  # None or {"method","threshold"} (filterParticles)
         self._build()
 
     def _channel_hex(self, channel: str) -> str:
@@ -1455,13 +1547,25 @@ class ResultsExplorer(QMainWindow):
         self._cl_minsize.setToolTip("HDBSCAN minimum cluster size.")
         recompute = QPushButton("Recompute")
         recompute.clicked.connect(self._cluster_recompute)
+        self._cl_lasso_btn = QPushButton("Lasso"); self._cl_lasso_btn.setCheckable(True)
+        self._cl_lasso_btn.setToolTip("Drag a freeform loop to select a group of cells "
+                                      "(disables pan/zoom while on).")
+        self._cl_lasso_btn.toggled.connect(self._toggle_lasso)
+        self._cl_clearsel_btn = QPushButton("Clear sel")
+        self._cl_clearsel_btn.clicked.connect(self._clear_selection)
         self._cl_export = QPushButton("Export CSV")
-        self._cl_export.setToolTip("Save coords + cluster + label + features to CSV.")
+        self._cl_export.setToolTip("Save coords + cluster + label + features to CSV "
+                                   "(only the lassoed selection, if any).")
         self._cl_export.clicked.connect(self._export_clusters)
+        self._cl_loadings = QPushButton("PC loadings")
+        self._cl_loadings.setToolTip("Show which features drive PC1 / PC2.")
+        self._cl_loadings.clicked.connect(self._show_loadings)
         row2.addWidget(cfg_btn)
         row2.addWidget(QLabel("cluster:")); row2.addWidget(self._cl_algo)
         row2.addWidget(self._cl_k); row2.addWidget(self._cl_minsize)
-        row2.addWidget(recompute); row2.addWidget(self._cl_export)
+        row2.addWidget(recompute)
+        row2.addWidget(self._cl_lasso_btn); row2.addWidget(self._cl_clearsel_btn)
+        row2.addWidget(self._cl_export); row2.addWidget(self._cl_loadings)
         row2.addStretch()
         lay.addLayout(row2)
 
@@ -1471,19 +1575,23 @@ class ResultsExplorer(QMainWindow):
         lay.addWidget(self._cl_status)
 
         split = QSplitter(Qt.Horizontal)
-        self._cl_canvas = None
-        try:
-            import matplotlib
-            matplotlib.use("qtagg")
-            from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
-            from matplotlib.figure import Figure
-            self._cl_fig = Figure(figsize=(5, 5), layout="tight")
-            self._cl_ax = self._cl_fig.add_subplot(111)
-            self._cl_canvas = FigureCanvasQTAgg(self._cl_fig)
-            self._cl_canvas.mpl_connect("pick_event", self._on_cluster_pick)
-            split.addWidget(self._cl_canvas)
-        except Exception as exc:
-            split.addWidget(QLabel(f"matplotlib unavailable — clustering plot disabled:\n{exc}"))
+        self._cl_plot = None
+        self._cl_scatter = None
+        self._cl_vb = None
+        if _pg is not None:
+            self._cl_vb = _LassoViewBox()
+            self._cl_plot = _pg.PlotWidget(viewBox=self._cl_vb)
+            self._cl_plot.setBackground("w")
+            self._cl_plot.showGrid(x=False, y=False)
+            self._cl_scatter = _pg.ScatterPlotItem(size=7, pen=None, hoverable=True,
+                                                   tip=self._cl_tip)
+            self._cl_scatter.sigClicked.connect(self._on_scatter_clicked)
+            self._cl_plot.addItem(self._cl_scatter)
+            self._cl_vb.lassoFinished.connect(self._on_lasso)
+            self._cl_legend = self._cl_plot.addLegend(offset=(-10, 10), labelTextColor="k")
+            split.addWidget(self._cl_plot)
+        else:
+            split.addWidget(QLabel("pyqtgraph unavailable — pip install pyqtgraph"))
 
         prev = QWidget(); pv = QVBoxLayout(prev)
         self._cl_prev_title = QLabel("Click a point to see its cell.")
@@ -1497,7 +1605,7 @@ class ResultsExplorer(QMainWindow):
         split.setSizes([640, 340])
         lay.addWidget(split, stretch=1)
 
-        self._cl_disp_idx = None      # scatter-point index → meta row index
+        self._cl_selected: set = set()   # meta indices selected by lasso
         return tab
 
     def _cluster_recompute(self) -> None:
@@ -1527,7 +1635,8 @@ class ResultsExplorer(QMainWindow):
         self._cluster_worker = _ClusterWorker(
             self._table, self._params(), fit_plate, want_umap, self._cl_minsize.value(),
             self._cl_omit_empty.isChecked(), self._cl_selected_cols, self._cl_scaling,
-            self._cl_algo.currentData(), self._cl_k.value())
+            self._cl_algo.currentData(), self._cl_k.value(),
+            self._cl_scale_method, self._cl_particle_filter)
         self._cluster_worker.done.connect(self._on_cluster_done)
         self._cluster_worker.error.connect(
             lambda m: self._cl_status.setText(f"Cluster error:\n{m}"))
@@ -1541,11 +1650,12 @@ class ResultsExplorer(QMainWindow):
             return
         import numpy as np
         self._cluster_result = result
+        self._cl_selected = set()          # indices are result-specific; reset on recompute
         labs = result["labels"]
         n_clusters = len({int(x) for x in labs} - {-1})
         n_noise = int((labs == -1).sum())
         umap_note = "" if "umap" in result["coords"] else " (UMAP unavailable — PCA only)"
-        scale_note = "; ⚠ per-plate scaling removes DIV-timepoint biology" \
+        scale_note = "; ⚠ per-plate scaling removes between-plate differences" \
             if self._cl_scaling in ("plate", "run_plate") else ""
         nfeat = len(result.get("feature_names", []))
         self._cl_status.setText(
@@ -1621,18 +1731,33 @@ class ResultsExplorer(QMainWindow):
         chans = lab.get("channels") or set()
         return ",".join(sorted(chans)) if chans else "negative"
 
-    def _cluster_draw(self, *_args) -> None:
-        if self._cl_canvas is None:
-            return
-        import numpy as np
-        ax = self._cl_ax
-        ax.clear()
+    @staticmethod
+    def _to_brush(c):
+        import matplotlib.colors as mc
+        r, g, b, a = mc.to_rgba(c)
+        return _pg.mkBrush(int(r * 255), int(g * 255), int(b * 255), int(a * 255))
+
+    def _cl_tip(self, x, y, data) -> str:
         res = self._cluster_result
         if not res:
-            ax.text(0.5, 0.5, "press Recompute", ha="center", va="center",
-                    transform=ax.transAxes, color="#888")
-            ax.set_xticks([]); ax.set_yticks([])
-            self._cl_canvas.draw_idle()
+            return ""
+        try:
+            r = res["meta"].iloc[int(data)]
+            lab = int(res["labels"][int(data)])
+            return f"{r['plate']}\n{r['well_id']}  (cluster {'noise' if lab == -1 else lab})"
+        except Exception:
+            return ""
+
+    def _cluster_draw(self, *_args) -> None:
+        if self._cl_scatter is None or self._cl_plot is None:
+            return
+        import numpy as np
+        self._cl_scatter.clear()
+        if self._cl_legend is not None:
+            self._cl_legend.clear()
+        res = self._cluster_result
+        if not res:
+            self._cl_plot.setTitle("press Recompute", color="k")
             return
         method = self._cl_method.currentData()
         # LDA is a supervised embedding computed lazily from the current hand
@@ -1646,37 +1771,65 @@ class ResultsExplorer(QMainWindow):
         coords = res["coords"].get(method)
         if coords is None:
             reason = res.get("lda_note", "") if method == "lda" \
-                else "(install umap-learn, then Recompute)"
-            ax.text(0.5, 0.5, f"{method.upper()} not available\n{reason}",
-                    ha="center", va="center", transform=ax.transAxes, color="#888", wrap=True)
-            ax.set_xticks([]); ax.set_yticks([])
-            self._cl_canvas.draw_idle()
+                else "install umap-learn, then Recompute"
+            self._cl_plot.setTitle(f"{method.upper()} not available — {reason}", color="k")
             return
         meta = res["meta"]
-        # The worker already scoped the embedding (all plates of the run, or the
-        # selected plate), so every computed cell is shown.
-        disp = np.ones(len(meta), dtype=bool)
-        self._cl_disp_idx = np.where(disp)[0]
-        if disp.sum() == 0:
-            ax.text(0.5, 0.5, "no cells", ha="center", va="center",
-                    transform=ax.transAxes, color="#888")
-            ax.set_xticks([]); ax.set_yticks([])
-            self._cl_canvas.draw_idle()
+        n = len(meta)
+        colors, by, legend = self._cluster_point_colors(np.ones(n, dtype=bool))
+        brushes = [self._to_brush(c) for c in colors]
+        sel = self._cl_selected
+        spots = []
+        for i in range(n):
+            spot = {"pos": (float(coords[i, 0]), float(coords[i, 1])),
+                    "data": int(i), "brush": brushes[i], "size": 7}
+            if i in sel:
+                spot["pen"] = _pg.mkPen((0, 0, 0), width=1.5)
+                spot["size"] = 11
+            spots.append(spot)
+        self._cl_scatter.setData(spots)
+        if legend and self._cl_legend is not None:
+            for name, c in legend:
+                self._cl_legend.addItem(
+                    _pg.ScatterPlotItem(size=8, pen=None, brush=self._to_brush(c)), str(name))
+        title = f"{method.upper()} — {n} cells, coloured by {by}"
+        if sel:
+            title += f"  ({len(sel)} selected)"
+        self._cl_plot.setTitle(title, color="k")
+        self._cl_plot.setLabel("bottom", "LD1" if method == "lda" else "")
+        self._cl_plot.setLabel("left", "LD2" if method == "lda" else "")
+
+    # ── scatter interaction: click → preview, lasso → group select ───
+    def _on_scatter_clicked(self, scatter, points) -> None:
+        if self._cluster_result is None or not len(points):
             return
-        colors, by, legend = self._cluster_point_colors(disp)
-        sc = ax.scatter(coords[disp, 0], coords[disp, 1], c=colors, s=18,
-                        picker=5, linewidths=0)
-        if legend:
-            from matplotlib.lines import Line2D
-            handles = [Line2D([0], [0], marker="o", linestyle="", markersize=6,
-                              markerfacecolor=c, markeredgecolor="none", label=str(name))
-                       for name, c in legend]
-            ax.legend(handles=handles, fontsize=7, loc="best", framealpha=0.8)
-        ax.set_title(f"{method.upper()} — {int(disp.sum())} cells, coloured by {by}")
-        if method == "lda":
-            ax.set_xlabel("LD1"); ax.set_ylabel("LD2")
-        ax.set_xticks([]); ax.set_yticks([])
-        self._cl_canvas.draw_idle()
+        idx = int(points[0].data())
+        r = self._cluster_result["meta"].iloc[idx]
+        self._cluster_show_preview(r["run_tag"], r["plate"], r["well_id"])
+
+    def _toggle_lasso(self, on: bool) -> None:
+        if self._cl_vb is not None:
+            self._cl_vb.set_lasso(on)
+
+    def _on_lasso(self, poly) -> None:
+        import numpy as np
+        from matplotlib.path import Path
+        res = self._cluster_result
+        if not res:
+            return
+        coords = res["coords"].get(self._cl_method.currentData())
+        if coords is None:
+            return
+        inside = Path(poly).contains_points(coords)
+        self._cl_selected = {int(i) for i in np.where(inside)[0]}
+        self._cluster_draw()
+        self._cl_status.setText(
+            f"{len(self._cl_selected)} cells selected by lasso — Export CSV saves "
+            "just the selection (Clear sel to reset).")
+
+    def _clear_selection(self, *_a) -> None:
+        self._cl_selected = set()
+        self._cluster_draw()
 
     def _on_colorby_changed(self, *_a) -> None:
         self._cl_feature.setEnabled(self._cl_colorby.currentData() == "feature")
@@ -1698,12 +1851,36 @@ class ResultsExplorer(QMainWindow):
         selected = self._cl_selected_cols or cat.default_selection()
         n_wells = len(cat.df)
         dlg = _FeatureSelectDialog(cat.columns, cat.groups, selected, self._cl_scaling,
-                                   n_wells, self)
+                                   n_wells, self._cl_scale_method, self._cl_particle_filter,
+                                   self)
         if dlg.exec_() if hasattr(dlg, "exec_") else dlg.exec():
-            self._cl_selected_cols, self._cl_scaling = dlg.result_config()
+            (self._cl_selected_cols, self._cl_scaling,
+             self._cl_scale_method, self._cl_particle_filter) = dlg.result_config()
             n = len(self._cl_selected_cols)
+            pf = "; filtered particles" if self._cl_particle_filter else ""
             self._cl_status.setText(
-                f"{n} features selected; scaled {self._cl_scaling}. Press Recompute to apply.")
+                f"{n} features; scaled {self._cl_scaling}/{self._cl_scale_method}{pf}. "
+                "Press Recompute to apply.")
+
+    def _show_loadings(self, *_a) -> None:
+        res = self._cluster_result
+        if not res or res.get("pca_loadings") is None:
+            self._show_text_dialog("PC loadings", "Recompute first (PCA loadings need a fresh embedding).")
+            return
+        import numpy as np
+        loadings = res["pca_loadings"]          # [2 × n_features]
+        names = res.get("feature_names", [])
+        var = res.get("pca_var")
+        lines = ["Which features drive each principal component", ""]
+        for pc in range(min(2, loadings.shape[0])):
+            frac = f" ({var[pc]:.0%} variance)" if var is not None and pc < len(var) else ""
+            lines.append(f"PC{pc + 1}{frac} — top features by |loading|:")
+            order = np.argsort(-np.abs(loadings[pc]))
+            for i in order[:12]:
+                bar = "█" * int(round(abs(loadings[pc, i]) * 20))
+                lines.append(f"    {loadings[pc, i]:+.3f}  {bar:<20}  {names[i]}")
+            lines.append("")
+        self._show_text_dialog("PC loadings", "\n".join(lines))
 
     def _export_clusters(self) -> None:
         res = self._cluster_result
@@ -1715,31 +1892,24 @@ class ResultsExplorer(QMainWindow):
         if not path:
             return
         import numpy as np
-        import pandas as pd
         df = res["meta"].copy()
         df["cluster"] = res["labels"]
         for m, coords in res["coords"].items():
-            df[f"{m}1"] = coords[:, 0]; df[f"{m}2"] = coords[:, 1]
+            if coords is not None:
+                df[f"{m}1"] = coords[:, 0]; df[f"{m}2"] = coords[:, 1]
         X = res.get("X"); names = res.get("feature_names", [])
         if X is not None:
             for i, name in enumerate(names):
                 df[name] = X[:, i]
         df["hand_label"] = [self._hand_label_str(df.iloc[i]) for i in range(len(df))]
+        # If a lasso selection is active, export just those cells.
+        if self._cl_selected:
+            df = df.iloc[sorted(self._cl_selected)]
         try:
             df.to_csv(path, index=False)
             self._cl_status.setText(f"Exported {len(df)} cells → {path}")
         except Exception as exc:
             self._cl_status.setText(f"Export failed: {exc}")
-
-    def _on_cluster_pick(self, event) -> None:
-        if self._cluster_result is None or self._cl_disp_idx is None:
-            return
-        ind = list(getattr(event, "ind", []))
-        if not ind:
-            return
-        meta_idx = int(self._cl_disp_idx[int(ind[0])])
-        row = self._cluster_result["meta"].iloc[meta_idx]
-        self._cluster_show_preview(row["run_tag"], row["plate"], row["well_id"])
 
     def _diag_dir_for(self, run_tag: str, plate: str):
         for rg in self._runs:

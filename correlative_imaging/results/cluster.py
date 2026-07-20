@@ -12,7 +12,7 @@ Design decisions baked in here (see the Clusters tab for the interaction):
   which catalog columns to embed on; runs are NEVER mixed (one run at a time).
 * **Scaling** (:data:`SCALING_GROUPS`) z-scores each selected column within a
   row-group. Within one run "run" == whole-run per channel across plates (matches
-  the R figures); "run_plate" is per-plate (removes DIV-timepoint differences).
+  the R figures); "run_plate" is per-plate (removes between-plate differences).
   Centered-vs-uncentered ÷SD is irrelevant to PCA/UMAP/clustering (distances are
   unchanged); the grouping is the only thing that matters.
 * **Clustering is done on the FEATURE matrix, not on the 2-D coords** (clustering
@@ -33,7 +33,7 @@ from .classify import ClassifierParams, classify_wells
 # Scaling grouping name → row-group columns to z-score each feature within.
 # Runs are never mixed, so within a single run "run" == global. The meaningful
 # choice is whole-run (per channel across plates, matches the R figures) vs
-# per-plate (removes plate/DIV-timepoint differences).
+# per-plate (removes between-plate differences).
 SCALING_GROUPS: dict[str, list[str]] = {
     "global": [],
     "run": ["run_tag"],
@@ -77,22 +77,48 @@ def umap_available() -> bool:
 
 
 # ── Feature assembly ─────────────────────────────────────────────────────────
+# Standardisation methods (per feature column, within the chosen row-group).
+# Mirrors the options in ephacRTools (scoreParticles center T/F, the median
+# threshold variant, and the ldaTools plate-centering step).
+SCALE_METHODS = {
+    "zscore": "z-score (centre + ÷SD)",
+    "sd": "÷SD only (uncentred)",
+    "robust": "robust (median + MAD)",
+    "center": "centre only (subtract mean)",
+    "none": "none (raw)",
+}
+DEFAULT_SCALE_METHOD = "zscore"
+
+
 def _standardize_within(df: pd.DataFrame, feat_cols: list[str],
-                        group_cols: list[str]) -> pd.DataFrame:
-    """z-score each feature column within row-groups (``group_cols`` empty =
-    global). Zero-variance / single-row groups collapse to 0."""
+                        group_cols: list[str], method: str = "zscore") -> pd.DataFrame:
+    """Standardise each feature column within row-groups (``group_cols`` empty =
+    global) by ``method`` (see :data:`SCALE_METHODS`). Zero-variance / single-row
+    groups collapse to 0."""
     out = df.copy()
 
-    def _z(block: pd.DataFrame) -> pd.DataFrame:
-        mu = block.mean()
-        sd = block.std(ddof=0).replace(0.0, 1.0)
-        return ((block - mu) / sd).fillna(0.0)
+    def _apply(block: pd.DataFrame) -> pd.DataFrame:
+        b = block.astype(float)
+        if method == "none":
+            return b.fillna(0.0)
+        if method == "center":
+            return (b - b.mean()).fillna(0.0)
+        if method == "sd":
+            sd = b.std(ddof=0).replace(0.0, 1.0)
+            return (b / sd).fillna(0.0)
+        if method == "robust":
+            med = b.median()
+            mad = (b - med).abs().median() * 1.4826
+            scale = mad.where(mad > 0, b.std(ddof=0)).replace(0.0, 1.0)
+            return ((b - med) / scale).fillna(0.0)
+        mu = b.mean(); sd = b.std(ddof=0).replace(0.0, 1.0)      # zscore
+        return ((b - mu) / sd).fillna(0.0)
 
     if group_cols:
         for _key, idx in df.groupby(group_cols).groups.items():
-            out.loc[idx, feat_cols] = _z(df.loc[idx, feat_cols].astype(float))
+            out.loc[idx, feat_cols] = _apply(df.loc[idx, feat_cols])
     else:
-        out[feat_cols] = _z(df[feat_cols].astype(float))
+        out[feat_cols] = _apply(df[feat_cols])
     return out
 
 
@@ -103,20 +129,24 @@ def build_feature_matrix(
     omit_empty: bool = False,
     params: ClassifierParams | None = None,
     roi: str = "roi_hole",
+    scale_method: str = DEFAULT_SCALE_METHOD,
+    particle_filter: dict | None = None,
 ) -> FeatureMatrix | None:
     """Assemble the per-cell feature matrix for ONE run (all its plates — runs are
     never mixed) from the shared feature catalog (:mod:`.features`).
 
     ``selected_columns`` picks catalog columns (``None`` → the catalog's default
-    subset). ``scaling`` z-scores each selected column within the grouping
-    (:data:`SCALING_GROUPS`); within one run "run" == whole-run per channel.
-    ``omit_empty`` drops wells the rule classifier calls negative. The classifier
-    call is carried into ``meta`` for colour-by. ``None`` if nothing to embed."""
+    subset). ``scaling`` sets the row-group (:data:`SCALING_GROUPS`) and
+    ``scale_method`` the per-column standardisation (:data:`SCALE_METHODS`); within
+    one run "run" == whole-run per channel. ``particle_filter`` (e.g.
+    ``{"method": "zscore", "threshold": 0.0}``) drops background particles before
+    the particle-based features. ``omit_empty`` drops classifier-negative wells.
+    The classifier call is carried into ``meta`` for colour-by."""
     from .features import build_catalog
 
     if rt is None or not rt.channels:
         return None
-    cat = build_catalog(rt, roi=roi)
+    cat = build_catalog(rt, roi=roi, particle_filter=particle_filter)
     if cat.df.empty:
         return None
     df = cat.df.copy()
@@ -141,7 +171,7 @@ def build_feature_matrix(
         return None
 
     df[cols] = df[cols].fillna(0.0)
-    scaled = _standardize_within(df, cols, SCALING_GROUPS.get(scaling, []))
+    scaled = _standardize_within(df, cols, SCALING_GROUPS.get(scaling, []), scale_method)
     X = np.nan_to_num(scaled[cols].to_numpy(dtype=float), nan=0.0)
     meta = df[["run_tag", "plate", "well_id", "pos_channels", "is_negative_hole"]] \
         .reset_index(drop=True)
@@ -172,6 +202,21 @@ def embed(X: np.ndarray, method: str = "pca", random_state: int = 0) -> np.ndarr
         return umap.UMAP(n_components=2, random_state=random_state,
                          n_neighbors=n_neighbors).fit_transform(X)
     raise ValueError(f"unknown method {method!r}")
+
+
+def pca_embed(X: np.ndarray):
+    """PCA embedding that also returns the loadings (``components_``, shape
+    ``[2 × n_features]``) and per-PC explained-variance fraction, so the GUI can
+    show which features drive PC1/PC2. Returns ``(coords, loadings, var_ratio)``;
+    loadings/var are ``None`` for <3 rows."""
+    n = X.shape[0]
+    if n < 3:
+        pad = np.zeros((n, 2), dtype=float)
+        pad[:, : min(2, X.shape[1])] = X[:, : min(2, X.shape[1])]
+        return pad, None, None
+    from sklearn.decomposition import PCA
+    p = PCA(n_components=2).fit(X)
+    return p.transform(X), p.components_, p.explained_variance_ratio_
 
 
 def lda_embedding(X: np.ndarray, class_labels, min_per_class: int = 2):

@@ -21,7 +21,7 @@ kappa, the apparent-vs-CV overfit gap, N per fold, and — crucially — how the
 compares to the incumbent rule-based box on the *same held-out* wells. If the LDA
 doesn't beat the rule, the rule wins.
 
-Two CV schemes, because the plates are DIV timepoints:
+Two CV schemes (plates are often distinct conditions/timepoints):
 
 * **leave-one-plate-out (LOGO)** — generalisation ACROSS developmental stage; the
   honest, hard test (and possibly pessimistic if only within-timepoint calls are
@@ -358,7 +358,7 @@ def format_report(reports: dict[str, ChannelReport],
             continue
         out.append(f"    apparent (in-sample, optimistic): "
                    f"acc={r.apparent['accuracy']:.0%} κ={r.apparent['kappa']:+.2f}")
-        out.append("  leave-one-plate-out (across DIV timepoints):")
+        out.append("  leave-one-plate-out (generalisation across plates):")
         out.append(line("LDA ", r.logo_lda))
         out.append(line("rule", r.logo_rule))
         out.append("  stratified k-fold (pooled, within-condition):")

@@ -78,11 +78,52 @@ def _pivot_channel(df: pd.DataFrame, value_cols: list[str], prefix: str,
     return wide.reset_index()
 
 
-def build_catalog(rt: RunTable, roi: str = "roi_hole") -> FeatureCatalog:
-    """Build the per-well feature catalog for one run (all its plates)."""
+def filter_particles(particles: pd.DataFrame, roi: str, method: str = "zscore",
+                     threshold: float | None = None,
+                     group_vars=("channel", "plate")) -> pd.DataFrame:
+    """Drop background / out-of-focus particles before aggregation, ported from
+    ephacRTools ``filterParticles``. Scales each particle's ``mean_intensity``
+    within ``group_vars`` and keeps those above a cut-off:
+
+    * ``"zscore"``       — standardise (mean 0, sd 1); keep ``≥ threshold``
+      (default 0, i.e. above the group mean).
+    * ``"median_ratio"`` — uncentered ÷SD; keep ``≥ threshold``; ``threshold``
+      ``None`` → each group's ``median(scaled)/3``.
+
+    Returns the roi-subset with rejected particles removed."""
+    p = particles[particles["roi_mask"] == roi].copy()
+    if p.empty or "mean_intensity" not in p.columns:
+        return p
+    gv = [g for g in group_vars if g in p.columns]
+
+    def _sd(x):
+        s = x.std(ddof=0)
+        return s if s and np.isfinite(s) else 1.0
+
+    if method == "median_ratio":
+        scaled = p.groupby(gv)["mean_intensity"].transform(lambda x: x / _sd(x))
+        if threshold is None:
+            thr = p.assign(_s=scaled).groupby(gv)["_s"].transform("median") / 3.0
+            keep = scaled >= thr
+        else:
+            keep = scaled >= threshold
+    else:  # zscore
+        scaled = p.groupby(gv)["mean_intensity"].transform(lambda x: (x - x.mean()) / _sd(x))
+        keep = scaled >= (0.0 if threshold is None else threshold)
+    return p[keep.fillna(False)]
+
+
+def build_catalog(rt: RunTable, roi: str = "roi_hole",
+                  particle_filter: dict | None = None) -> FeatureCatalog:
+    """Build the per-well feature catalog for one run (all its plates).
+
+    ``particle_filter`` (e.g. ``{"method": "zscore", "threshold": 0.0}``) applies
+    :func:`filter_particles` before the particle-based aggregates (occupancy,
+    count, shape, intensity), so those features are computed over accepted
+    particles only — as in the R figures. Bulk intensity + colocalization are not
+    particle-based and are unaffected."""
     channels = rt.channels
     groups: dict[str, str] = {}
-    parts = []
     base = None
 
     # ── bulk intensity (mean/sum/std) per channel ────────────────────
@@ -98,7 +139,12 @@ def build_catalog(rt: RunTable, roi: str = "roi_hole") -> FeatureCatalog:
 
     # ── particle aggregates: occupancy, count, shape, intensity ──────
     if rt.particles is not None and not rt.particles.empty:
-        p = rt.particles[rt.particles["roi_mask"] == roi]
+        if particle_filter:
+            p = filter_particles(rt.particles, roi,
+                                 particle_filter.get("method", "zscore"),
+                                 particle_filter.get("threshold"))
+        else:
+            p = rt.particles[rt.particles["roi_mask"] == roi]
         roi_area = None
         if rt.intensity is not None and not rt.intensity.empty:
             ri = rt.intensity[rt.intensity["roi_mask"] == roi]
