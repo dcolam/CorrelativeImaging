@@ -11,7 +11,7 @@ differ.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import pandas as pd
 
@@ -37,6 +37,7 @@ class RunTable:
     intensity: pd.DataFrame      # long: plate, well, channel, roi_mask, mean/sum/...
     particles: pd.DataFrame      # long: plate, well, channel, roi_mask, per-particle
     channels: list[str]          # distinct channel names seen, e.g. ["405nm","488nm","561nm"]
+    coloc: pd.DataFrame = field(default_factory=pd.DataFrame)  # long: plate, well, channel-pair, roi_mask, manders/pearson
 
 
 def _read_table(con, name: str) -> pd.DataFrame:
@@ -57,13 +58,14 @@ def load_run(run: RunGroup) -> RunTable:
     """
     import sqlite3
 
-    img_frames, int_frames, part_frames = [], [], []
+    img_frames, int_frames, part_frames, coloc_frames = [], [], [], []
     for pr in run.plates:
         con = sqlite3.connect(f"file:{pr.db_path}?mode=ro", uri=True)
         try:
             images = _read_table(con, "images")
             intensity = _read_table(con, "intensity_measurements")
             particles = _read_table(con, "particle_measurements")
+            coloc = _read_table(con, "colocalization_results")
         finally:
             con.close()
         if images.empty:
@@ -80,7 +82,7 @@ def load_run(run: RunGroup) -> RunTable:
         # Map measurement rows (keyed by image_id) to plate + well.
         id2well = dict(zip(images["id"], images["well_id"]))
         id2exp = dict(zip(images["id"], images.get("experiment", pd.Series(dtype=str))))
-        for frame in (intensity, particles):
+        for frame in (intensity, particles, coloc):
             if not frame.empty:
                 frame["plate"] = pr.plate
                 frame["well_id"] = frame["image_id"].map(id2well)
@@ -91,10 +93,13 @@ def load_run(run: RunGroup) -> RunTable:
             int_frames.append(intensity)
         if not particles.empty:
             part_frames.append(particles)
+        if not coloc.empty:
+            coloc_frames.append(coloc)
 
     images_all = pd.concat(img_frames, ignore_index=True) if img_frames else pd.DataFrame()
     intensity_all = pd.concat(int_frames, ignore_index=True) if int_frames else pd.DataFrame()
     particles_all = pd.concat(part_frames, ignore_index=True) if part_frames else pd.DataFrame()
+    coloc_all = pd.concat(coloc_frames, ignore_index=True) if coloc_frames else pd.DataFrame()
 
     channels = (
         sorted(intensity_all["channel"].dropna().unique().tolist())
@@ -107,6 +112,7 @@ def load_run(run: RunGroup) -> RunTable:
         intensity=intensity_all,
         particles=particles_all,
         channels=channels,
+        coloc=coloc_all,
     )
 
 

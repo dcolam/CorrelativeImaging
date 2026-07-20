@@ -1372,32 +1372,32 @@ class ResultsExplorer(QMainWindow):
         self._cl_method.currentIndexChanged.connect(self._cluster_draw)
         self._cl_colorby = QComboBox()
         for label, key in (("cluster", "cluster"), ("classifier call", "call"),
-                           ("hand label", "label"), ("run", "run"), ("plate", "plate"),
+                           ("hand label", "label"), ("plate", "plate"),
                            ("feature…", "feature")):
             self._cl_colorby.addItem(f"colour: {label}", key)
         self._cl_colorby.setToolTip(
             "Colour points by posthoc cluster, the classifier's call, your hand "
-            "labels, run or plate (batch check), or a chosen feature."
+            "labels, plate (batch check), or a chosen feature."
         )
         self._cl_colorby.currentIndexChanged.connect(self._on_colorby_changed)
         self._cl_feature = QComboBox()
         self._cl_feature.setToolTip("Feature to colour by (continuous).")
         self._cl_feature.setEnabled(False)
         self._cl_feature.currentIndexChanged.connect(self._cluster_draw)
-        self._cl_all_runs = QCheckBox("all runs")
-        self._cl_all_runs.setToolTip(
-            "Include every run in the folder (unchecked = only the selected plate). "
-            "Changing this needs Recompute.")
-        self._cl_fit_plate = QCheckBox("reduce on this plate only")
-        self._cl_fit_plate.setToolTip(
-            "Fit the embedding on the selected plate alone. Off = fit on the whole "
-            "set so it stays fixed as you change the plate filter. Needs Recompute.")
+        # Scope: NEVER mix runs. Either all plates of the current run, or just the
+        # selected plate. (One control, replacing the old all-runs/fit-plate pair.)
+        self._cl_scope = QComboBox()
+        self._cl_scope.addItem("all plates in this run", "run")
+        self._cl_scope.addItem("selected plate only", "plate")
+        self._cl_scope.setToolTip(
+            "What to embed — all plates of the current run, or only the selected "
+            "plate. Runs are never mixed. Changing this needs Recompute.")
         self._cl_omit_empty = QCheckBox("omit empty wells")
         self._cl_omit_empty.setToolTip(
             "Exclude wells the classifier calls negative/empty. Needs Recompute.")
         row1.addWidget(QLabel("view:")); row1.addWidget(self._cl_method)
         row1.addWidget(self._cl_colorby); row1.addWidget(self._cl_feature)
-        row1.addWidget(self._cl_all_runs); row1.addWidget(self._cl_fit_plate)
+        row1.addWidget(QLabel("scope:")); row1.addWidget(self._cl_scope)
         row1.addWidget(self._cl_omit_empty)
         row1.addStretch()
         lay.addLayout(row1)
@@ -1474,18 +1474,18 @@ class ResultsExplorer(QMainWindow):
             return
         run = self._current_run()
         plate = self._plate_combo.currentData()
-        all_runs = self._cl_all_runs.isChecked()
-        groups = list(self._runs) if all_runs else ([run] if run else [])
+        # Runs are NEVER mixed — always embed within the current run only.
+        groups = [run] if run else []
         if not groups:
             self._cl_status.setText("No run selected.")
             return
-        fit_plate = plate if self._cl_fit_plate.isChecked() else None
+        plate_only = self._cl_scope.currentData() == "plate"
+        fit_plate = plate if plate_only else None
         umap_err = _cluster.umap_import_error()
         want_umap = umap_err is None
-        scope = "all runs" if all_runs else "current run"
-        fitdesc = f"fit on plate {plate}" if fit_plate else f"fit on {scope}"
+        scope = f"plate {plate}" if plate_only else "all plates in run"
         empty_note = "; empty wells omitted" if self._cl_omit_empty.isChecked() else ""
-        msg = f"Computing embedding ({scope}; {fitdesc}{empty_note}) …"
+        msg = f"Computing embedding ({scope}{empty_note}) …"
         # If UMAP is the chosen view but unavailable, say WHY (the real import error).
         if self._cl_method.currentData() == "umap" and umap_err is not None:
             msg = f"UMAP unavailable — {umap_err}. Showing PCA. {msg}"
@@ -1516,11 +1516,10 @@ class ResultsExplorer(QMainWindow):
         scale_note = "; ⚠ per-plate scaling removes DIV-timepoint biology" \
             if self._cl_scaling in ("plate", "run_plate") else ""
         self._cl_status.setText(
-            f"{len(result['meta'])} cells embedded of {result['n_total']} total — "
+            f"{len(result['meta'])} cells embedded of {result['n_total']} total (this run) — "
             f"{self._cl_algo.currentText()}: {n_clusters} clusters, {n_noise} unclustered. "
             f"Features: {', '.join(self._cl_families)}; scaled {self._cl_scaling}"
-            f"{umap_note}{scale_note}. "
-            "Clustering across runs can reflect batch as well as biology."
+            f"{umap_note}{scale_note}."
         )
         # Populate the colour-by-feature dropdown from this result's features.
         self._cl_feature.blockSignals(True)
@@ -1622,14 +1621,12 @@ class ResultsExplorer(QMainWindow):
             self._cl_canvas.draw_idle()
             return
         meta = res["meta"]
-        plate = self._plate_combo.currentData()
-        if self._cl_all_runs.isChecked():
-            disp = np.ones(len(meta), dtype=bool)
-        else:
-            disp = (meta["plate"] == plate).to_numpy()
+        # The worker already scoped the embedding (all plates of the run, or the
+        # selected plate), so every computed cell is shown.
+        disp = np.ones(len(meta), dtype=bool)
         self._cl_disp_idx = np.where(disp)[0]
         if disp.sum() == 0:
-            ax.text(0.5, 0.5, "no cells for this plate", ha="center", va="center",
+            ax.text(0.5, 0.5, "no cells", ha="center", va="center",
                     transform=ax.transAxes, color="#888")
             ax.set_xticks([]); ax.set_yticks([])
             self._cl_canvas.draw_idle()
