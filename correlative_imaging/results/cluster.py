@@ -8,18 +8,16 @@ the cells, colour them, and map a clicked point back to its well.
 
 Design decisions baked in here (see the Clusters tab for the interaction):
 
-* **Feature families** (:data:`FEATURE_FAMILIES`) are chosen in the pop-up; each
-  contributes per-channel columns. Everything is aligned by channel NAME (channel
-  order varies between experiments) on the runs' *shared* channels.
-* **Scaling** (:data:`SCALING_GROUPS`) z-scores each feature column within a
-  row-group — global / per run / per (run×plate) / per plate. Per-run is the sane
-  default for cross-run work; per-plate removes DIV-timepoint biology (warn).
-  Per-column unit-variance standardisation always happens so no feature dominates
-  PCA by raw scale; the grouping only decides global-vs-within-batch.
+* **Features** come from the shared catalog (:mod:`.features`) — the caller picks
+  which catalog columns to embed on; runs are NEVER mixed (one run at a time).
+* **Scaling** (:data:`SCALING_GROUPS`) z-scores each selected column within a
+  row-group. Within one run "run" == whole-run per channel across plates (matches
+  the R figures); "run_plate" is per-plate (removes DIV-timepoint differences).
+  Centered-vs-uncentered ÷SD is irrelevant to PCA/UMAP/clustering (distances are
+  unchanged); the grouping is the only thing that matters.
 * **Clustering is done on the FEATURE matrix, not on the 2-D coords** (clustering
   on UMAP/PCA coordinates is an anti-pattern — those distances aren't faithful).
-* The **fit-set vs display** split lives in the GUI: fit once on the chosen
-  fit-set, then filter which points are drawn. UMAP gets a fixed ``random_state``.
+* UMAP gets a fixed ``random_state`` so a refit is reproducible.
 """
 
 from __future__ import annotations
@@ -32,23 +30,17 @@ import pandas as pd
 from .analysis import RunTable
 from .classify import ClassifierParams, classify_wells
 
-# Feature family → per-channel base column names it contributes.
-FEATURE_FAMILIES: dict[str, list[str]] = {
-    "score": ["score"],                 # population-scaled enrichment (classifier's signal)
-    "occupancy": ["occ"],               # fraction of hole covered by objects (0–1)
-    "morphology": ["area", "circularity", "eccentricity", "solidity"],
-    "intensity": ["hole_mean", "bg_mean", "n_particles"],
-}
-DEFAULT_FAMILIES = ("score",)
-
 # Scaling grouping name → row-group columns to z-score each feature within.
+# Runs are never mixed, so within a single run "run" == global. The meaningful
+# choice is whole-run (per channel across plates, matches the R figures) vs
+# per-plate (removes plate/DIV-timepoint differences).
 SCALING_GROUPS: dict[str, list[str]] = {
     "global": [],
     "run": ["run_tag"],
     "run_plate": ["run_tag", "plate"],
     "plate": ["plate"],
 }
-DEFAULT_SCALING = "run_plate"
+DEFAULT_SCALING = "run"
 
 
 @dataclass
@@ -85,82 +77,6 @@ def umap_available() -> bool:
 
 
 # ── Feature assembly ─────────────────────────────────────────────────────────
-def _hole_particle_aggregates(particles: pd.DataFrame) -> pd.DataFrame:
-    """Per (plate, well_id, channel) hole-ROI aggregates: mean morphology +
-    particle count. Empty frame if no particle data."""
-    cols = ["plate", "well_id", "channel", "area", "circularity",
-            "eccentricity", "solidity", "n_particles"]
-    if particles is None or particles.empty or "roi_mask" not in particles.columns:
-        return pd.DataFrame(columns=cols)
-    sub = particles[particles["roi_mask"] == "roi_hole"]
-    if sub.empty:
-        return pd.DataFrame(columns=cols)
-    g = sub.groupby(["plate", "well_id", "channel"])
-    out = g.agg(
-        area=("area_px", "mean"),
-        circularity=("circularity", "mean"),
-        eccentricity=("eccentricity", "mean"),
-        solidity=("solidity", "mean"),
-        n_particles=("label", "count"),
-    ).reset_index()
-    return out
-
-
-def _roi_mean(intensity: pd.DataFrame, roi: str, name: str) -> pd.DataFrame:
-    """Per (plate, well_id, channel) mean intensity in *roi*, column *name*."""
-    if intensity is None or intensity.empty or "roi_mask" not in intensity.columns:
-        return pd.DataFrame(columns=["plate", "well_id", "channel", name])
-    sub = intensity[intensity["roi_mask"] == roi]
-    if sub.empty:
-        return pd.DataFrame(columns=["plate", "well_id", "channel", name])
-    g = sub.groupby(["plate", "well_id", "channel"])["mean_intensity"].mean()
-    return g.rename(name).reset_index()
-
-
-def _run_long_features(rt: RunTable, params: ClassifierParams, omit_empty: bool) -> pd.DataFrame:
-    """Long per-(plate, well, channel) base-feature table for one run: score, occ,
-    hole_mean, bg_mean, n_particles, area, circularity, eccentricity, solidity.
-    Only wells with a hole (optionally only non-empty) are kept."""
-    cls = classify_wells(rt, params)
-    if cls.empty:
-        return pd.DataFrame()
-    cls = cls[cls["hole_present"]]
-    if omit_empty and "is_negative_hole" in cls.columns:
-        cls = cls[~cls["is_negative_hole"].astype(bool)]
-    if cls.empty:
-        return pd.DataFrame()
-
-    # score + occ (per-channel columns from classify) → long, plus the classifier
-    # call carried along for colour-by.
-    rows = []
-    for r in cls.itertuples(index=False):
-        for ch in rt.channels:
-            rows.append({
-                "plate": r.plate, "well_id": r.well_id, "channel": ch,
-                "score": float(getattr(r, f"score_{ch}")),
-                "occ": float(getattr(r, f"occ_{ch}")),
-            })
-    base = pd.DataFrame(rows)
-
-    morph = _hole_particle_aggregates(rt.particles)
-    hole = _roi_mean(rt.intensity, "roi_hole", "hole_mean")
-    bg = _roi_mean(rt.intensity, "roi_background", "bg_mean")
-    for extra in (morph, hole, bg):
-        if not extra.empty:
-            base = base.merge(extra, on=["plate", "well_id", "channel"], how="left")
-    # missing morphology/intensity → 0 (well/channel with no detected objects)
-    for col in ("area", "circularity", "eccentricity", "solidity", "n_particles",
-                "hole_mean", "bg_mean"):
-        if col not in base.columns:
-            base[col] = 0.0
-        base[col] = base[col].fillna(0.0)
-
-    call = cls[["plate", "well_id", "pos_channels", "is_negative_hole"]].copy()
-    base = base.merge(call, on=["plate", "well_id"], how="left")
-    base.insert(0, "run_tag", rt.run_tag)
-    return base
-
-
 def _standardize_within(df: pd.DataFrame, feat_cols: list[str],
                         group_cols: list[str]) -> pd.DataFrame:
     """z-score each feature column within row-groups (``group_cols`` empty =
@@ -181,62 +97,55 @@ def _standardize_within(df: pd.DataFrame, feat_cols: list[str],
 
 
 def build_feature_matrix(
-    run_tables: dict[str, RunTable],
-    params: ClassifierParams | None = None,
-    families: tuple[str, ...] | list[str] = DEFAULT_FAMILIES,
+    rt: RunTable,
+    selected_columns: list[str] | None = None,
     scaling: str = DEFAULT_SCALING,
     omit_empty: bool = False,
+    params: ClassifierParams | None = None,
+    roi: str = "roi_hole",
 ) -> FeatureMatrix | None:
-    """Assemble the per-cell feature matrix across one or more loaded runs.
+    """Assemble the per-cell feature matrix for ONE run (all its plates — runs are
+    never mixed) from the shared feature catalog (:mod:`.features`).
 
-    ``families`` selects which feature families (:data:`FEATURE_FAMILIES`) to
-    include; ``scaling`` picks the standardisation grouping (:data:`SCALING_GROUPS`).
-    Features are taken on the channels *shared* by all runs, aligned by name.
-    Returns ``None`` if there is nothing to embed or no family resolves to a
-    column."""
+    ``selected_columns`` picks catalog columns (``None`` → the catalog's default
+    subset). ``scaling`` z-scores each selected column within the grouping
+    (:data:`SCALING_GROUPS`); within one run "run" == whole-run per channel.
+    ``omit_empty`` drops wells the rule classifier calls negative. The classifier
+    call is carried into ``meta`` for colour-by. ``None`` if nothing to embed."""
+    from .features import build_catalog
+
+    if rt is None or not rt.channels:
+        return None
+    cat = build_catalog(rt, roi=roi)
+    if cat.df.empty:
+        return None
+    df = cat.df.copy()
+
+    # Classifier call + negativity per well (for colour-by and omit-empty).
     params = params or ClassifierParams()
-    families = [f for f in families if f in FEATURE_FAMILIES] or list(DEFAULT_FAMILIES)
-    bases = [b for fam in families for b in FEATURE_FAMILIES[fam]]
-
-    longs, channel_sets = [], []
-    for _run_tag, rt in run_tables.items():
-        if rt is None or not rt.channels:
-            continue
-        lf = _run_long_features(rt, params, omit_empty)
-        if lf.empty:
-            continue
-        longs.append(lf)
-        channel_sets.append(set(rt.channels))
-    if not longs:
-        return None
-    shared = sorted(set.intersection(*channel_sets)) if channel_sets else []
-    if not shared:
+    cls = classify_wells(rt, params)
+    if not cls.empty:
+        call = cls[["plate", "well_id", "pos_channels", "is_negative_hole"]]
+        df = df.merge(call, on=["plate", "well_id"], how="left")
+    else:
+        df["pos_channels"] = ""; df["is_negative_hole"] = False
+    if omit_empty:
+        df = df[~df["is_negative_hole"].fillna(False).astype(bool)]
+    if df.empty:
         return None
 
-    long = pd.concat(longs, ignore_index=True)
-    long = long[long["channel"].isin(shared)]
-
-    # long → wide: one column per (base, channel).
-    wide = long.pivot_table(
-        index=["run_tag", "plate", "well_id"], columns="channel", values=bases,
-    )
-    wide.columns = [f"{base}_{ch}" for base, ch in wide.columns]
-    wide = wide.reset_index()
-    feat_cols = [c for c in wide.columns if c not in ("run_tag", "plate", "well_id")]
-    if not feat_cols:
+    cols = [c for c in (selected_columns or cat.default_selection()) if c in cat.columns]
+    if not cols:
+        cols = cat.default_selection()
+    if not cols:
         return None
 
-    # classifier call per (run,plate,well) for colour-by (one value per well).
-    call = (long[["run_tag", "plate", "well_id", "pos_channels", "is_negative_hole"]]
-            .drop_duplicates(["run_tag", "plate", "well_id"]))
-    wide = wide.merge(call, on=["run_tag", "plate", "well_id"], how="left")
-
-    wide[feat_cols] = wide[feat_cols].fillna(0.0)
-    scaled = _standardize_within(wide, feat_cols, SCALING_GROUPS.get(scaling, []))
-    X = np.nan_to_num(scaled[feat_cols].to_numpy(dtype=float), nan=0.0)
-    meta = wide[["run_tag", "plate", "well_id", "pos_channels", "is_negative_hole"]] \
+    df[cols] = df[cols].fillna(0.0)
+    scaled = _standardize_within(df, cols, SCALING_GROUPS.get(scaling, []))
+    X = np.nan_to_num(scaled[cols].to_numpy(dtype=float), nan=0.0)
+    meta = df[["run_tag", "plate", "well_id", "pos_channels", "is_negative_hole"]] \
         .reset_index(drop=True)
-    return FeatureMatrix(X=X, meta=meta, feature_names=feat_cols, channels=shared)
+    return FeatureMatrix(X=X, meta=meta, feature_names=cols, channels=rt.channels)
 
 
 def embed(X: np.ndarray, method: str = "pca", random_state: int = 0) -> np.ndarray:

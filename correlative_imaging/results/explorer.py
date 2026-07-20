@@ -51,6 +51,7 @@ from ..diagnostics import (
     render_channels,
 )
 from . import cluster as _cluster
+from . import features as _features
 from . import lda as _lda
 from .analysis import RunTable, load_run
 from .classify import ClassifierParams, classify_wells
@@ -122,17 +123,17 @@ class _ClusterWorker(QThread):
     done = Signal(object)     # dict of results
     error = Signal(str)
 
-    def __init__(self, run_groups, params, fit_plate, want_umap, min_cluster_size,
-                 omit_empty=False, families=("score",), scaling="run_plate",
+    def __init__(self, rt, params, fit_plate, want_umap, min_cluster_size,
+                 omit_empty=False, selected_columns=None, scaling="run",
                  cluster_method="hdbscan", n_clusters=5):
         super().__init__()
-        self._run_groups = run_groups
+        self._rt = rt
         self._params = params
         self._fit_plate = fit_plate
         self._want_umap = want_umap
         self._min_cluster_size = min_cluster_size
         self._omit_empty = omit_empty
-        self._families = families
+        self._selected_columns = selected_columns
         self._scaling = scaling
         self._cluster_method = cluster_method
         self._n_clusters = n_clusters
@@ -140,14 +141,9 @@ class _ClusterWorker(QThread):
     def run(self) -> None:
         try:
             import numpy as np
-            tables = {}
-            for rg in self._run_groups:
-                try:
-                    tables[rg.run_tag] = load_run(rg)
-                except Exception:
-                    continue
             fm = _cluster.build_feature_matrix(
-                tables, self._params, self._families, self._scaling, self._omit_empty)
+                self._rt, self._selected_columns, self._scaling,
+                self._omit_empty, self._params)
             if fm is None or len(fm) < 3:
                 self.done.emit({"empty": True})
                 return
@@ -632,54 +628,90 @@ class _DiagnosticViewer(QWidget):
             return None
 
 
-class _ClusterConfigDialog(QDialog):
-    """Choose which feature families to include and how to standardise them for
-    the Clusters tab. Returns ``(families, scaling)`` on accept."""
+class _FeatureSelectDialog(QDialog):
+    """Pick which catalog features to cluster on, grouped by source with a
+    'select all' per group, plus the standardisation grouping. Shows a live
+    feature-count vs well-count warning. Returns ``(selected_columns, scaling)``."""
 
     _SCALING_LABELS = [
-        ("per run × plate", "run_plate"),
-        ("per run", "run"),
-        ("global (no batch grouping)", "global"),
-        ("per plate  — ⚠ erases DIV-timepoint biology", "plate"),
+        ("whole run — per channel across plates (matches R figures)", "run"),
+        ("per plate — ⚠ removes plate / DIV-timepoint differences", "run_plate"),
     ]
 
-    def __init__(self, families, scaling, parent=None):
+    def __init__(self, columns, groups, selected, scaling, n_wells, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Cluster features & scaling")
+        self.resize(520, 620)
+        self._n_wells = n_wells
+        self._checks: dict[str, QCheckBox] = {}
+        selected = set(selected or [])
         lay = QVBoxLayout(self)
 
-        lay.addWidget(QLabel("Feature families to include:"))
-        self._checks: dict[str, QCheckBox] = {}
-        for fam in _cluster.FEATURE_FAMILIES:
-            cb = QCheckBox(fam)
-            cb.setChecked(fam in families)
-            self._checks[fam] = cb
-            lay.addWidget(cb)
+        lay.addWidget(QLabel(f"Features to cluster on  ({n_wells} wells in this run):"))
+        scroll = QScrollArea(); scroll.setWidgetResizable(True)
+        inner = QWidget(); il = QVBoxLayout(inner)
+        # group columns preserving catalog order
+        order = []
+        for c in columns:
+            g = groups.get(c, "other")
+            if g not in order:
+                order.append(g)
+        self._group_alls: dict[str, QCheckBox] = {}
+        for g in order:
+            gcols = [c for c in columns if groups.get(c, "other") == g]
+            box = QGroupBox(f"{g}  ({len(gcols)})")
+            gl = QVBoxLayout(box)
+            all_cb = QCheckBox("select all")
+            all_cb.setStyleSheet("font-weight:bold;")
+            all_cb.stateChanged.connect(lambda st, cols=gcols: self._toggle_group(cols, st))
+            gl.addWidget(all_cb)
+            self._group_alls[g] = all_cb
+            for c in gcols:
+                cb = QCheckBox(c); cb.setChecked(c in selected)
+                cb.toggled.connect(self._update_count)
+                self._checks[c] = cb
+                gl.addWidget(cb)
+            il.addWidget(box)
+        il.addStretch()
+        scroll.setWidget(inner)
+        lay.addWidget(scroll, stretch=1)
 
-        lay.addWidget(QLabel("Standardise (z-score each feature within):"))
+        srow = QHBoxLayout()
+        srow.addWidget(QLabel("Standardise within:"))
         self._scaling = QComboBox()
         for label, key in self._SCALING_LABELS:
             self._scaling.addItem(label, key)
         idx = self._scaling.findData(scaling)
         self._scaling.setCurrentIndex(idx if idx >= 0 else 0)
-        lay.addWidget(self._scaling)
+        srow.addWidget(self._scaling, stretch=1)
+        lay.addLayout(srow)
 
-        note = QLabel(
-            "Per-column standardisation always happens (so no feature dominates by "
-            "raw scale); the grouping only sets global-vs-within-batch. Per-run is "
-            "the safe default; per-plate removes plate/DIV-timepoint differences."
-        )
-        note.setWordWrap(True); note.setStyleSheet("font-size:10px; color:#888;")
-        lay.addWidget(note)
+        self._count = QLabel("")
+        self._count.setWordWrap(True)
+        lay.addWidget(self._count)
+        self._update_count()
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         lay.addWidget(buttons)
 
+    def _toggle_group(self, cols, state) -> None:
+        on = state == Qt.Checked.value if hasattr(Qt.Checked, "value") else bool(state)
+        for c in cols:
+            self._checks[c].setChecked(on)
+
+    def _update_count(self, *_a) -> None:
+        n = sum(cb.isChecked() for cb in self._checks.values())
+        warn = n > max(3, self._n_wells // 10)
+        colour = "#d9534f" if warn else "#888"
+        extra = "  ⚠ many features vs wells — consider fewer, or rely on the PCA step." if warn else ""
+        self._count.setStyleSheet(f"font-size:11px; color:{colour};")
+        self._count.setText(f"{n} features selected / {self._n_wells} wells.{extra}")
+
     def result_config(self):
-        fams = [f for f, cb in self._checks.items() if cb.isChecked()]
-        return (fams or list(_cluster.DEFAULT_FAMILIES)), self._scaling.currentData()
+        sel = [c for c, cb in self._checks.items() if cb.isChecked()]
+        return sel, self._scaling.currentData()
 
 
 class ResultsExplorer(QMainWindow):
@@ -699,7 +731,7 @@ class ResultsExplorer(QMainWindow):
         # Clusters tab state
         self._cluster_worker: _ClusterWorker | None = None
         self._cluster_result: dict | None = None   # last worker payload
-        self._cl_families = list(_cluster.DEFAULT_FAMILIES)   # feature families (pop-up)
+        self._cl_selected_cols = None    # catalog columns to cluster on (None → default subset)
         self._cl_scaling = _cluster.DEFAULT_SCALING           # standardisation grouping
         self._build()
 
@@ -1405,8 +1437,8 @@ class ResultsExplorer(QMainWindow):
         # Row 2: features/scaling + clustering + recompute/export
         row2 = QHBoxLayout()
         cfg_btn = QPushButton("Features / scaling …")
-        cfg_btn.setToolTip("Choose which feature families to include and how to standardise them.")
-        cfg_btn.clicked.connect(self._edit_cluster_config)
+        cfg_btn.setToolTip("Choose which catalog features to cluster on and how to standardise them.")
+        cfg_btn.clicked.connect(self._edit_feature_selection)
         self._cl_algo = QComboBox()
         for label, key in (("HDBSCAN", "hdbscan"), ("KMeans", "kmeans"),
                            ("Agglomerative", "agglomerative")):
@@ -1493,8 +1525,8 @@ class ResultsExplorer(QMainWindow):
         if self._cluster_worker and self._cluster_worker.isRunning():
             self._cluster_worker.wait()
         self._cluster_worker = _ClusterWorker(
-            groups, self._params(), fit_plate, want_umap, self._cl_minsize.value(),
-            self._cl_omit_empty.isChecked(), tuple(self._cl_families), self._cl_scaling,
+            self._table, self._params(), fit_plate, want_umap, self._cl_minsize.value(),
+            self._cl_omit_empty.isChecked(), self._cl_selected_cols, self._cl_scaling,
             self._cl_algo.currentData(), self._cl_k.value())
         self._cluster_worker.done.connect(self._on_cluster_done)
         self._cluster_worker.error.connect(
@@ -1515,11 +1547,11 @@ class ResultsExplorer(QMainWindow):
         umap_note = "" if "umap" in result["coords"] else " (UMAP unavailable — PCA only)"
         scale_note = "; ⚠ per-plate scaling removes DIV-timepoint biology" \
             if self._cl_scaling in ("plate", "run_plate") else ""
+        nfeat = len(result.get("feature_names", []))
         self._cl_status.setText(
             f"{len(result['meta'])} cells embedded of {result['n_total']} total (this run) — "
             f"{self._cl_algo.currentText()}: {n_clusters} clusters, {n_noise} unclustered. "
-            f"Features: {', '.join(self._cl_families)}; scaled {self._cl_scaling}"
-            f"{umap_note}{scale_note}."
+            f"{nfeat} features; scaled {self._cl_scaling}{umap_note}{scale_note}."
         )
         # Populate the colour-by-feature dropdown from this result's features.
         self._cl_feature.blockSignals(True)
@@ -1655,13 +1687,23 @@ class ResultsExplorer(QMainWindow):
         self._cl_k.setEnabled(algo in ("kmeans", "agglomerative"))
         self._cl_minsize.setEnabled(algo == "hdbscan")
 
-    def _edit_cluster_config(self) -> None:
-        dlg = _ClusterConfigDialog(self._cl_families, self._cl_scaling, self)
+    def _edit_feature_selection(self) -> None:
+        if self._table is None:
+            self._cl_status.setText("Load a run first.")
+            return
+        cat = _features.build_catalog(self._table)
+        if not cat.columns:
+            self._cl_status.setText("No features available for this run.")
+            return
+        selected = self._cl_selected_cols or cat.default_selection()
+        n_wells = len(cat.df)
+        dlg = _FeatureSelectDialog(cat.columns, cat.groups, selected, self._cl_scaling,
+                                   n_wells, self)
         if dlg.exec_() if hasattr(dlg, "exec_") else dlg.exec():
-            self._cl_families, self._cl_scaling = dlg.result_config()
+            self._cl_selected_cols, self._cl_scaling = dlg.result_config()
+            n = len(self._cl_selected_cols)
             self._cl_status.setText(
-                f"Features: {', '.join(self._cl_families)}; scaled {self._cl_scaling}. "
-                "Press Recompute to apply.")
+                f"{n} features selected; scaled {self._cl_scaling}. Press Recompute to apply.")
 
     def _export_clusters(self) -> None:
         res = self._cluster_result
