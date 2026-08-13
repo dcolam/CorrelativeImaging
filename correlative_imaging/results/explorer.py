@@ -140,6 +140,18 @@ def _ordered_kinds(kinds) -> list[str]:
     return sorted(kinds, key=lambda k: (k != "whole", k))
 
 
+import re as _re
+
+
+def _pad_well(w, width: int = 2) -> str:
+    """Zero-pad a well id's column for display/export ('A1' → 'A01', 'B10' →
+    'B10'). Display-only — the raw well id is kept for file/label lookups."""
+    if not w:
+        return w
+    m = _re.match(r"^([A-Za-z]+)(\d+)$", str(w))
+    return f"{m.group(1)}{int(m.group(2)):0{width}d}" if m else str(w)
+
+
 class _LoadWorker(QThread):
     """Load a run's databases off the UI thread (a few DBs → ~1s)."""
     loaded = Signal(object)   # RunTable
@@ -254,7 +266,7 @@ class _ResultsGrid(QWidget):
             for c, col in enumerate(_PLATE_COLS, start=1):
                 wid = f"{row}{col}"
                 b = QPushButton(""); b.setFixedSize(self._CELL, self._CELL)
-                b.setToolTip(wid)
+                b.setToolTip(_pad_well(wid))
                 b.clicked.connect(lambda _=False, w=wid: self._on_click(w))
                 self._btns[wid] = b
                 self._paint(wid, _ABSENT_HEX)
@@ -1402,7 +1414,7 @@ class ResultsExplorer(QMainWindow):
             (self._table.wells["plate"] == plate)
             & (self._table.wells["well_id"] == well_id)
         ]
-        self._detail_title.setText(f"{plate}  —  well {well_id}")
+        self._detail_title.setText(f"{plate}  —  well {_pad_well(well_id)}")
         # rebuild measurements form
         while self._detail_form.rowCount():
             self._detail_form.removeRow(0)
@@ -1744,7 +1756,7 @@ class ResultsExplorer(QMainWindow):
         try:
             r = res["meta"].iloc[int(data)]
             lab = int(res["labels"][int(data)])
-            return f"{r['plate']}\n{r['well_id']}  (cluster {'noise' if lab == -1 else lab})"
+            return f"{r['plate']}\n{_pad_well(r['well_id'])}  (cluster {'noise' if lab == -1 else lab})"
         except Exception:
             return ""
 
@@ -1893,6 +1905,8 @@ class ResultsExplorer(QMainWindow):
             return
         import numpy as np
         df = res["meta"].copy()
+        # Zero-padded well id for tidy sorting (raw well_id kept for traceability).
+        df.insert(df.columns.get_loc("well_id") + 1, "well", df["well_id"].map(_pad_well))
         df["cluster"] = res["labels"]
         for m, coords in res["coords"].items():
             if coords is not None:
@@ -1902,6 +1916,18 @@ class ResultsExplorer(QMainWindow):
             for i, name in enumerate(names):
                 df[name] = X[:, i]
         df["hand_label"] = [self._hand_label_str(df.iloc[i]) for i in range(len(df))]
+        # Rule-based classifier metrics per well (prefixed rule_ to avoid clashing
+        # with catalog columns like occ_<ch>).
+        if self._table is not None:
+            cls = classify_wells(self._table, self._params())
+            if not cls.empty:
+                mcols = ["n_positive", "is_negative_hole", "hole_present"]
+                for ch in self._table.channels:
+                    mcols += [f"score_{ch}", f"occ_{ch}", f"margin_{ch}", f"pos_{ch}"]
+                mcols = [c for c in mcols if c in cls.columns]
+                rule = cls[["plate", "well_id"] + mcols].rename(
+                    columns={c: f"rule_{c}" for c in mcols})
+                df = df.merge(rule, on=["plate", "well_id"], how="left")
         # If a lasso selection is active, export just those cells.
         if self._cl_selected:
             df = df.iloc[sorted(self._cl_selected)]
@@ -1920,7 +1946,7 @@ class ResultsExplorer(QMainWindow):
         return None
 
     def _cluster_show_preview(self, run_tag: str, plate: str, well_id: str) -> None:
-        self._cl_prev_title.setText(f"{plate} — well {well_id}\n({run_tag})")
+        self._cl_prev_title.setText(f"{plate} — well {_pad_well(well_id)}\n({run_tag})")
         diag = self._diag_dir_for(run_tag, plate)
         # Same rich viewer as the Plate tab: kind/view selectors, per-channel
         # toggles + brightness, jpg/tiff, BF.
