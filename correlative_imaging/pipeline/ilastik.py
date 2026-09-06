@@ -21,6 +21,48 @@ log = logging.getLogger(__name__)
 # Z-projection
 # ──────────────────────────────────────────────────────────────────────────────
 
+def select_z_range(
+    arr: np.ndarray,
+    z_start: int = 0,
+    z_stop: int = 0,
+    axis: int = 0,
+    label: str = "",
+) -> np.ndarray:
+    """Restrict *arr* to a sub-stack along *axis* before projecting.
+
+    The range is **1-based and inclusive**, matching how Fiji's "Make Substack"
+    and the slice slider count planes: ``z_start=3, z_stop=7`` keeps planes 3–7,
+    seven-minus-three-plus-one = 5 planes. ``0`` means unbounded, so
+    ``z_start=0`` starts at the first plane and ``z_stop=0`` runs to the last —
+    which makes "no range set" (0, 0) mean the whole stack, so pipelines saved
+    before this option existed keep projecting exactly as they did.
+
+    A range wider than the stack is clamped rather than raising: an 8-plane
+    stack asked for 3–20 yields planes 3–8, logged once. An empty selection
+    (start beyond the stack, or start > stop) is refused — silently projecting
+    zero planes would produce an all-zero image that looks like a real result.
+    """
+    if arr.ndim <= axis or (not z_start and not z_stop):
+        return arr
+    n = arr.shape[axis]
+    start = max(1, z_start or 1)
+    stop = min(n, z_stop or n)
+    if start > n or start > stop:
+        raise ValueError(
+            f"Z range {z_start or 1}–{z_stop or n} selects no planes "
+            f"{('for ' + label) if label else ''}of a {n}-plane stack."
+        )
+    if (z_start and z_start > 1 and start != z_start) or (z_stop and stop != z_stop):
+        log.warning("Z range %s–%s clamped to %d–%d (stack has %d planes)%s.",
+                    z_start or 1, z_stop or n, start, stop, n,
+                    f" for {label}" if label else "")
+    if start == 1 and stop == n:
+        return arr
+    sl = [slice(None)] * arr.ndim
+    sl[axis] = slice(start - 1, stop)
+    return arr[tuple(sl)]
+
+
 @dataclass
 @register_step
 class ZProjection(Step):
@@ -30,14 +72,21 @@ class ZProjection(Step):
     ----------
     channel:  Channel index to project.  -1 = all channels.
     method:   'min' | 'max' | 'mean' | 'sum'  (default 'min', best for BF).
+    z_start:  First Z plane to include, 1-based inclusive; 0 = first plane.
+    z_stop:   Last Z plane to include, 1-based inclusive; 0 = last plane.
+              ``z_start``/``z_stop`` default to 0/0 — the whole stack — so
+              pipelines written before this option behave unchanged.
     """
     channel: int = -1
     method: str = "min"
+    z_start: int = 0
+    z_stop: int = 0
 
     @property
     def name(self) -> str:
         ch = "all" if self.channel == -1 else f"ch{self.channel}"
-        return f"z_projection_{self.method}_{ch}"
+        rng = f"_z{self.z_start or 1}-{self.z_stop or 'end'}" if (self.z_start or self.z_stop) else ""
+        return f"z_projection_{self.method}_{ch}{rng}"
 
     def process(self, image: np.ndarray, context: PipelineContext) -> StepResult:
         if image.ndim != 4:
@@ -46,12 +95,14 @@ class ZProjection(Step):
         ops = {"min": np.min, "max": np.max, "mean": np.mean, "sum": np.sum}
         fn = ops.get(self.method, np.min)
 
-        # Collapse the Z axis for every channel: (C, Z, Y, X) → (C, Y, X).
-        # Projection is independent per channel, so a single reduction over
-        # axis=1 handles all channels at once. (channel != -1 is accepted for
-        # API symmetry but still collapses the whole stack — leaving some
-        # channels 3-D and others 2-D would be an invalid mixed-rank array.)
-        out = fn(image, axis=1)
+        # Z is axis 1 of (C, Z, Y, X): restrict to the sub-stack first, then
+        # collapse. Projection is independent per channel, so a single
+        # reduction over axis=1 handles all channels at once. (channel != -1 is
+        # accepted for API symmetry but still collapses the whole stack —
+        # leaving some channels 3-D and others 2-D would be an invalid
+        # mixed-rank array.)
+        sub = select_z_range(image, self.z_start, self.z_stop, axis=1)
+        out = fn(sub, axis=1)
         return StepResult(image=out.astype(image.dtype, copy=False))
 
 

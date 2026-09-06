@@ -326,7 +326,9 @@ def _bf_project_one(task: tuple) -> tuple:
     the per-well projection that ``_BFWorker.run`` does inline for its
     sequential/test path — kept in sync with it by hand (small, stable).
 
-    ``task`` = (bf_path, well_id, bf_channel, z_method, in_dir, proj_dir|None).
+    ``task`` = (bf_path, well_id, bf_channel, z_method, in_dir, proj_dir|None,
+    z_start, z_stop). The Z range is 1-based inclusive with 0 = unbounded, the
+    same convention as ``ZProjection``.
     Returns (stem, well_id, pixel_size_um, dtype_str, error|None); on failure
     ``stem`` is None and ``error`` holds the traceback.
     """
@@ -334,7 +336,10 @@ def _bf_project_one(task: tuple) -> tuple:
     import numpy as np
     import tifffile
 
-    bf_path_str, well_id, bf_channel, z_method, in_dir_str, proj_dir_str = task
+    from correlative_imaging.pipeline.ilastik import select_z_range
+
+    (bf_path_str, well_id, bf_channel, z_method, in_dir_str, proj_dir_str,
+     z_start, z_stop) = task
     try:
         ops = {"min": np.min, "max": np.max, "mean": np.mean, "sum": np.sum}
         proj_fn = ops.get(z_method, np.min)
@@ -343,6 +348,7 @@ def _bf_project_one(task: tuple) -> tuple:
         img = read_image(bf_path)
         ch_data = img.data[bf_channel]              # (Z,H,W) or (H,W)
         if ch_data.ndim == 3:
+            ch_data = select_z_range(ch_data, z_start, z_stop, axis=0, label=well_id)
             ch_data = proj_fn(ch_data, axis=0)      # → (H,W), original dtype
         h5_in = Path(in_dir_str) / f"{stem}.h5"
         with h5py.File(h5_in, "w") as f:

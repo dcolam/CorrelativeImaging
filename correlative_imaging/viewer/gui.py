@@ -119,6 +119,24 @@ _STEP_FORMS: dict[str, list[tuple]] = {
 }
 
 
+def _z_range_spinboxes(tip_subject: str = "projection"):
+    """A (first, last) pair of Z-range spin boxes.
+
+    1-based and inclusive, matching Fiji's Make Substack. 0 is shown as
+    "first"/"last" and means unbounded, so the default pair (0, 0) is the whole
+    stack — the same behaviour as before sub-stacks existed.
+    """
+    lo = QSpinBox(); lo.setRange(0, 9999); lo.setSpecialValueText("first")
+    hi = QSpinBox(); hi.setRange(0, 9999); hi.setSpecialValueText("last")
+    lo.setToolTip(f"First Z plane to include in the {tip_subject} (1 = first plane).\n"
+                  f"Leave at 'first' for the whole stack.")
+    hi.setToolTip(f"Last Z plane to include in the {tip_subject}, inclusive.\n"
+                  f"Leave at 'last' for the whole stack.")
+    for w in (lo, hi):
+        w.setMaximumWidth(70)
+    return lo, hi
+
+
 # ──────────────────────────────────────────────────────────────────
 # Background workers
 # ──────────────────────────────────────────────────────────────────
@@ -1789,6 +1807,14 @@ class BFPipelineTab(QWidget):
         self._proj_combo.setToolTip("Min projection works best for transmitted-light BF")
         pfl.addRow("Z-projection:", self._proj_combo)
 
+        # Sub-stack for the BF projection — the planes that actually carry the
+        # structure Ilastik is trained on are often a subset of the stack.
+        self._bf_z_from, self._bf_z_to = _z_range_spinboxes("BF projection")
+        z_row = QHBoxLayout()
+        z_row.addWidget(self._bf_z_from); z_row.addWidget(QLabel("to"))
+        z_row.addWidget(self._bf_z_to); z_row.addStretch()
+        pfl.addRow("Z slices:", z_row)
+
         self._bf_ch_spin = QSpinBox()
         self._bf_ch_spin.setRange(0, 15); self._bf_ch_spin.setValue(0)
         pfl.addRow("BF channel index:", self._bf_ch_spin)
@@ -1892,6 +1918,8 @@ class BFPipelineTab(QWidget):
         s.beginGroup("bf")
         self._exe_edit.setText(s.value("ilastik_exe", ""))
         self._ilp_edit.setText(s.value("ilp_path", ""))
+        self._bf_z_from.setValue(s.value("z_start", 0, type=int))
+        self._bf_z_to.setValue(s.value("z_stop", 0, type=int))
         idx = self._proj_combo.findText(s.value("z_method", "min"))
         if idx >= 0:
             self._proj_combo.setCurrentIndex(idx)
@@ -1918,6 +1946,8 @@ class BFPipelineTab(QWidget):
         s.setValue("ilastik_exe",    self._exe_edit.text())
         s.setValue("ilp_path",       self._ilp_edit.text())
         s.setValue("z_method",       self._proj_combo.currentText())
+        s.setValue("z_start",        self._bf_z_from.value())
+        s.setValue("z_stop",         self._bf_z_to.value())
         s.setValue("bf_channel",     self._bf_ch_spin.value())
         s.setValue("save_dir",       self._save_dir_edit.text())
 
@@ -2018,6 +2048,8 @@ class BFPipelineTab(QWidget):
             "ilastik_exe":     self._exe_edit.text().strip(),
             "ilp_path":        self._ilp_edit.text().strip(),
             "z_method":        self._proj_combo.currentText(),
+            "z_start":         self._bf_z_from.value(),
+            "z_stop":          self._bf_z_to.value(),
             "bf_channel":      self._bf_ch_spin.value(),
             "classes":         self.get_classes_config(),
             "save_dir":        self._save_dir_edit.text().strip(),
@@ -2030,6 +2062,9 @@ class BFPipelineTab(QWidget):
         don't have to be re-entered by hand."""
         self._exe_edit.setText(cfg.get("ilastik_exe", ""))
         self._ilp_edit.setText(cfg.get("ilp_path", ""))
+        # Absent in configs saved before sub-stacks existed → whole stack.
+        self._bf_z_from.setValue(int(cfg.get("z_start", 0) or 0))
+        self._bf_z_to.setValue(int(cfg.get("z_stop", 0) or 0))
         idx = self._proj_combo.findText(cfg.get("z_method", "min"))
         if idx >= 0:
             self._proj_combo.setCurrentIndex(idx)
@@ -2214,6 +2249,11 @@ class _BFWorker(QThread):
 
         ops = {"min": np.min, "max": np.max, "mean": np.mean, "sum": np.sum}
         proj_fn = ops.get(cfg["z_method"], np.min)
+        # Sub-stack range, shared with _bf_project_one so the sequential and
+        # parallel projection paths cannot drift apart.
+        from correlative_imaging.pipeline.ilastik import select_z_range
+        z_start = int(cfg.get("z_start", 0) or 0)
+        z_stop  = int(cfg.get("z_stop", 0) or 0)
         ch = cfg["bf_channel"]
 
         # ── Output directories ────────────────────────────────────────
@@ -2255,6 +2295,22 @@ class _BFWorker(QThread):
                     self.log_msg.emit(f"  ⚠ {w.well_id}: no BF — skipped")
                     n_err += 1
 
+            # Pre-flight the Z range against one real stack. Without this a
+            # range that selects nothing fails every well separately, each with
+            # its own traceback — a mistyped setting would read as corrupt data.
+            if (z_start or z_stop) and wells_with_bf:
+                try:
+                    probe = read_image(wells_with_bf[0].bf_path).data[ch]
+                    if probe.ndim == 3:
+                        select_z_range(probe, z_start, z_stop, axis=0,
+                                       label=wells_with_bf[0].well_id)
+                except ValueError as exc:
+                    self.log_msg.emit(f"✗ {exc} Adjust the Z-slice range and re-run.")
+                    self.finished.emit(0, len(wells_with_bf))
+                    return
+                except Exception:
+                    pass    # unreadable first well is Phase 1's problem, not ours
+
             use_parallel = (
                 not self._test_mode and self._proj_workers > 1 and len(wells_with_bf) > 1
             )
@@ -2273,7 +2329,8 @@ class _BFWorker(QThread):
                 well_map = {w.bf_path.stem: w for w in wells_with_bf}
                 tasks = [
                     (str(w.bf_path), w.well_id, ch, cfg["z_method"],
-                     str(in_dir), str(proj_dir) if proj_dir else None)
+                     str(in_dir), str(proj_dir) if proj_dir else None,
+                     z_start, z_stop)
                     for w in wells_with_bf
                 ]
                 ctx = mp.get_context("spawn")
@@ -2318,6 +2375,8 @@ class _BFWorker(QThread):
                         img     = read_image(well.bf_path)
                         ch_data = img.data[ch]          # (Z,H,W) or (H,W)
                         if ch_data.ndim == 3:
+                            ch_data = select_z_range(ch_data, z_start, z_stop,
+                                                     axis=0, label=well.well_id)
                             ch_data = proj_fn(ch_data, axis=0)   # → (H,W), original dtype
 
                         stem = well.bf_path.stem
@@ -3359,6 +3418,14 @@ class ChannelsTab(QWidget):
         self._zproj_cb.toggled.connect(self._zproj_method.setEnabled)
         top_row.addWidget(self._zproj_cb)
         top_row.addWidget(self._zproj_method)
+
+        # Optional sub-stack: project only part of the Z range. 1-based and
+        # inclusive like Fiji's Make Substack; 0 shows as "first"/"last" and
+        # means unbounded, so the default (0, 0) is the whole stack.
+        self._zproj_from, self._zproj_to = _z_range_spinboxes()
+        for w in (QLabel("slices"), self._zproj_from, QLabel("to"), self._zproj_to):
+            self._zproj_cb.toggled.connect(w.setEnabled)
+            top_row.addWidget(w)
         root.addLayout(top_row)
         root.addWidget(splitter)
 
@@ -3367,12 +3434,17 @@ class ChannelsTab(QWidget):
         if disabled. channel=-1 → all channels collapsed once."""
         if not self._zproj_cb.isChecked():
             return None
-        return {"type": "ZProjection", "channel": -1, "method": self._zproj_method.currentText()}
+        return {"type": "ZProjection", "channel": -1,
+                "method": self._zproj_method.currentText(),
+                "z_start": self._zproj_from.value(), "z_stop": self._zproj_to.value()}
 
     def set_zprojection(self, step: dict | None) -> None:
         self._zproj_cb.setChecked(step is not None)
         if step:
             self._zproj_method.setCurrentText(step.get("method", "max"))
+            # Absent in pipelines saved before sub-stacks existed → whole stack.
+            self._zproj_from.setValue(int(step.get("z_start", 0) or 0))
+            self._zproj_to.setValue(int(step.get("z_stop", 0) or 0))
 
     def _on_assign_colors(self) -> None:
         if not self._panels:
@@ -3981,7 +4053,9 @@ def _step_repr(s: dict) -> str:
     """One-line human-readable summary of a single pipeline step dict."""
     t = s.get("type", "?")
     if t == "ZProjection":
-        return f"ZProjection({s.get('method')}, all channels → 2-D)"
+        z0, z1 = s.get("z_start", 0), s.get("z_stop", 0)
+        rng = f", z {z0 or 'first'}–{z1 or 'last'}" if (z0 or z1) else ""
+        return f"ZProjection({s.get('method')}{rng}, all channels → 2-D)"
     if t == "BackgroundSubtraction":
         return f"BackgroundSubtraction({s.get('method')}, r={s.get('radius')}px)"
     if t == "GaussianBlur":
