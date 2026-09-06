@@ -1,7 +1,8 @@
-"""Preprocessing steps: background subtraction, blur, normalization."""
+"""Preprocessing steps: binning, background subtraction, blur, normalization."""
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 import numpy as np
@@ -9,12 +10,90 @@ from scipy.ndimage import gaussian_filter
 
 from .base import PipelineContext, Step, StepResult, register_step
 
+log = logging.getLogger(__name__)
+
 
 def _apply_per_slice(fn, arr: np.ndarray, **kwargs) -> np.ndarray:
     """Apply fn slice-by-slice on (Z, Y, X) or (Y, X) arrays."""
     if arr.ndim == 2:
         return fn(arr, **kwargs)
     return np.stack([fn(z, **kwargs) for z in arr])
+
+
+# ------------------------------------------------------------------
+# Binning — reduce X/Y resolution before anything else runs
+# ------------------------------------------------------------------
+
+@dataclass
+@register_step
+class Binning(Step):
+    """Bin the image in X and Y by an integer factor, for every channel at once.
+
+    Runs first, on the freshly loaded image, so the whole pipeline afterwards
+    works on the smaller array: faster, less memory, and a mild denoising
+    effect from averaging neighbouring pixels.
+
+    ``context.pixel_size_um`` is multiplied by *factor* so that physical
+    measurements stay correct — a 100-pixel object at 0.65 µm/px binned 2×
+    becomes ~25 pixels at 1.30 µm/px, i.e. the same area in µm². Anything
+    reading the pixel size after this step (ParticleAnalysis, dilation in µm,
+    ROI rescaling) therefore needs no changes.
+
+    Z is **not** binned: only the last two axes are reduced, so ``z_step_um``
+    is unchanged and this works the same on ``(C, Y, X)`` and ``(C, Z, Y, X)``.
+
+    Parameters
+    ----------
+    factor:  Bin size in pixels; 1 = no binning (the step becomes a no-op).
+    method:  'mean' (default — averages, reduces noise), 'sum' (preserves total
+             counts), 'max' (keeps peak values) or 'min'.
+    """
+    factor: int = 1
+    method: str = "mean"
+
+    @property
+    def name(self) -> str:
+        return f"binning_{self.factor}x_{self.method}"
+
+    def process(self, image: np.ndarray, context: PipelineContext) -> StepResult:
+        if self.factor <= 1:
+            return StepResult()      # no-op, image passes through untouched
+
+        ops = {"mean": np.mean, "sum": np.sum, "max": np.max, "min": np.min}
+        if self.method not in ops:
+            raise ValueError(f"Unknown binning method: {self.method!r}. "
+                             f"Choose from: {sorted(ops)}")
+        if image.ndim < 2:
+            return StepResult()
+
+        f = int(self.factor)
+        h, w = image.shape[-2:]
+        hc, wc = (h // f) * f, (w // f) * f
+        if hc == 0 or wc == 0:
+            raise ValueError(
+                f"Binning factor {f} is larger than the image ({h}×{w} px)."
+            )
+        if (hc, wc) != (h, w):
+            # A remainder row/column cannot form a full bin. Cropping it is the
+            # only option that keeps every output pixel the average of exactly
+            # f×f inputs — padding would make edge pixels artificially dim.
+            log.info("Binning %d×: cropped %d×%d → %d×%d (remainder discarded).",
+                     f, h, w, hc, wc)
+
+        cropped = image[..., :hc, :wc]
+        # (..., H, W) → (..., H/f, f, W/f, f), then reduce the two bin axes.
+        grouped = cropped.reshape(*cropped.shape[:-2], hc // f, f, wc // f, f)
+        # Reduce in float: 'mean' on an integer array would truncate, and 'sum'
+        # would overflow a uint16 container at factor 4.
+        binned = ops[self.method](grouped.astype(np.float32), axis=(-3, -1))
+
+        context.pixel_size_um = float(context.pixel_size_um) * f
+        return StepResult(
+            image=binned,
+            info={"factor": f, "method": self.method,
+                  "shape": list(binned.shape),
+                  "pixel_size_um": context.pixel_size_um},
+        )
 
 
 # ------------------------------------------------------------------

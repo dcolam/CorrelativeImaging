@@ -3420,6 +3420,28 @@ class ChannelsTab(QWidget):
         # default: collapsing the Z-stack up front makes every downstream step
         # (rolling-ball etc.) run on one plane instead of every slice — much
         # faster, and matches "project → correct → analyse".
+        # Binning runs before everything else, on the freshly loaded image, so
+        # the whole pipeline works on the smaller array. The pixel size is
+        # scaled with it, so µm measurements are unaffected.
+        self._bin_combo = QComboBox()
+        self._bin_combo.addItems(["1× (none)", "2×", "3×", "4×", "6×", "8×"])
+        self._bin_combo.setToolTip(
+            "Bin the image in X and Y before any other step: faster, less memory,\n"
+            "and some noise averaging. The pixel size is scaled to match, so areas\n"
+            "in µm² stay correct. Z is not binned.\n"
+            "Does not apply to the BF/Ilastik pipeline — a trained .ilp expects\n"
+            "the original scale."
+        )
+        self._bin_method = QComboBox()
+        self._bin_method.addItems(["mean", "sum", "max", "min"])
+        self._bin_method.setToolTip("mean averages (denoises); sum preserves total counts.")
+        self._bin_method.setEnabled(False)
+        self._bin_combo.currentIndexChanged.connect(
+            lambda: self._bin_method.setEnabled(self._bin_factor() > 1))
+        top_row.addWidget(QLabel("Bin:"))
+        top_row.addWidget(self._bin_combo)
+        top_row.addWidget(self._bin_method)
+
         self._zproj_cb = QCheckBox("Project Z→2D first")
         self._zproj_cb.setChecked(True)
         self._zproj_cb.setToolTip(
@@ -3451,6 +3473,32 @@ class ChannelsTab(QWidget):
             w.valueChanged.connect(self._update_zdepth_label)
         root.addLayout(top_row)
         root.addWidget(splitter)
+
+    def _bin_factor(self) -> int:
+        """Binning factor from the combo's label ("4×" → 4, "1× (none)" → 1)."""
+        try:
+            return int(self._bin_combo.currentText().split("×")[0])
+        except ValueError:
+            return 1
+
+    def get_binning_step(self) -> dict | None:
+        """The whole-image binning step to put first in the pipeline, or None
+        when binning is off."""
+        f = self._bin_factor()
+        if f <= 1:
+            return None
+        return {"type": "Binning", "factor": f, "method": self._bin_method.currentText()}
+
+    def set_binning(self, step: dict | None) -> None:
+        f = int((step or {}).get("factor", 1) or 1)
+        idx = self._bin_combo.findText(f"{f}×")
+        if f <= 1 or idx < 0:
+            self._bin_combo.setCurrentIndex(0)      # 1× (none)
+        else:
+            self._bin_combo.setCurrentIndex(idx)
+        if step:
+            self._bin_method.setCurrentText(step.get("method", "mean"))
+        self._bin_method.setEnabled(self._bin_factor() > 1)
 
     def set_stack_depth(self, n_slices: int | None) -> None:
         """Tell the tab how deep the currently loaded sample's Z-stack is, so
@@ -3563,6 +3611,7 @@ class ChannelsTab(QWidget):
         sample image already loaded, so channel count/names are known)."""
         steps = pl_dict.get("steps", [])
         # Whole-image Z-projection (channel == -1), if present.
+        self.set_binning(next((s for s in steps if s.get("type") == "Binning"), None))
         zproj = next((s for s in steps if s.get("type") == "ZProjection"), None)
         self.set_zprojection(zproj)
         per_ch_types = {"BackgroundSubtraction", "GaussianBlur", "Normalize",
@@ -4108,6 +4157,9 @@ def _metrics_suffix(selected: list[str] | None, all_choices: list[str]) -> str:
 def _step_repr(s: dict) -> str:
     """One-line human-readable summary of a single pipeline step dict."""
     t = s.get("type", "?")
+    if t == "Binning":
+        return (f"Binning({s.get('factor')}×, {s.get('method')}, all channels, "
+                f"pixel size scaled)")
     if t == "ZProjection":
         z0, z1 = s.get("z_start", 0), s.get("z_stop", 0)
         rng = f", z {z0 or 'first'}–{z1 or 'last'}" if (z0 or z1) else ""
@@ -5507,7 +5559,13 @@ class CorrelativeImagingWidget(QWidget):
         sels   = self._roi_tab.get_selections()
         steps: list[dict] = []
 
-        # ── 0. Z-projection (whole image, once) ──
+        # ── 0a. Binning (whole image, first — everything after works on the
+        # smaller array; context.pixel_size_um is scaled so µm stay correct) ──
+        binning = self._channels_tab.get_binning_step()
+        if binning:
+            steps.append(binning)
+
+        # ── 0b. Z-projection (whole image, once) ──
         zproj = self._channels_tab.get_zprojection_step()
         if zproj:
             steps.append(zproj)
@@ -5567,6 +5625,7 @@ class CorrelativeImagingWidget(QWidget):
         dataclasses, which are safe to read from any thread.
         """
         panels = self._channels_tab.get_panels()
+        binning = self._channels_tab.get_binning_step()     # whole-image, first
         zproj = self._channels_tab.get_zprojection_step()   # whole-image, once
         preprocess_steps: list[dict] = []
         segment_steps: list[dict] = []
@@ -5586,7 +5645,8 @@ class CorrelativeImagingWidget(QWidget):
             per_sel_tail.append((sel, tail))
 
         def _fn(well) -> tuple[dict, list[str]]:
-            steps = ([zproj] if zproj else []) + list(preprocess_steps) + list(segment_steps)
+            steps = (([binning] if binning else []) + ([zproj] if zproj else [])
+                     + list(preprocess_steps) + list(segment_steps))
             missing: list[str] = []
             for sel, tail in per_sel_tail:
                 roi_step = sel.get_roi_step(well)

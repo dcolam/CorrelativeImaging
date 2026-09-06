@@ -2,6 +2,7 @@ from .base import Pipeline, PipelineContext, Step, StepResult, register_step
 from .preprocess import (
     BackgroundSubtraction,
     BlackLevelNormalization,
+    Binning,
     BrightnessContrast,
     GaussianBlur,
     Normalize,
@@ -19,6 +20,7 @@ __all__ = [
     "StepResult",
     "register_step",
     # Preprocessing
+    "Binning",
     "BackgroundSubtraction",
     "BlackLevelNormalization",
     "BrightnessContrast",
