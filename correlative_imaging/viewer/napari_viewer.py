@@ -56,7 +56,10 @@ class NapariViewer:
                    blending: str = "additive") -> None:
         """Add every channel as a separate napari Image layer.
 
-        projection: 'min' | 'max' | 'mean' | 'sum'  (Z-projection method; no-op for 2-D images).
+        projection: 'min' | 'max' | 'mean' | 'sum'  (Z-projection method; no-op
+                    for 2-D images), or ``'none'`` to add the Z-stack
+                    unprojected — napari then shows a Z slider to scroll
+                    through the planes.
         blending:   napari blending mode. Use 'translucent' (not the default
                     'additive') when this image will be shown alongside
                     another — e.g. brightfield next to fluorescence — since
@@ -66,6 +69,26 @@ class NapariViewer:
         from napari.utils.colormaps import ensure_colormap
 
         colormaps = ["gray", "green", "red", "cyan", "magenta", "yellow"]
+        px = image_data.pixel_size_um
+
+        if projection == "none" and image_data.data.ndim == 4:
+            # (C, Z, Y, X) → one 3-D layer per channel. The Z scale comes from
+            # the file; read_image falls back to 1.0 when the format carries no
+            # spacing, which is fine for scrolling but makes a rotated 3-D view
+            # geometrically wrong.
+            stack = image_data.data
+            scale = [image_data.z_step_um or 1.0, px, px]
+            for i, ch_name in enumerate(image_data.channel_names):
+                self._viewer.add_image(
+                    stack[i],
+                    name=f"{group}/{ch_name}",
+                    colormap=colormaps[i % len(colormaps)],
+                    blending=blending,
+                    scale=scale,
+                    contrast_limits=auto_contrast_limits(stack[i]),
+                )
+            return
+
         mip = image_data.project(projection)   # (C, Y, X) or (Y, X)
         if mip.ndim == 2:
             mip = mip[np.newaxis]        # ensure (C, Y, X) shape
@@ -77,7 +100,7 @@ class NapariViewer:
                 name=f"{group}/{ch_name}",
                 colormap=cmap,
                 blending=blending,
-                scale=[image_data.pixel_size_um, image_data.pixel_size_um],
+                scale=[px, px],
                 contrast_limits=auto_contrast_limits(mip[i]),
             )
 

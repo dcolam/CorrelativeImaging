@@ -119,6 +119,16 @@ _STEP_FORMS: dict[str, list[tuple]] = {
 }
 
 
+def _view_projection(combo) -> str:
+    """The projection token behind the viewer's Projection combo.
+
+    The 'none' entry is spelled out in the UI ("none (scroll Z)") but travels
+    through the view signals as the plain token the layer code expects.
+    """
+    text = combo.currentText()
+    return "none" if text.startswith("none") else text
+
+
 def _z_range_spinboxes(tip_subject: str = "projection"):
     """A (first, last) pair of Z-range spin boxes.
 
@@ -1257,9 +1267,12 @@ class PlateTab(QWidget):
         proj_row = QHBoxLayout()
         proj_row.addWidget(QLabel("Projection:"))
         self._view_proj_combo = QComboBox()
-        self._view_proj_combo.addItems(["max", "min", "mean", "sum"])
+        self._view_proj_combo.addItems(["max", "min", "mean", "sum", "none (scroll Z)"])
         self._view_proj_combo.setToolTip(
-            "Z-projection method used when showing images below (no effect on 2-D images)."
+            "Z-projection method used when showing images below (no effect on 2-D images).\n"
+            "'none (scroll Z)' loads the stack unprojected, so napari shows a Z slider.\n"
+            "This is a display setting only — it does not change the pipeline's own\n"
+            "Z-projection, and the whole stack is shown regardless of any sub-stack range."
         )
         proj_row.addWidget(self._view_proj_combo)
         proj_row.addStretch()
@@ -1673,13 +1686,13 @@ class PlateTab(QWidget):
         wid = self._grid._selected
         w = self._wells.get(wid) if wid else None
         if w:
-            self.view_requested.emit(w, which, self._view_proj_combo.currentText())
+            self.view_requested.emit(w, which, _view_projection(self._view_proj_combo))
 
     def _on_view_all(self) -> None:
         wid = self._grid._selected
         w = self._wells.get(wid) if wid else None
         if w:
-            self.overview_requested.emit(w, self._view_proj_combo.currentText())
+            self.overview_requested.emit(w, _view_projection(self._view_proj_combo))
 
     def _on_load_sample(self) -> None:
         wid = self._grid._selected
@@ -3423,11 +3436,54 @@ class ChannelsTab(QWidget):
         # inclusive like Fiji's Make Substack; 0 shows as "first"/"last" and
         # means unbounded, so the default (0, 0) is the whole stack.
         self._zproj_from, self._zproj_to = _z_range_spinboxes()
-        for w in (QLabel("slices"), self._zproj_from, QLabel("to"), self._zproj_to):
+        # Shows the loaded sample's actual depth and the range that will really
+        # be projected. The spin boxes stay unclamped on purpose: a pipeline is
+        # reused across wells whose stacks differ in depth, so capping them to
+        # the sample loaded right now would silently rewrite the setting.
+        self._zdepth_lbl = QLabel("")
+        self._zdepth_lbl.setStyleSheet("color:#aaa; font-size:11px;")
+        self._stack_depth: int | None = None
+        for w in (QLabel("slices"), self._zproj_from, QLabel("to"),
+                  self._zproj_to, self._zdepth_lbl):
             self._zproj_cb.toggled.connect(w.setEnabled)
             top_row.addWidget(w)
+        for w in (self._zproj_from, self._zproj_to):
+            w.valueChanged.connect(self._update_zdepth_label)
         root.addLayout(top_row)
         root.addWidget(splitter)
+
+    def set_stack_depth(self, n_slices: int | None) -> None:
+        """Tell the tab how deep the currently loaded sample's Z-stack is, so
+        the range controls can show real slice numbers instead of only
+        "first"/"last". Pass None when nothing (or a 2-D image) is loaded."""
+        self._stack_depth = n_slices if (n_slices and n_slices > 1) else None
+        self._update_zdepth_label()
+
+    def _update_zdepth_label(self) -> None:
+        n = self._stack_depth
+        if not n:
+            self._zdepth_lbl.setText("")
+            self._zdepth_lbl.setToolTip("Load a sample image to see its stack depth.")
+            return
+        lo, hi = self._zproj_from.value(), self._zproj_to.value()
+        eff_lo, eff_hi = max(1, lo or 1), min(n, hi or n)
+        txt = f"of {n}"
+        if eff_lo > eff_hi or eff_lo > n:
+            txt += "  ⚠ selects no slices"
+            self._zdepth_lbl.setStyleSheet("color:#f66; font-size:11px;")
+        elif (lo and lo != eff_lo) or (hi and hi != eff_hi):
+            # Clamping is logged, but the log panel isn't in front of the user
+            # while they are setting the range — say it here instead.
+            txt += f"  → projects {eff_lo}–{eff_hi}"
+            self._zdepth_lbl.setStyleSheet("color:#FF9800; font-size:11px;")
+        else:
+            self._zdepth_lbl.setStyleSheet("color:#aaa; font-size:11px;")
+        self._zdepth_lbl.setText(txt)
+        self._zdepth_lbl.setToolTip(
+            f"The loaded sample has {n} Z slices. The range is not capped to it: "
+            f"other wells may have deeper or shallower stacks, and 'first'/'last' "
+            f"keeps meaning the whole stack for each."
+        )
 
     def get_zprojection_step(self) -> dict | None:
         """The whole-image Z-projection step to prepend to the pipeline, or None
@@ -5210,6 +5266,15 @@ class CorrelativeImagingWidget(QWidget):
             nv.show_image(image_data, group=label, projection=projection, blending=blending)
         except Exception:
             px = image_data.pixel_size_um; scale = [px, px]
+            if projection == "none" and image_data.data.ndim == 4:
+                # Unprojected: one 3-D layer per channel, Z first in the scale.
+                # ImageData.project() has no "none" mode, so this must branch
+                # before it — otherwise the fallback would quietly re-project.
+                zscale = [image_data.z_step_um or 1.0, px, px]
+                for i, ch in enumerate(image_data.channel_names):
+                    self._viewer.add_image(image_data.data[i], name=f"{label}/{ch}",
+                                           blending=blending, scale=zscale)
+                return
             # ImageData.data always keeps the channel axis first (C,Y,X) or
             # (C,Z,Y,X) per its contract, so .project() always returns (C,Y,X).
             mip = image_data.project(projection)
@@ -5335,6 +5400,11 @@ class CorrelativeImagingWidget(QWidget):
                 v.show_image(img, group="sample")
             except Exception:
                 pass
+
+        nz = None
+        if img is not None and getattr(img, "data", None) is not None and img.data.ndim == 4:
+            nz = int(img.data.shape[1])
+        self._channels_tab.set_stack_depth(nz)
 
         self._channels_tab.set_channels(channel_names)
         self._roi_tab.set_channels(channel_names)
