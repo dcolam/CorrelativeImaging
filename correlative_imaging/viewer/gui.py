@@ -758,6 +758,287 @@ class _PlateGrid(QWidget):
             btn.set_status("empty")
 
 
+# Where user-written naming schemes are kept, so they survive across sessions
+# and projects (the built-ins live in code and are never written here).
+CUSTOM_SCHEMES_PATH = Path.home() / ".correlative_imaging" / "naming_schemes.json"
+
+
+class _SchemeDialog(QDialog):
+    """Pick, auto-detect, or hand-write the file-naming scheme for a folder.
+
+    The point of the preview table is that the user sees exactly how each file
+    would be interpreted — plate, well, field, BF/FL — *before* the scan runs,
+    so an unrecognised convention is fixed here instead of showing up later as
+    a half-empty plate grid.
+    """
+
+    def __init__(self, folder: Path, current_key: str, parent=None):
+        super().__init__(parent)
+        from correlative_imaging.io.naming import (
+            BUILTIN_SCHEMES, DEFAULT_ROLE_MAP, load_custom_schemes,
+        )
+        self.setWindowTitle("File naming scheme")
+        self.resize(900, 640)
+        self._folder = Path(folder)
+        self._schemes = dict(BUILTIN_SCHEMES)
+        self._schemes.update(load_custom_schemes(CUSTOM_SCHEMES_PATH))
+        self._default_role_map = dict(DEFAULT_ROLE_MAP)
+        self.selected_scheme = None
+
+        lay = QVBoxLayout(self)
+
+        intro = QLabel(
+            f"Scanning <b>{self._folder}</b><br>"
+            "Pick the scheme that matches this acquisition system, or write one "
+            "if the convention isn't recognised. The preview shows how each file "
+            "would be read."
+        )
+        intro.setWordWrap(True)
+        lay.addWidget(intro)
+
+        # ── Scheme picker + auto-detect ──────────────────────────────
+        pick_row = QHBoxLayout()
+        pick_row.addWidget(QLabel("Scheme:"))
+        self._combo = QComboBox()
+        for key, sc in self._schemes.items():
+            self._combo.addItem(sc.label + ("" if sc.builtin else "  (custom)"), key)
+        self._combo.addItem("Custom / edit by hand …", "__custom__")
+        self._combo.currentIndexChanged.connect(self._on_scheme_changed)
+        pick_row.addWidget(self._combo, stretch=1)
+        detect_btn = QPushButton("Auto-detect")
+        detect_btn.setToolTip("Try every scheme against the files in this folder "
+                              "and rank them by how many files each explains.")
+        detect_btn.clicked.connect(self._auto_detect)
+        pick_row.addWidget(detect_btn)
+        lay.addLayout(pick_row)
+
+        self._desc_lbl = QLabel("")
+        self._desc_lbl.setWordWrap(True)
+        self._desc_lbl.setStyleSheet("color:#aaa; font-size:11px;")
+        lay.addWidget(self._desc_lbl)
+
+        # ── Editable definition (enabled for custom schemes) ──────────
+        self._edit_box = QGroupBox("Scheme definition")
+        ef = QFormLayout(self._edit_box)
+        self._pattern_edit = QLineEdit()
+        self._pattern_edit.setToolTip(
+            "Regex matched against the path relative to the plate folder, with the\n"
+            "extension stripped (e.g. 'brightfield/PNC_A01_id001_s00_bf').\n"
+            "Named groups: row, col, field, role, role_dir, plate, serial."
+        )
+        ef.addRow("Pattern:", self._pattern_edit)
+        self._ext_edit2 = QLineEdit()
+        self._ext_edit2.setToolTip("Comma-separated, e.g. '.ome.tiff, .tif'")
+        ef.addRow("Extensions:", self._ext_edit2)
+        self._depth_spin = QSpinBox(); self._depth_spin.setRange(1, 8)
+        self._depth_spin.setToolTip("1 = files sit directly in the plate folder; "
+                                    "2 = one level of sub-folders (brightfield/, fluorescence/).")
+        ef.addRow("Search depth:", self._depth_spin)
+        self._role_combo = QComboBox()
+        self._role_combo.addItem("Role from a token in the path (role / role_dir)", "group")
+        self._role_combo.addItem("Role from serial order (lowest = BF, next = FL)", "serial_order")
+        ef.addRow("BF / FL rule:", self._role_combo)
+        self._plate_combo2 = QComboBox()
+        self._plate_combo2.addItem("One plate per folder", "folder")
+        self._plate_combo2.addItem("Plate ID is a token in the path (plate group)", "group")
+        ef.addRow("Plate identity:", self._plate_combo2)
+        self._rolemap_edit = QLineEdit()
+        self._rolemap_edit.setToolTip("token=role pairs, e.g. 'bf=bf, brightfield=bf, w1=fl'")
+        ef.addRow("Role tokens:", self._rolemap_edit)
+        for w in (self._pattern_edit, self._ext_edit2, self._rolemap_edit):
+            w.textChanged.connect(self._refresh_preview)
+        self._depth_spin.valueChanged.connect(self._refresh_preview)
+        self._role_combo.currentIndexChanged.connect(self._refresh_preview)
+        self._plate_combo2.currentIndexChanged.connect(self._refresh_preview)
+        lay.addWidget(self._edit_box)
+
+        # ── Preview ──────────────────────────────────────────────────
+        self._preview_lbl = QLabel("")
+        self._preview_lbl.setWordWrap(True)
+        lay.addWidget(self._preview_lbl)
+        self._table = QTableWidget(0, 5)
+        self._table.setHorizontalHeaderLabels(["File", "Plate", "Well", "Field", "Role"])
+        self._table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self._table.verticalHeader().setVisible(False)
+        lay.addWidget(self._table, stretch=1)
+
+        # ── Buttons ──────────────────────────────────────────────────
+        btn_row = QHBoxLayout()
+        save_btn = QPushButton("Save as custom scheme …")
+        save_btn.setToolTip(f"Stored in {CUSTOM_SCHEMES_PATH}")
+        save_btn.clicked.connect(self._save_custom)
+        btn_row.addWidget(save_btn)
+        btn_row.addStretch()
+        ok_btn = QPushButton("Use this scheme"); ok_btn.setDefault(True)
+        ok_btn.clicked.connect(self._accept)
+        cancel_btn = QPushButton("Cancel"); cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(ok_btn); btn_row.addWidget(cancel_btn)
+        lay.addLayout(btn_row)
+
+        idx = self._combo.findData(current_key)
+        self._combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self._on_scheme_changed()
+
+    # ── scheme <-> widgets ───────────────────────────────────────────
+
+    def _is_custom_mode(self) -> bool:
+        return self._combo.currentData() == "__custom__"
+
+    def _on_scheme_changed(self) -> None:
+        key = self._combo.currentData()
+        if key == "__custom__":
+            self._edit_box.setEnabled(True)
+            self._desc_lbl.setText("Write the pattern yourself, then check the preview below.")
+        else:
+            sc = self._schemes[key]
+            self._edit_box.setEnabled(not sc.builtin)
+            self._desc_lbl.setText(sc.description)
+            self._pattern_edit.setText(sc.pattern)
+            self._ext_edit2.setText(", ".join(sc.extensions))
+            self._depth_spin.setValue(sc.depth)
+            self._role_combo.setCurrentIndex(self._role_combo.findData(sc.role_rule))
+            self._plate_combo2.setCurrentIndex(self._plate_combo2.findData(sc.plate_from))
+            extra = {k: v for k, v in sc.role_map.items()
+                     if self._default_role_map.get(k) != v}
+            self._rolemap_edit.setText(", ".join(f"{k}={v}" for k, v in extra.items()))
+        self._refresh_preview()
+
+    def _current_scheme(self):
+        """Build a scheme from the widgets (custom mode) or return the picked one."""
+        from correlative_imaging.io.naming import NamingScheme
+        key = self._combo.currentData()
+        if key != "__custom__" and self._schemes[key].builtin:
+            return self._schemes[key]
+        role_map = dict(self._default_role_map)
+        for pair in self._rolemap_edit.text().split(","):
+            if "=" in pair:
+                tok, role = pair.split("=", 1)
+                role_map[tok.strip().lower()] = role.strip().lower()
+        exts = tuple(e.strip() for e in self._ext_edit2.text().split(",") if e.strip())
+        return NamingScheme(
+            key=key if key != "__custom__" else "custom",
+            label="Custom" if key == "__custom__" else self._schemes[key].label,
+            pattern=self._pattern_edit.text().strip() or ".^",
+            extensions=exts or (".tif",),
+            depth=self._depth_spin.value(),
+            role_rule=self._role_combo.currentData(),
+            role_map=role_map,
+            plate_from=self._plate_combo2.currentData(),
+        )
+
+    # ── actions ──────────────────────────────────────────────────────
+
+    def _auto_detect(self) -> None:
+        from correlative_imaging.io.naming import detect_scheme
+        scores = detect_scheme(self._folder, list(self._schemes.values()))
+        lines = [f"{s.scheme.label}: {s.n_parsed}/{s.n_files} files recognised"
+                 + (f", {s.n_roles} with an explicit BF/FL role" if s.n_parsed else "")
+                 for s in scores]
+        best = scores[0] if scores and scores[0].n_parsed else None
+        if best is None:
+            QMessageBox.information(
+                self, "Auto-detect",
+                "No built-in scheme recognised these files:\n\n" + "\n".join(lines)
+                + "\n\nPick 'Custom / edit by hand …' and write a pattern.")
+            return
+        idx = self._combo.findData(best.scheme.key)
+        if idx >= 0:
+            self._combo.setCurrentIndex(idx)
+        QMessageBox.information(self, "Auto-detect",
+                                "Best match: " + best.scheme.label + "\n\n" + "\n".join(lines))
+
+    def _refresh_preview(self) -> None:
+        from correlative_imaging.io.naming import _plate_candidates
+        try:
+            scheme = self._current_scheme()
+        except ValueError as exc:
+            self._preview_lbl.setText(f"<span style='color:#f66'>{exc}</span>")
+            self._table.setRowCount(0)
+            return
+
+        plate_dirs = _plate_candidates(self._folder, scheme) or [self._folder]
+        rows, n_files, n_ok = [], 0, 0
+        for pdir in plate_dirs:
+            for path in scheme.iter_files(pdir):
+                n_files += 1
+                rec = scheme.parse(path, pdir)
+                if rec is not None:
+                    n_ok += 1
+                if len(rows) < 60:
+                    try:
+                        shown = path.relative_to(self._folder).as_posix()
+                    except ValueError:
+                        shown = path.name
+                    plate = (rec.plate if rec and rec.plate
+                             else (pdir.name if scheme.plate_from == "folder" else "—"))
+                    rows.append((shown, plate,
+                                 rec.well_id if rec else "—",
+                                 str(rec.field) if rec else "—",
+                                 (rec.role or "by serial order"
+                                  if scheme.role_rule == "serial_order" else rec.role or "—")
+                                 if rec else "—"))
+                if n_files >= 400:
+                    break
+            if n_files >= 400:
+                break
+
+        self._table.setRowCount(len(rows))
+        for r, cells in enumerate(rows):
+            for c, text in enumerate(cells):
+                item = QTableWidgetItem(text)
+                item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                if cells[2] == "—":
+                    item.setForeground(Qt.red)
+                self._table.setItem(r, c, item)
+        self._table.resizeColumnsToContents()
+        self._table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+
+        n_plates = len(plate_dirs)
+        colour = "#4CAF50" if n_ok and n_ok == n_files else ("#FF9800" if n_ok else "#f66")
+        self._preview_lbl.setText(
+            f"<span style='color:{colour}'>{n_ok} of {n_files} file(s) recognised</span> "
+            f"in {n_plates} plate folder(s)"
+            + (f" — showing the first {len(rows)}." if len(rows) < n_files else ".")
+        )
+
+    def _save_custom(self) -> None:
+        from correlative_imaging.io.naming import (
+            BUILTIN_SCHEMES, load_custom_schemes, save_custom_schemes,
+        )
+        from qtpy.QtWidgets import QInputDialog
+        name, ok = QInputDialog.getText(self, "Save scheme", "Name for this scheme:")
+        name = name.strip()
+        if not ok or not name:
+            return
+        key = _sanitize_name(name).lower() or "custom"
+        if key in BUILTIN_SCHEMES:
+            QMessageBox.warning(self, "Name in use",
+                                f"'{name}' collides with a built-in scheme — pick another name.")
+            return
+        try:
+            scheme = self._current_scheme()
+        except ValueError as exc:
+            QMessageBox.critical(self, "Invalid scheme", str(exc))
+            return
+        scheme.key, scheme.label = key, name
+        custom = load_custom_schemes(CUSTOM_SCHEMES_PATH)
+        custom[key] = scheme
+        save_custom_schemes(CUSTOM_SCHEMES_PATH, custom)
+        self._schemes[key] = scheme
+        if self._combo.findData(key) < 0:
+            self._combo.insertItem(self._combo.count() - 1, f"{name}  (custom)", key)
+        self._combo.setCurrentIndex(self._combo.findData(key))
+        QMessageBox.information(self, "Saved", f"Scheme '{name}' saved to\n{CUSTOM_SCHEMES_PATH}")
+
+    def _accept(self) -> None:
+        try:
+            self.selected_scheme = self._current_scheme()
+        except ValueError as exc:
+            QMessageBox.critical(self, "Invalid scheme", str(exc))
+            return
+        self.accept()
+
+
 class PlateTab(QWidget):
     """Tab 1: folder setup + 384-well plate scanner + BF/FL pairing.
 
@@ -813,6 +1094,26 @@ class PlateTab(QWidget):
         # ── 2. Plate scan options ────────────────────────────────────
         scan_box = QGroupBox("2. Plate scan")
         sl = QFormLayout(scan_box)
+
+        # Naming scheme: which acquisition system wrote these files. The
+        # extension row below only applies to the flat Olympus layout — other
+        # schemes carry their own extensions (e.g. .ome.tiff), so it is
+        # disabled for them rather than silently ignored.
+        scheme_row = QHBoxLayout()
+        self._scheme_combo = QComboBox()
+        self._scheme_combo.currentIndexChanged.connect(self._on_scheme_combo_changed)
+        scheme_row.addWidget(self._scheme_combo, stretch=1)
+        scheme_btn = QPushButton("Configure …")
+        scheme_btn.setToolTip("Auto-detect the convention, preview how each file "
+                              "is read, or write a scheme by hand.")
+        scheme_btn.clicked.connect(self._open_scheme_dialog)
+        scheme_row.addWidget(scheme_btn)
+        sl.addRow("Naming scheme:", scheme_row)
+        self._scheme_desc = QLabel("")
+        self._scheme_desc.setWordWrap(True)
+        self._scheme_desc.setStyleSheet("color:#aaa; font-size:11px;")
+        sl.addRow("", self._scheme_desc)
+        self._custom_scheme = None      # set when the dialog returns a hand-written one
 
         self._ext_edit = QLineEdit(".vsi")
         sl.addRow("Extension:", self._ext_edit)
@@ -972,6 +1273,8 @@ class PlateTab(QWidget):
 
         lay.addStretch()
 
+        self._rebuild_scheme_combo()
+
         # Restore saved paths/settings and wire auto-save
         self._load_settings()
         self._connect_persistence()
@@ -992,8 +1295,24 @@ class PlateTab(QWidget):
         self._ext_edit.setText(ext if ext else ".vsi")
         self._contains_edit.setText(s.value("contains", ""))
         self._recursive_cb.setChecked(s.value("recursive", False, type=bool))
+        # A hand-written (unsaved) scheme is stored inline so it survives a
+        # restart; named schemes are restored by key from naming_schemes.json.
+        raw_custom = s.value("custom_scheme", "")
+        if raw_custom:
+            from correlative_imaging.io.naming import NamingScheme
+            try:
+                self._custom_scheme = NamingScheme.from_dict(json.loads(raw_custom))
+            except (ValueError, TypeError, json.JSONDecodeError) as exc:
+                log.warning("Could not restore custom naming scheme: %s", exc)
+                self._custom_scheme = None
+        self._rebuild_scheme_combo()
+        key = s.value("scheme", "olympus_vsi")
+        idx = self._scheme_combo.findData(key)
+        if idx >= 0:
+            self._scheme_combo.setCurrentIndex(idx)
         s.endGroup()
         self._restoring_settings = False
+        self._on_scheme_combo_changed()
 
     def _save_settings(self) -> None:
         s = QSettings("CorrelativeImaging", "CorrelativeImaging")
@@ -1004,6 +1323,9 @@ class PlateTab(QWidget):
         s.setValue("extension",     self._ext_edit.text())
         s.setValue("contains",      self._contains_edit.text())
         s.setValue("recursive",     self._recursive_cb.isChecked())
+        s.setValue("scheme",        self._scheme_combo.currentData() or "olympus_vsi")
+        s.setValue("custom_scheme",
+                   json.dumps(self._custom_scheme.to_dict()) if self._custom_scheme else "")
         s.endGroup()
 
     def _connect_persistence(self) -> None:
@@ -1078,6 +1400,68 @@ class PlateTab(QWidget):
         if p.is_dir():
             self._output_edit.setText(str(p / "output"))
 
+    # ── Naming scheme ────────────────────────────────────────────────
+
+    def _rebuild_scheme_combo(self) -> None:
+        from correlative_imaging.io.naming import BUILTIN_SCHEMES, load_custom_schemes
+        prev = self._scheme_combo.currentData()
+        self._scheme_combo.blockSignals(True)
+        self._scheme_combo.clear()
+        self._all_schemes = dict(BUILTIN_SCHEMES)
+        self._all_schemes.update(load_custom_schemes(CUSTOM_SCHEMES_PATH))
+        for key, sc in self._all_schemes.items():
+            self._scheme_combo.addItem(sc.label + ("" if sc.builtin else "  (custom)"), key)
+        if self._custom_scheme is not None:
+            self._scheme_combo.addItem(f"{self._custom_scheme.label}  (unsaved)", "__custom__")
+        idx = self._scheme_combo.findData(prev)
+        self._scheme_combo.setCurrentIndex(max(idx, 0))
+        self._scheme_combo.blockSignals(False)
+        self._on_scheme_combo_changed()
+
+    def _on_scheme_combo_changed(self) -> None:
+        sc = self._active_scheme()
+        self._scheme_desc.setText(sc.description or "")
+        # The extension box is only honoured by the flat Olympus layout.
+        is_vsi = sc.key == "olympus_vsi"
+        self._ext_edit.setEnabled(is_vsi)
+        if not is_vsi:
+            self._ext_edit.setToolTip(
+                f"Not used by this scheme — it scans {', '.join(sc.extensions)}.")
+        else:
+            self._ext_edit.setToolTip("")
+        if not self._restoring_settings:
+            self._save_settings()
+
+    def _active_scheme(self):
+        """The scheme the next scan will use."""
+        from correlative_imaging.io.naming import DEFAULT_SCHEME
+        key = self._scheme_combo.currentData()
+        if key == "__custom__" and self._custom_scheme is not None:
+            return self._custom_scheme
+        return getattr(self, "_all_schemes", {}).get(key, DEFAULT_SCHEME)
+
+    def _open_scheme_dialog(self) -> None:
+        folder = self._folder_edit.text().strip()
+        if not folder or not Path(folder).is_dir():
+            QMessageBox.warning(self, "No folder",
+                                "Set a valid input folder first — the preview needs "
+                                "real files to show how they would be read.")
+            return
+        dlg = _SchemeDialog(Path(folder), self._scheme_combo.currentData() or "", self)
+        if dlg.exec_() if hasattr(dlg, "exec_") else dlg.exec():
+            sc = dlg.selected_scheme
+            if sc is None:
+                return
+            if sc.key in ("custom",) or sc.key not in dlg._schemes:
+                self._custom_scheme = sc
+            else:
+                self._custom_scheme = None
+            self._rebuild_scheme_combo()
+            target = "__custom__" if self._custom_scheme is not None else sc.key
+            idx = self._scheme_combo.findData(target)
+            if idx >= 0:
+                self._scheme_combo.setCurrentIndex(idx)
+
     def _scan(self) -> None:
         from correlative_imaging.io.plate import discover_plate_folders, scan_plate_folder
         folder = self._folder_edit.text().strip()
@@ -1087,9 +1471,11 @@ class PlateTab(QWidget):
         ext       = self._ext_edit.text().strip() or ".vsi"
         contains  = self._contains_edit.text().strip()
         recursive = self._recursive_cb.isChecked()
+        scheme    = self._active_scheme()
 
         try:
-            plate_folders = discover_plate_folders(folder, extension=ext, contains=contains)
+            plate_folders = discover_plate_folders(folder, extension=ext,
+                                                   contains=contains, scheme=scheme)
         except Exception as exc:
             QMessageBox.critical(self, "Scan failed", str(exc))
             return
@@ -1105,7 +1491,9 @@ class PlateTab(QWidget):
             self._update_plate_table()
             self._wells = {}
             self._grid.clear_all()
-            self._status_lbl.setText("0 wells found — no matching well-coordinate files.")
+            self._status_lbl.setText(
+                f"0 wells found — no files matched the '{scheme.label}' scheme. "
+                f"Use 'Configure …' to auto-detect or write one.")
             self.refresh_json_dropdown(self.input_dir, self.output_dir)
             return
 
@@ -1122,7 +1510,9 @@ class PlateTab(QWidget):
             plate_out = (base_out / _sanitize_name(display_name)) if is_multi else base_out
             bf_roi_dir = plate_out / "bf_pipeline" / "rois"
             wells = scan_plate_folder(pdir, extension=ext, contains=contains,
-                                      recursive=recursive, extra_roi_dirs=[bf_roi_dir])
+                                      recursive=recursive, extra_roi_dirs=[bf_roi_dir],
+                                      scheme=scheme,
+                                      plate_token=key if scheme.plate_from == "group" else None)
             entry = _PlateEntry(key=key, folder=pdir, display_name=display_name,
                                 enabled=old_enabled.get(key, True))
             entry.wells = {w.well_id: w for w in wells}
@@ -1149,6 +1539,11 @@ class PlateTab(QWidget):
         tags: set[str] = set()
         for w in all_wells:
             for p in w.roi_paths:
+                # An ROI whose name the scheme itself parses was named after the
+                # image it was drawn on, not tagged by the user — guessing a tag
+                # from it would invent a bogus "well_existing" selection.
+                if scheme.parse_text(p.stem, p) is not None:
+                    continue
                 tag = _guess_existing_tag(p)
                 if tag:
                     tags.add(tag)
