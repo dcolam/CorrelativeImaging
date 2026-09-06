@@ -43,6 +43,13 @@ instrument uses a word the default token list does not cover, override it::
     --bf-channels 0,3          # explicit w-indices (never guesses)
     --bf-pattern "trans|dia"   # case-insensitive regex on _IllumSetting_
     --no-split                 # old behaviour: one file with all channels
+
+Well ID
+-------
+Each file carries ``id<NNN>``: the row-major well number on the plate — A01=1,
+A24=24, B01=25 … P24=384 for the default 384-well layout (``--plate-format``
+also accepts 96 and 1536). It is unique per *well within one plate*; the ``s<NN>``
+site token and the experiment name distinguish images that share a well ID.
 """
 
 from __future__ import annotations
@@ -127,6 +134,34 @@ def collect(input_dir: Path) -> dict:
         print("  ⚠ No files matched — check the pattern against a real filename.",
               file=sys.stderr)
     return groups
+
+
+# Plate layouts: rows × columns. Wells are numbered row-major within the plate,
+# so A01=1, A24=24, B01=25 … P24=384 on a 384-well plate.
+_PLATE_FORMATS = {96: (8, 12), 384: (16, 24), 1536: (32, 48)}
+
+
+def well_index(well: str, plate_format: int = 384) -> int:
+    """Row-major 1-based well number, e.g. ``A01``→1, ``B01``→25, ``P24``→384.
+
+    Raises ``ValueError`` if the coordinate falls outside *plate_format* — a
+    multi-letter row or a column past the plate width means either the wrong
+    ``--plate-format`` or a filename this numbering does not describe.
+    """
+    n_rows, n_cols = _PLATE_FORMATS[plate_format]
+    m = re.match(r"^([A-Za-z]+)(\d+)$", well)
+    if not m:
+        raise ValueError(f"{well!r} is not a plate coordinate like 'A01'")
+    letters, col = m.group(1).upper(), int(m.group(2))
+    row = 0
+    for ch in letters:                      # AA-style rows for 1536 plates
+        row = row * 26 + (ord(ch) - ord("A") + 1)
+    if not (1 <= row <= n_rows and 1 <= col <= n_cols):
+        raise ValueError(
+            f"well {well!r} (row {row}, col {col}) is outside a {plate_format}-well "
+            f"plate ({n_rows}×{n_cols}) — check --plate-format"
+        )
+    return (row - 1) * n_cols + col
 
 
 # Words that appear in the MetaSeries ``_IllumSetting_`` of a transmitted-light
@@ -326,6 +361,8 @@ def main(argv=None) -> int:
     ap.add_argument("--fl-subdir", default="fluorescence", help="fluorescence sub-folder name")
     ap.add_argument("--bf-suffix", default="bf", help="brightfield filename suffix (default bf)")
     ap.add_argument("--fl-suffix", default="fl", help="fluorescence filename suffix (default fl)")
+    ap.add_argument("--plate-format", type=int, default=384, choices=sorted(_PLATE_FORMATS),
+                    help="plate layout used for the well ID (default 384: A01=1 … P24=384)")
     args = ap.parse_args(argv)
 
     bf_channels = _parse_bf_channels(args.bf_channels)
@@ -341,13 +378,24 @@ def main(argv=None) -> int:
     if not groups:
         return 1
 
+    print(f"Well IDs: {args.plate_format}-well plate, row-major "
+          f"(A01=1, B01={_PLATE_FORMATS[args.plate_format][1] + 1}, "
+          f"last={args.plate_format}); unique per well within one plate.\n")
     seen: set = set()   # distinct channel layouts already reported
     for i, (key, recs) in enumerate(sorted(groups.items()), 1):
-        name, _well, site = key
+        name, file_well, site = key
         arr, ome, well, ws = build_group(recs, args.dxy, args.dz, args.unit)
         names = ome["Channel"]["Name"]
         prefix = f"[{i}/{len(groups)}]"
-        stem = f"{name}_{well}_s{site:02d}"
+        # Numbered from the *filename* coordinate: build_group's `well` may come
+        # from the stage-label tag, which is an arbitrary string on some setups.
+        try:
+            wid = well_index(file_well, args.plate_format)
+        except ValueError as e:
+            print(f"{prefix} ⚠ {e} — skipping this group.", file=sys.stderr)
+            continue
+        ome["Name"] = f"{name}_{well}_id{wid:03d}_s{site:02d}"
+        stem = f"{name}_{well}_id{wid:03d}_s{site:02d}"
 
         if args.no_split:
             _write(args.output / f"{stem}.ome.tiff", arr, ome, "", prefix)
