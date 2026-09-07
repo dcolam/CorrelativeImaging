@@ -60,6 +60,11 @@ class NapariViewer:
                     for 2-D images), or ``'none'`` to add the Z-stack
                     unprojected — napari then shows a Z slider to scroll
                     through the planes.
+        Layers are added with napari's own min/max contrast limits — no
+        percentile stretch. The 1–99.5 % stretch clipped real signal often
+        enough to be misleading; it is still available on demand via the Run
+        tab's "Auto" contrast button.
+
         blending:   napari blending mode. Use 'translucent' (not the default
                     'additive') when this image will be shown alongside
                     another — e.g. brightfield next to fluorescence — since
@@ -85,7 +90,6 @@ class NapariViewer:
                     colormap=colormaps[i % len(colormaps)],
                     blending=blending,
                     scale=scale,
-                    contrast_limits=auto_contrast_limits(stack[i]),
                 )
             return
 
@@ -101,7 +105,6 @@ class NapariViewer:
                 colormap=cmap,
                 blending=blending,
                 scale=[px, px],
-                contrast_limits=auto_contrast_limits(mip[i]),
             )
 
     def show_mask(
@@ -187,7 +190,6 @@ class NapariViewer:
                         visible=False,
                         blending="additive",
                         scale=[image_data.pixel_size_um, image_data.pixel_size_um],
-                        contrast_limits=auto_contrast_limits(mip[i]),
                     )
             for mask_name, mask in result.masks.items():
                 self.show_mask(

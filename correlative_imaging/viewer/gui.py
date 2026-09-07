@@ -1077,7 +1077,6 @@ class PlateTab(QWidget):
 
     channels_ready = Signal(list)   # list[str] channel names after sample load
     well_selected  = Signal(object) # WellInfo when a well is clicked
-    view_requested = Signal(object, str, str)  # (WellInfo, "bf" | "fl", projection)
     overview_requested = Signal(object, str)  # (WellInfo, projection) — BF + FL + ROI
     existing_rois_detected = Signal(list)  # list[str] distinct tags found across the scan
     load_pipeline_requested = Signal(dict)  # parsed pipeline dict, ready to apply everywhere
@@ -1278,20 +1277,18 @@ class PlateTab(QWidget):
         proj_row.addStretch()
         dl.addRow(proj_row)
 
-        view_row = QHBoxLayout()
-        self._view_bf_btn  = QPushButton("Show BF in viewer")
-        self._view_fl_btn  = QPushButton("Show FL in viewer")
-        self._view_all_btn = QPushButton("Show BF + FL + ROI overview")
+        # One way to show a well: BF + FL + ROI together. Separate "Show BF" /
+        # "Show FL" buttons were removed — they showed a strict subset of this
+        # view, and napari's per-layer visibility checkboxes already toggle
+        # BF against FL once the overview is loaded.
+        self._view_all_btn = QPushButton("Show BF + FL + ROI in viewer")
         self._view_all_btn.setStyleSheet("font-weight:bold")
-        self._view_bf_btn.setEnabled(False)
-        self._view_fl_btn.setEnabled(False)
+        self._view_all_btn.setToolTip(
+            "Load this well into napari: brightfield, fluorescence and any ROI\n"
+            "files, as separate layers. Use napari's layer list to show or hide\n"
+            "BF vs FL individually.")
         self._view_all_btn.setEnabled(False)
-        self._view_bf_btn.clicked.connect(lambda: self._on_view("bf"))
-        self._view_fl_btn.clicked.connect(lambda: self._on_view("fl"))
         self._view_all_btn.clicked.connect(self._on_view_all)
-        view_row.addWidget(self._view_bf_btn)
-        view_row.addWidget(self._view_fl_btn)
-        dl.addRow(view_row)
         dl.addRow(self._view_all_btn)
 
         self._load_btn = QPushButton(
@@ -1368,8 +1365,8 @@ class PlateTab(QWidget):
     # ── Load pipeline JSON ────────────────────────────────────────────
 
     def refresh_json_dropdown(self, input_dir=None, output_dir=None) -> None:
-        """Repopulate the dropdown with *_pipeline.json files found in both
-        the input and output folders (the naming convention from RunTab's
+        """Repopulate the dropdown with *_pipeline.json files found anywhere
+        under the input and output folders (the naming convention from RunTab's
         auto-save, see _run_basename — but a JSON could also have been saved
         or copied next to the raw data). Call whenever either folder might
         have changed, e.g. right after a plate scan."""
@@ -1384,14 +1381,18 @@ class PlateTab(QWidget):
             d = Path(d)
             if not d.is_dir():
                 continue
-            for p in sorted(d.glob("*_pipeline.json")):
+            # Recursive: with multiple plates each JSON is written inside that
+            # plate's own output subfolder, so a top-level glob finds nothing.
+            for p in sorted(d.rglob("*_pipeline.json")):
                 resolved = p.resolve()
                 if resolved not in seen:
                     seen.add(resolved)
                     found.append(p)
         if found:
             for p in found:
-                self._json_combo.addItem(p.name, str(p))
+                # Every plate writes the same base name, so the parent folder
+                # is what distinguishes them in the dropdown.
+                self._json_combo.addItem(f"{p.parent.name}/{p.name}", str(p))
         else:
             self._json_combo.addItem("(none found in input/output folder)")
         idx = self._json_combo.findText(current)
@@ -1676,17 +1677,9 @@ class PlateTab(QWidget):
             self._d_roi.setText("\n".join(p.name for p in w.roi_paths))
         else:
             self._d_roi.setText("none detected")
-        self._view_bf_btn.setEnabled(w.bf_path is not None)
-        self._view_fl_btn.setEnabled(w.fl_path is not None)
         self._view_all_btn.setEnabled(w.bf_path is not None or w.fl_path is not None)
         self._load_btn.setEnabled(True)
         self.well_selected.emit(w)
-
-    def _on_view(self, which: str) -> None:
-        wid = self._grid._selected
-        w = self._wells.get(wid) if wid else None
-        if w:
-            self.view_requested.emit(w, which, _view_projection(self._view_proj_combo))
 
     def _on_view_all(self) -> None:
         wid = self._grid._selected
@@ -1817,7 +1810,11 @@ class BFPipelineTab(QWidget):
 
         self._proj_combo = QComboBox()
         self._proj_combo.addItems(["min", "max", "mean", "sum"])
-        self._proj_combo.setToolTip("Min projection works best for transmitted-light BF")
+        self._proj_combo.setToolTip(
+            "How the BF Z-stack is collapsed to the single 2-D plane Ilastik sees.\n"
+            "'min' is right for transmitted light: structures absorb light and so\n"
+            "appear dark, and a minimum projection keeps the darkest value per pixel."
+        )
         pfl.addRow("Z-projection:", self._proj_combo)
 
         # Sub-stack for the BF projection — the planes that actually carry the
@@ -1830,6 +1827,12 @@ class BFPipelineTab(QWidget):
 
         self._bf_ch_spin = QSpinBox()
         self._bf_ch_spin.setRange(0, 15); self._bf_ch_spin.setValue(0)
+        self._bf_ch_spin.setToolTip(
+            "Which channel of the brightfield file Ilastik segments.\n"
+            "0 for a single-channel transmitted-light image — the usual case.\n"
+            "Only matters if your BF file has several channels; it does not\n"
+            "refer to the fluorescence channels."
+        )
         pfl.addRow("BF channel index:", self._bf_ch_spin)
 
         lay.addWidget(param_box)
@@ -1851,6 +1854,12 @@ class BFPipelineTab(QWidget):
         self._n_classes_spin = QSpinBox()
         self._n_classes_spin.setRange(1, 9)
         self._n_classes_spin.setValue(2)
+        self._n_classes_spin.setToolTip(
+            "How many labels your Ilastik project was trained with.\n"
+            "Must match the .ilp: Ilastik's Simple Segmentation output is an\n"
+            "integer label image (1, 2, 3 …) and each row below names one of\n"
+            "those labels so it can become an ROI selection."
+        )
         self._n_classes_spin.valueChanged.connect(self._on_n_classes_changed)
         n_row.addWidget(self._n_classes_spin)
         n_row.addStretch()
@@ -2965,6 +2974,7 @@ class ChannelPanel(QWidget):
         # ── Name ───────────────────────────────────────────────────
         id_box = QGroupBox("Channel identity")
         ifl = QFormLayout(id_box)
+        self._raw_name = raw_name
         self._name_edit = QLineEdit(raw_name)
         self._name_edit.textChanged.connect(self.name_changed)
         ifl.addRow("Display name:", self._name_edit)
@@ -3164,6 +3174,17 @@ class ChannelPanel(QWidget):
     def display_name(self) -> str:
         t = self._name_edit.text().strip()
         return t if t else f"ch{self._ch_index}"
+
+    def has_custom_name(self) -> bool:
+        """True when the user typed their own display name, so a newly loaded
+        sample's channel names must not overwrite it."""
+        return self._name_edit.text().strip() not in ("", self._raw_name)
+
+    def set_raw_name(self, name: str) -> None:
+        """Refresh the name that came from the image file, keeping any user edit."""
+        if not self.has_custom_name():
+            self._name_edit.setText(name)
+        self._raw_name = name
 
     @property
     def display_color(self) -> str:
@@ -3405,21 +3426,38 @@ class ChannelsTab(QWidget):
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
 
-        root = QVBoxLayout(self)
+        # ChannelsTab owns the whole-image controls (binning, Z-projection,
+        # Z-range) but shows them on a separate page, so the GUI can present
+        # them as their own "Preprocessing" tab. Same controller-with-pages
+        # pattern PlateTab uses: keeping one owner means get_binning_step(),
+        # get_zprojection_step() and populate_from_pipeline() are unchanged.
+        self.preprocess_page = QWidget()
+        self.channels_page = QWidget()
+
+        root = QVBoxLayout(self.channels_page)
         root.setContentsMargins(0, 0, 0, 0)
         top_row = QHBoxLayout()
         disable_btn = QPushButton("Disable all steps (all channels)")
         disable_btn.clicked.connect(self._disable_all_steps)
-        top_row.addWidget(disable_btn)
         colors_btn = QPushButton("Assign channel colors …")
         colors_btn.clicked.connect(self._on_assign_colors)
-        top_row.addWidget(colors_btn)
-        top_row.addStretch()
         # Z-projection runs ONCE for the whole image, before any per-channel
         # preprocessing — so it's a tab-level control, not per channel. On by
         # default: collapsing the Z-stack up front makes every downstream step
         # (rolling-ball etc.) run on one plane instead of every slice — much
         # faster, and matches "project → correct → analyse".
+        pre_lay = QVBoxLayout(self.preprocess_page)
+        pre_lay.addWidget(QLabel(
+            "<b>These run once on the whole image</b>, for every channel together, "
+            "before any per-channel preprocessing.<br>"
+            "Per-channel steps (background subtraction, blur, scaling) stay in the "
+            "<b>Channels</b> tab, since each channel can be set up differently."
+        ))
+        bin_box = QGroupBox("1. Binning")
+        bin_lay = QHBoxLayout(bin_box)
+        zbox = QGroupBox("2. Z-projection")
+        top_row = QHBoxLayout(zbox)     # the Z controls below fill this row
+
         # Binning runs before everything else, on the freshly loaded image, so
         # the whole pipeline works on the smaller array. The pixel size is
         # scaled with it, so µm measurements are unaffected.
@@ -3438,9 +3476,11 @@ class ChannelsTab(QWidget):
         self._bin_method.setEnabled(False)
         self._bin_combo.currentIndexChanged.connect(
             lambda: self._bin_method.setEnabled(self._bin_factor() > 1))
-        top_row.addWidget(QLabel("Bin:"))
-        top_row.addWidget(self._bin_combo)
-        top_row.addWidget(self._bin_method)
+        bin_lay.addWidget(QLabel("Bin X/Y by:"))
+        bin_lay.addWidget(self._bin_combo)
+        bin_lay.addWidget(QLabel("using"))
+        bin_lay.addWidget(self._bin_method)
+        bin_lay.addStretch()
 
         self._zproj_cb = QCheckBox("Project Z→2D first")
         self._zproj_cb.setChecked(True)
@@ -3471,7 +3511,16 @@ class ChannelsTab(QWidget):
             top_row.addWidget(w)
         for w in (self._zproj_from, self._zproj_to):
             w.valueChanged.connect(self._update_zdepth_label)
-        root.addLayout(top_row)
+        top_row.addStretch()
+        pre_lay.addWidget(bin_box)
+        pre_lay.addWidget(zbox)
+        pre_lay.addStretch()
+
+        ch_top = QHBoxLayout()
+        ch_top.addWidget(disable_btn)
+        ch_top.addWidget(colors_btn)
+        ch_top.addStretch()
+        root.addLayout(ch_top)
         root.addWidget(splitter)
 
     def _bin_factor(self) -> int:
@@ -3564,6 +3613,22 @@ class ChannelsTab(QWidget):
             self._stack.setCurrentWidget(self._panels[row])
 
     def set_channels(self, raw_names: list[str]) -> None:
+        """Define the channel panels.
+
+        When the channel *count* is unchanged — the usual case when loading
+        another well as the sample image — the existing panels are kept and only
+        their labels refresh. Rebuilding would silently discard every
+        preprocessing, threshold and analysis setting the user had configured,
+        which made "load this well as sample" destructive.
+        """
+        if len(raw_names) == len(self._panels) and self._panels:
+            for i, name in enumerate(raw_names):
+                item = self._ch_list.item(i)
+                if item and not self._panels[i].has_custom_name():
+                    item.setText(name)
+                    self._panels[i].set_raw_name(name)
+            return
+
         for panel in self._panels:
             self._stack.removeWidget(panel)
         self._panels.clear()
@@ -3822,7 +3887,13 @@ class ROISelectionsTab(QWidget):
         self._src_grp  = QButtonGroup(self)
         self._rb_whole = QRadioButton("Whole image  (no restriction)")
         self._rb_auto  = QRadioButton("Auto-detect from channel")
-        self._rb_file  = QRadioButton("Import from file  (.roi / .tif)")
+        self._rb_file  = QRadioButton("Import from file  (.roi / .tif) — same file for ALL wells")
+        self._rb_file.setToolTip(
+            "One ROI file applied to every well in the run. Use this only when the\n"
+            "region really is identical everywhere.\n"
+            "For a different ROI per well, use 'BF-pipeline class' (generated per\n"
+            "well by the BF Pipeline tab) or 'existing project ROI' (matched per\n"
+            "well by well coordinate in the filename).")
         self._rb_well_class    = QRadioButton("BF-pipeline ROI  (per well, batch only)")
         self._rb_well_existing = QRadioButton("Existing project ROI  (per well, batch only)")
         self._rb_whole.setChecked(True)
@@ -3849,6 +3920,10 @@ class ROISelectionsTab(QWidget):
 
         self._class_name_edit = QLineEdit()
         self._class_name_edit.setPlaceholderText("e.g. hole — must match a BF Pipeline class name")
+        self._class_name_edit.setToolTip(
+            "Per-well: each well uses the ROI the BF pipeline produced for that\n"
+            "well and this class. Contrast with 'ROI file', which applies ONE\n"
+            "file to every well in the run.")
         self._class_name_row_label = QLabel("Match class name:")
         dfl.addRow(self._class_name_row_label, self._class_name_edit)
         self._class_name_row_label.setVisible(False)
@@ -4037,10 +4112,20 @@ class CombineTab(QWidget):
         btn_row = QHBoxLayout()
         add_btn = QPushButton("+ Add pair")
         add_btn.clicked.connect(self._add_pair)
+        all_btn = QPushButton("Add all pairs")
+        all_btn.setToolTip(
+            "Add every ordered channel pair (each channel as primary against every "
+            "other as secondary).\nManders M1/M2 are direction-dependent, so A→B and "
+            "B→A are both included: 3 channels → 6 pairs.")
+        all_btn.clicked.connect(self._add_all_pairs)
         rm_btn  = QPushButton("− Remove selected")
         rm_btn.clicked.connect(self._remove_pair)
+        clear_btn = QPushButton("Clear all")
+        clear_btn.clicked.connect(lambda: self._table.setRowCount(0))
         btn_row.addWidget(add_btn)
+        btn_row.addWidget(all_btn)
         btn_row.addWidget(rm_btn)
+        btn_row.addWidget(clear_btn)
         cl.addLayout(btn_row)
         lay.addWidget(box)
 
@@ -4060,12 +4145,53 @@ class CombineTab(QWidget):
         self._table.insertRow(r)
         primary   = QComboBox(); primary.addItems(labels)
         secondary = QComboBox(); secondary.addItems(labels); secondary.setCurrentIndex(min(1, len(labels) - 1))
-        dilation  = QDoubleSpinBox(); dilation.setRange(0, 20); dilation.setValue(0.5); dilation.setSuffix(" µm")
+        dilation  = QDoubleSpinBox(); dilation.setRange(0, 20); dilation.setValue(0.0); dilation.setSuffix(" µm")
+        dilation.setToolTip(
+            "Grow the primary channel's mask by this much before measuring overlap.\n"
+            "0 = no dilation: overlap is measured on the segmented objects themselves.")
         z_proj    = QComboBox(); z_proj.addItems(["max", "mean", "sum"])
         self._table.setCellWidget(r, 0, primary)
         self._table.setCellWidget(r, 1, secondary)
         self._table.setCellWidget(r, 2, dilation)
         self._table.setCellWidget(r, 3, z_proj)
+
+    def _add_all_pairs(self) -> None:
+        """Every ordered pair of distinct channels.
+
+        Ordered, not combinations: Manders' M1/M2 and the per-particle overlap
+        fraction are defined relative to the *primary* channel, so A→B and B→A
+        are different measurements. n channels → n·(n−1) pairs (3 → 6).
+        """
+        n = len(self._channel_names)
+        if n < 2:
+            QMessageBox.information(
+                self, "Not enough channels",
+                "Load a sample image (or a pipeline JSON) so the channels are known first.")
+            return
+        existing = {(r["primary_channel"], r["secondary_channel"])
+                    for r in self._current_rows()}
+        added = 0
+        for i in range(n):
+            for j in range(n):
+                if i == j or (i, j) in existing:
+                    continue
+                self._add_pair()
+                r = self._table.rowCount() - 1
+                self._table.cellWidget(r, 0).setCurrentIndex(i)
+                self._table.cellWidget(r, 1).setCurrentIndex(j)
+                added += 1
+        log.info("Colocalization: added %d pair(s); table now has %d.",
+                 added, self._table.rowCount())
+
+    def _current_rows(self) -> list[dict]:
+        """Primary/secondary indices currently in the table."""
+        out = []
+        for r in range(self._table.rowCount()):
+            pw, sw = self._table.cellWidget(r, 0), self._table.cellWidget(r, 1)
+            if isinstance(pw, QComboBox) and isinstance(sw, QComboBox):
+                out.append({"primary_channel": pw.currentIndex(),
+                            "secondary_channel": sw.currentIndex()})
+        return out
 
     def _remove_pair(self) -> None:
         row = self._table.currentRow()
@@ -4097,7 +4223,7 @@ class CombineTab(QWidget):
                 steps.append({"type": "ColocalizationAnalysis",
                                "primary_channel":   p.currentIndex(),
                                "secondary_channel": s.currentIndex(),
-                               "dilation_um":       d.value() if isinstance(d, QDoubleSpinBox) else 0.5,
+                               "dilation_um":       d.value() if isinstance(d, QDoubleSpinBox) else 0.0,
                                "z_projection":      zp.currentText() if isinstance(zp, QComboBox) else "max",
                                "roi_mask":          roi_mask_key})
         return steps
@@ -4125,7 +4251,7 @@ class CombineTab(QWidget):
             if isinstance(sec, QComboBox):
                 sec.setCurrentIndex(s.get("secondary_channel", 0))
             if isinstance(d, QDoubleSpinBox):
-                d.setValue(s.get("dilation_um", 0.5))
+                d.setValue(s.get("dilation_um", 0.0))
             if isinstance(zp, QComboBox):
                 zp.setCurrentText(s.get("z_projection", "max"))
 
@@ -4203,20 +4329,35 @@ def _format_pipeline_summary(pl_dict: dict, well=None, bf_cfg: dict | None = Non
     pipeline if `well` is None), not a re-derived approximation.
     """
     steps = pl_dict.get("steps", [])
-    lines = [f"Pipeline: {pl_dict.get('name', 'pipeline')}"]
+    lines = [f"Pipeline: {pl_dict.get('name', 'pipeline')}   ({len(steps)} steps)"]
     if well is not None:
-        lines.append(f"Well: {getattr(well, 'well_id', '?')}  — exactly what batch runs for this well.")
+        lines.append(f"Resolved for well {getattr(well, 'well_id', '?')} — "
+                     f"this is EXACTLY what a batch run executes for this well.")
     else:
-        lines.append("No well selected — whole-image pipeline (per-well ROI selections not resolved).")
+        lines.append("⚠ No well selected. Per-well ROI selections are NOT resolved here, "
+                     "so this is not what batch runs. Select a well in the Plate tab.")
     lines.append("")
 
-    pre_seg_types = {"ZProjection", "BackgroundSubtraction", "GaussianBlur", "Normalize",
-                     "BlackLevelNormalization", "AutoThreshold", "WatershedSplit"}
-    pre_seg = [s for s in steps if s["type"] in pre_seg_types]
-    rest    = [s for s in steps if s["type"] not in pre_seg_types]
+    # Whole-image steps run once, before anything per-channel. Binning used to
+    # fall through to the ROI grouping below and appear under "[whole image]",
+    # which read as if it were an ROI-restricted step.
+    global_types = {"Binning", "ZProjection"}
+    per_ch_types = {"BackgroundSubtraction", "GaussianBlur", "Normalize",
+                    "BlackLevelNormalization", "AutoThreshold", "WatershedSplit"}
+    global_steps = [s for s in steps if s["type"] in global_types]
+    pre_seg = [s for s in steps if s["type"] in per_ch_types]
+    rest    = [s for s in steps if s["type"] not in global_types | per_ch_types]
+
+    lines.append("=== 1. Whole image (once, before anything else) ===")
+    if global_steps:
+        for s in global_steps:
+            lines.append(f"  {_step_repr(s)}")
+    else:
+        lines.append("  (no binning, no Z-projection — steps run on the raw stack)")
+    lines.append("")
 
     if bf_cfg and bf_cfg.get("classes"):
-        lines.append("=== BF-Pipeline / Ilastik ===")
+        lines.append("=== 0. BF-Pipeline / Ilastik (produces the ROI files) ===")
         lines.append(f"Project: {bf_cfg.get('ilp_path') or '(not set)'}")
         for c in bf_cfg["classes"]:
             status = ""
@@ -4228,7 +4369,7 @@ def _format_pipeline_summary(pl_dict: dict, well=None, bf_cfg: dict | None = Non
         lines.append("")
 
     if pre_seg:
-        lines.append("=== Preprocessing & segmentation (per channel) ===")
+        lines.append("=== 2. Preprocessing & segmentation (per channel) ===")
         by_ch: dict = {}
         for s in pre_seg:
             by_ch.setdefault(s.get("channel"), []).append(s)
@@ -4253,7 +4394,7 @@ def _format_pipeline_summary(pl_dict: dict, well=None, bf_cfg: dict | None = Non
                 order.append(key)
             g["steps"].append(s)
 
-    lines.append("=== ROI selections ===")
+    lines.append("=== 3. Analysis, per ROI selection ===")
     if not order:
         lines.append("  (none)")
     for key in order:
@@ -4868,7 +5009,25 @@ class RunTab(QWidget):
         )
         diag_note.setStyleSheet("color: gray; font-size: 10px;")
         dfl.addWidget(diag_note)
-        bl.addWidget(diag_box)
+        # The diagnostics options are numerous and rarely changed mid-session,
+        # so they live in their own dialog rather than crowding the Run tab.
+        self._diag_box = diag_box
+        self._diag_dialog = QDialog(self)
+        self._diag_dialog.setWindowTitle("Diagnostic images")
+        _dl = QVBoxLayout(self._diag_dialog)
+        _dl.addWidget(diag_box)
+        _close = QPushButton("Close")
+        _close.clicked.connect(self._diag_dialog.accept)
+        _dl.addWidget(_close)
+
+        diag_row = QHBoxLayout()
+        self._diag_btn = QPushButton("Diagnostic images …")
+        self._diag_btn.clicked.connect(self._open_diag_dialog)
+        self._diag_summary_lbl = QLabel("")
+        self._diag_summary_lbl.setStyleSheet("color:#aaa; font-size:11px;")
+        diag_row.addWidget(self._diag_btn)
+        diag_row.addWidget(self._diag_summary_lbl, stretch=1)
+        bl.addLayout(diag_row)
 
         ctrl = QHBoxLayout()
         self._run_btn   = QPushButton("Run batch"); self._run_btn.setStyleSheet("font-weight:bold")
@@ -4993,13 +5152,18 @@ class RunTab(QWidget):
                 return
             self._run_well_preview(img_data, well, pipeline_dict_fn)
         else:
-            if well is None:
-                self._log(
-                    "No well selected — previewing the simplified whole-image "
-                    "pipeline (per-well ROI selections are skipped; select a "
-                    "well in Setup for a full, batch-equivalent preview)."
-                )
-            self._run_preview_with_dict(img_data, self._get_pipeline_dict())
+            # Previously this fell back to build_pipeline_dict(well=None), which
+            # silently DROPS every per-well ROI selection — so the preview ran a
+            # different pipeline than batch would, distinguished only by whether
+            # a grid cell happened to be selected. Refuse instead: a preview
+            # that isn't what batch runs is worse than no preview.
+            QMessageBox.information(
+                self, "Select a well first",
+                "The single-image run uses the identical pipeline batch will run, "
+                "resolved against one well's own ROI files.\n\n"
+                "Pick a well in the Plate tab, then press this button again."
+            )
+            self._log("Preview aborted — no well selected.")
 
     def _run_well_preview(self, img_data, well, pipeline_dict_fn) -> None:
         self._log(f"Building FL preview pipeline for {well.well_id} …")
@@ -5049,7 +5213,6 @@ class RunTab(QWidget):
                     raw_layer_by_ch[i] = self._viewer.add_image(
                         raw_mip[i], name=f"raw/{ch}", colormap=_color_for(i),
                         visible=False, blending="additive", scale=scale,
-                        contrast_limits=auto_contrast_limits(raw_mip[i]),
                     )
 
             context = PipelineContext(channel_names=img_data.channel_names,
@@ -5085,7 +5248,6 @@ class RunTab(QWidget):
                             mip[step_ch], name=f"{step_name}/{ch}",
                             visible=False, blending="additive",
                             colormap=cmap, scale=scale,
-                            contrast_limits=auto_contrast_limits(mip[step_ch]),
                         )
                         # AutoThreshold/WatershedSplit never set result.image
                         # (only result.masks), so any layer added here is
@@ -5099,7 +5261,6 @@ class RunTab(QWidget):
                                 mip[i], name=f"{step_name}/{ch}",
                                 visible=False, blending="additive",
                                 colormap=cmap, scale=scale,
-                                contrast_limits=auto_contrast_limits(mip[i]),
                             )
                             last_preproc_layer[i] = lyr
                 for mk, mask in result.masks.items():
@@ -5152,6 +5313,30 @@ class RunTab(QWidget):
             self._preview_btn.setEnabled(True)
             self._preview_btn.setText("Run pipeline on sample image (shows in napari)")
 
+    def _open_diag_dialog(self) -> None:
+        self._diag_dialog.exec_() if hasattr(self._diag_dialog, "exec_") else self._diag_dialog.exec()
+        self._refresh_diag_summary()
+
+    def _refresh_diag_summary(self) -> None:
+        """One line on the Run tab saying what the dialog will actually write —
+        so an unticked box can't silently cost a whole run's diagnostics."""
+        if not (self._diag_whole_cb.isChecked() or self._diag_crops_cb.isChecked()):
+            self._diag_summary_lbl.setText("off — no diagnostic images will be written")
+            return
+        what = []
+        if self._diag_whole_cb.isChecked():
+            what.append("whole image")
+        if self._diag_crops_cb.isChecked():
+            which = ("all selections" if self._crop_selection is None
+                     else (", ".join(sorted(self._crop_selection)) or "NONE chosen"))
+            what.append(f"crops ({which}, +{self._diag_crop_pad.value():g} µm)")
+        fmts = [n for n, cb in (("tiff", self._diag_tiff_cb), ("jpg", self._diag_jpg_cb))
+                if cb.isChecked()]
+        if self._diag_multichannel_cb.isChecked():
+            fmts.append("per-channel TIF" + (" +BF" if self._diag_bf_cb.isChecked() else ""))
+        self._diag_summary_lbl.setText(
+            f"{' + '.join(what)} → {', '.join(fmts) or 'NO FORMAT CHECKED'}")
+
     # ── Crop-selection choice ────────────────────────────────────────
 
     def _roi_selection_list(self) -> list[tuple[str, str]]:
@@ -5173,6 +5358,7 @@ class RunTab(QWidget):
             all_keys = {k for k, _ in sels}
             self._crop_selection = None if chosen == all_keys else chosen
             self._refresh_crop_which_label()
+            self._refresh_diag_summary()
             self._save_settings()
 
     def _refresh_crop_which_label(self) -> None:
@@ -5214,6 +5400,7 @@ class RunTab(QWidget):
         s.endGroup()
         self._crop_which_btn.setEnabled(self._diag_crops_cb.isChecked())
         self._refresh_crop_which_label()
+        self._refresh_diag_summary()
 
     def _save_settings(self) -> None:
         s = QSettings("CorrelativeImaging", "CorrelativeImaging")
@@ -5228,7 +5415,9 @@ class RunTab(QWidget):
     def _connect_persistence(self) -> None:
         for cb in self._diag_widgets().values():
             cb.toggled.connect(self._save_settings)
+            cb.toggled.connect(self._refresh_diag_summary)
         self._diag_crop_pad.valueChanged.connect(self._save_settings)
+        self._diag_crop_pad.valueChanged.connect(self._refresh_diag_summary)
 
     def _on_run(self) -> None:
         setup = self._get_setup()
@@ -5449,7 +5638,10 @@ class CorrelativeImagingWidget(QWidget):
         self._tabs.addTab(self._plate_tab.setup_page, "Setup")
         self._tabs.addTab(self._plate_tab.plate_page, "Plate")
         self._tabs.addTab(self._bf_tab,       "BF Pipeline")
-        self._tabs.addTab(self._channels_tab, "Channels")
+        # ChannelsTab is a controller owning two pages (see its _build):
+        # whole-image preprocessing and the per-channel panels.
+        self._tabs.addTab(self._channels_tab.preprocess_page, "Preprocessing")
+        self._tabs.addTab(self._channels_tab.channels_page, "Channels")
         self._tabs.addTab(self._roi_tab,      "ROI & Selections")
         self._tabs.addTab(self._combine_tab,  "Colocalization")
         self._tabs.addTab(self._advanced_tab, "Pipeline Summary")
@@ -5458,10 +5650,11 @@ class CorrelativeImagingWidget(QWidget):
 
         self._plate_tab.channels_ready.connect(self._on_channels_ready)
         self._plate_tab.well_selected.connect(self._on_well_selected)
-        self._plate_tab.view_requested.connect(self._on_view_requested)
         self._plate_tab.overview_requested.connect(self._on_overview_requested)
 
-        self._view_cache: dict[tuple, object] = {}  # (well_id, "bf"/"fl") → image_data
+        # (well_id, "bf"/"fl") → ImageData, so re-showing a well's overview
+        # doesn't re-read the files.
+        self._view_cache: dict[tuple, object] = {}
         self._view_worker = None
 
         root = QVBoxLayout(self)
@@ -5490,8 +5683,7 @@ class CorrelativeImagingWidget(QWidget):
             mip = image_data.project(projection)
             for i, ch in enumerate(image_data.channel_names):
                 self._viewer.add_image(mip[i], name=f"{label}/{ch}",
-                                       blending=blending, scale=scale,
-                                       contrast_limits=auto_contrast_limits(mip[i]))
+                                       blending=blending, scale=scale)
 
     def _add_roi_overlays(self, well, shape_yx: tuple, pixel_size_um: float = 1.0) -> None:
         # Separate Labels layers per ROI file — napari's own layer-visibility
@@ -5518,12 +5710,6 @@ class CorrelativeImagingWidget(QWidget):
                 scale=scale,
             )
 
-    def _show_in_viewer(self, image_data, label: str, well=None, projection: str = "max") -> None:
-        self._viewer.layers.clear()
-        self._add_image_layers(image_data, label, projection)
-        if well is not None:
-            self._add_roi_overlays(well, image_data.data.shape[-2:], image_data.pixel_size_um)
-
     def _show_well_overview(self, well, bf_data, fl_data, projection: str) -> None:
         self._viewer.layers.clear()
         shape_yx = None
@@ -5542,29 +5728,6 @@ class CorrelativeImagingWidget(QWidget):
                 pixel_size_um = fl_data.pixel_size_um
         if shape_yx is not None:
             self._add_roi_overlays(well, shape_yx, pixel_size_um)
-
-    def _on_view_requested(self, well, which: str, projection: str = "max") -> None:
-        if self._viewer is None:
-            return
-        path = well.bf_path if which == "bf" else well.fl_path
-        if path is None:
-            return
-        label = which.upper()
-        cache_key = (well.well_id, which)
-
-        if cache_key in self._view_cache:
-            self._show_in_viewer(self._view_cache[cache_key], label, well, projection)
-            return
-
-        def _loaded(image_data):
-            self._view_cache[cache_key] = image_data
-            self._show_in_viewer(image_data, label, well, projection)
-
-        self._view_worker = _LoadImageWorker(path)
-        self._view_worker.loaded.connect(_loaded)
-        self._view_worker.error.connect(lambda msg: None)
-        self._view_worker.start()
-        self._viewer.status = f"Loading {label} for well {well.well_id} …"
 
     def _on_overview_requested(self, well, projection: str = "max") -> None:
         """Show BF + FL + this well's ROI(s) together, for the Setup tab's
@@ -5759,6 +5922,22 @@ class CorrelativeImagingWidget(QWidget):
             # _on_load_pipeline_json.
             "channel_names": self._channels_tab.get_channel_names(),
             "bf_pipeline": self._bf_tab.get_config(),
+            # Selections whose ROI file is resolved per well at run time. They
+            # cannot appear in "steps" here (there is no well to resolve
+            # against), so a reader of this file would otherwise conclude the
+            # run had no ROI steps at all — see the note below.
+            "per_well_selections": [
+                {"label": sel.label, "source": sel.source, "mask_key": sel.mask_key,
+                 "class_name": sel.class_name, "existing_tag": sel.existing_tag}
+                for sel in sels if sel.source in ("well_class", "well_existing")
+            ],
+            "_note": (
+                "'steps' is the pipeline as configured, WITHOUT the per-well ROI "
+                "steps listed in 'per_well_selections' — those are resolved against "
+                "each well's own ROI files when the run happens. The exact step list "
+                "executed for a given well is stored in that run's database, table "
+                "pipeline_runs, column pipeline_json."
+            ),
         }
 
     def make_well_pipeline_dict_fn(self):

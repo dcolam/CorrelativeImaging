@@ -238,7 +238,34 @@ def _load_bf_projection(diag_dir, well_id: str, target_shape=None):
     return None
 
 
-def _save_multichannel_tif(planes, channel_names, bf_plane, path) -> None:
+_IJ_LUT_RGB = {
+    "gray": (255, 255, 255), "grey": (255, 255, 255), "white": (255, 255, 255),
+    "red": (255, 0, 0), "green": (0, 255, 0), "blue": (0, 0, 255),
+    "cyan": (0, 255, 255), "magenta": (255, 0, 255), "yellow": (255, 255, 0),
+    "orange": (255, 128, 0),
+}
+
+
+def _imagej_luts(colors, n: int):
+    """Per-channel ImageJ LUTs (3×256 uint8 ramps), or None if no usable colors.
+
+    Without these the TIF opens in grayscale and the channel colours chosen in
+    the Channels tab are lost — the composite JPG had them, the real data did not.
+    """
+    import numpy as np
+
+    if not colors:
+        return None
+    ramp = np.arange(256, dtype="uint8")
+    luts = []
+    for i in range(n):
+        name = str(colors[i]).lower() if i < len(colors) else "gray"
+        r, g, b = _IJ_LUT_RGB.get(name, (255, 255, 255))
+        luts.append(np.stack([(ramp * (c / 255)).astype("uint8") for c in (r, g, b)]))
+    return luts
+
+
+def _save_multichannel_tif(planes, channel_names, bf_plane, path, colors=None) -> None:
     """Write real per-channel data as an ImageJ-readable multi-channel TIF
     (axes CYX, one slice per channel, channel labels preserved). Fluorescence
     planes are saved as float32 as-is (lossless, comparable across wells); the
@@ -261,10 +288,15 @@ def _save_multichannel_tif(planes, channel_names, bf_plane, path) -> None:
         labels.append("BF")
 
     stack = np.stack(chans, axis=0)   # (C, Y, X)
-    tifffile.imwrite(
-        str(path), stack, imagej=True,
-        metadata={"axes": "CYX", "Labels": labels},
-    )
+    meta = {"axes": "CYX", "Labels": labels, "mode": "composite"}
+    # BF, when appended, is always the last channel and is grayscale.
+    lut_colors = list(colors or [])
+    if bf_plane is not None:
+        lut_colors = lut_colors[:len(chans) - 1] + ["gray"]
+    luts = _imagej_luts(lut_colors, len(chans))
+    if luts is not None:
+        meta["LUTs"] = luts
+    tifffile.imwrite(str(path), stack, imagej=True, metadata=meta)
 
 
 def _save_well_diagnostics(
@@ -322,7 +354,7 @@ def _save_well_diagnostics(
         if multichannel:
             _save_multichannel_tif(
                 planes, channel_names, bf_plane,
-                out_dir / f"{well.well_id}_whole_channels.tif",
+                out_dir / f"{well.well_id}_whole_channels.tif", colors=colors,
             )
 
     if diag_cfg.get("crops"):
@@ -354,6 +386,7 @@ def _save_well_diagnostics(
                 _save_multichannel_tif(
                     cropped_planes, channel_names, bf_crop,
                     out_dir / f"{well.well_id}_{roi_name}_crop_channels.tif",
+                    colors=colors,
                 )
 
     if diag_cfg.get("save_particle_labels"):
