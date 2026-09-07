@@ -190,12 +190,27 @@ def _project_planes(arr) -> "np.ndarray":
     return arr.max(axis=1) if arr.ndim == 4 else arr
 
 
-def _load_bf_projection(diag_dir, well_id: str):
+def _load_bf_projection(diag_dir, well_id: str, target_shape=None):
     """Load this well's brightfield projection (written by the BF pipeline to
     ``<output>/bf_pipeline/projections/<well>_proj.tif``) for inclusion as an
-    extra channel. Returns a 2-D array, or None if not found."""
+    extra channel. Returns a 2-D array, or None if not found.
+
+    *target_shape* is the (Y, X) shape of the pipeline's own planes. The BF
+    pipeline deliberately does **not** bin — a trained Ilastik ``.ilp`` expects
+    the original scale — so when the analysis pipeline bins, this projection is
+    larger than the planes it is being stacked with. It is binned down here by
+    the same integer factor to match; without that, ``np.stack`` in
+    :func:`_save_multichannel_tif` raises on mismatched shapes and the ROI-crop
+    bounding boxes (computed on the binned grid) would index the wrong region.
+
+    Returns None, with a warning, when the two grids are not related by a whole
+    factor — a resampled-but-misaligned overlay is worse than no overlay.
+    """
     import numpy as np
     import tifffile
+
+    from correlative_imaging.pipeline.preprocess import bin_array
+
     proj = Path(diag_dir).parent / "bf_pipeline" / "projections" / f"{well_id}_proj.tif"
     if not proj.exists():
         return None
@@ -203,9 +218,24 @@ def _load_bf_projection(diag_dir, well_id: str):
         arr = tifffile.imread(str(proj))
         if arr.ndim == 3:                 # collapse any stray channel/z axis
             arr = arr.max(axis=0)
-        return np.asarray(arr, dtype=np.float32)
+        arr = np.asarray(arr, dtype=np.float32)
     except Exception:
         return None
+
+    if target_shape is None or tuple(arr.shape) == tuple(target_shape):
+        return arr
+
+    th, tw = target_shape
+    fy, fx = arr.shape[0] // th if th else 0, arr.shape[1] // tw if tw else 0
+    if fy >= 1 and fy == fx and arr.shape[0] // fy == th and arr.shape[1] // fx == tw:
+        return bin_array(arr, fy, "mean")
+
+    log.warning(
+        "Well %s: BF projection is %s but the pipeline planes are %s — not a whole "
+        "binning factor apart, so the BF channel is omitted from diagnostics.",
+        well_id, tuple(arr.shape), tuple(target_shape),
+    )
+    return None
 
 
 def _save_multichannel_tif(planes, channel_names, bf_plane, path) -> None:
@@ -271,7 +301,12 @@ def _save_well_diagnostics(
     # as an extra labelled channel.
     multichannel = diag_cfg.get("multichannel_tif", False)
     channel_names = list(getattr(context, "channel_names", []) or [])
-    bf_plane = _load_bf_projection(out_dir, well.well_id) if diag_cfg.get("include_bf") else None
+    # Pass the pipeline's own plane shape so a binned run still lines up.
+    bf_plane = (
+        _load_bf_projection(out_dir, well.well_id,
+                            target_shape=planes[0].shape[-2:] if planes else None)
+        if diag_cfg.get("include_bf") else None
+    )
 
     roi_names = [
         s["roi_name"] for s in pl_dict.get("steps", [])
@@ -292,7 +327,19 @@ def _save_well_diagnostics(
 
     if diag_cfg.get("crops"):
         pad_px = round(diag_cfg.get("crop_pad_um", 0.0) / (pixel_size_um or 1.0))
-        for roi_name, mask in roi_masks.items():
+        # None = every selection (the historical behaviour). A list restricts
+        # crops to those mask keys — a background/whole selection's "crop" is
+        # the full frame, so cropping it only doubles the output.
+        wanted = diag_cfg.get("crop_selections")
+        to_crop = (roi_masks if wanted is None
+                   else {k: v for k, v in roi_masks.items() if k in set(wanted)})
+        if wanted is not None and not to_crop and roi_masks:
+            log.warning(
+                "Well %s: crops are on but none of the chosen selections %s matched "
+                "this well's ROIs %s — no crops written.",
+                well.well_id, sorted(wanted), sorted(roi_masks),
+            )
+        for roi_name, mask in to_crop.items():
             bbox = bbox_from_mask(mask, pad_px)
             if bbox is None:
                 continue

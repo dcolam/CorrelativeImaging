@@ -24,6 +24,41 @@ def _apply_per_slice(fn, arr: np.ndarray, **kwargs) -> np.ndarray:
 # Binning — reduce X/Y resolution before anything else runs
 # ------------------------------------------------------------------
 
+_BIN_OPS = {"mean": np.mean, "sum": np.sum, "max": np.max, "min": np.min}
+
+
+def bin_array(arr: np.ndarray, factor: int, method: str = "mean") -> np.ndarray:
+    """Bin the last two axes of *arr* by an integer *factor*, returning float32.
+
+    Shape-agnostic ahead of those two axes, so it handles ``(Y, X)``,
+    ``(C, Y, X)`` and ``(C, Z, Y, X)`` alike. Module-level rather than a method
+    on :class:`Binning` so the diagnostics path can bin a brightfield plane onto
+    the same grid the pipeline produced, using this exact reduction.
+
+    A remainder row/column that cannot form a full bin is cropped. Padding
+    instead would leave edge pixels averaging fewer than f×f inputs, i.e.
+    artificially dim.
+    """
+    if method not in _BIN_OPS:
+        raise ValueError(f"Unknown binning method: {method!r}. "
+                         f"Choose from: {sorted(_BIN_OPS)}")
+    f = int(factor)
+    if f <= 1:
+        return arr
+    h, w = arr.shape[-2:]
+    hc, wc = (h // f) * f, (w // f) * f
+    if hc == 0 or wc == 0:
+        raise ValueError(f"Binning factor {f} is larger than the image ({h}×{w} px).")
+    if (hc, wc) != (h, w):
+        log.info("Binning %d×: cropped %d×%d → %d×%d (remainder discarded).",
+                 f, h, w, hc, wc)
+    cropped = arr[..., :hc, :wc]
+    # (..., H, W) → (..., H/f, f, W/f, f), then reduce the two bin axes.
+    grouped = cropped.reshape(*cropped.shape[:-2], hc // f, f, wc // f, f)
+    # Reduce in float: 'mean' on an integer array would truncate, and 'sum'
+    # would overflow a uint16 container at factor 4.
+    return _BIN_OPS[method](grouped.astype(np.float32), axis=(-3, -1))
+
 @dataclass
 @register_step
 class Binning(Step):
@@ -56,38 +91,19 @@ class Binning(Step):
         return f"binning_{self.factor}x_{self.method}"
 
     def process(self, image: np.ndarray, context: PipelineContext) -> StepResult:
-        if self.factor <= 1:
+        if self.factor <= 1 or image.ndim < 2:
             return StepResult()      # no-op, image passes through untouched
 
-        ops = {"mean": np.mean, "sum": np.sum, "max": np.max, "min": np.min}
-        if self.method not in ops:
-            raise ValueError(f"Unknown binning method: {self.method!r}. "
-                             f"Choose from: {sorted(ops)}")
-        if image.ndim < 2:
-            return StepResult()
-
+        binned = bin_array(image, self.factor, self.method)
         f = int(self.factor)
-        h, w = image.shape[-2:]
-        hc, wc = (h // f) * f, (w // f) * f
-        if hc == 0 or wc == 0:
-            raise ValueError(
-                f"Binning factor {f} is larger than the image ({h}×{w} px)."
-            )
-        if (hc, wc) != (h, w):
-            # A remainder row/column cannot form a full bin. Cropping it is the
-            # only option that keeps every output pixel the average of exactly
-            # f×f inputs — padding would make edge pixels artificially dim.
-            log.info("Binning %d×: cropped %d×%d → %d×%d (remainder discarded).",
-                     f, h, w, hc, wc)
-
-        cropped = image[..., :hc, :wc]
-        # (..., H, W) → (..., H/f, f, W/f, f), then reduce the two bin axes.
-        grouped = cropped.reshape(*cropped.shape[:-2], hc // f, f, wc // f, f)
-        # Reduce in float: 'mean' on an integer array would truncate, and 'sum'
-        # would overflow a uint16 container at factor 4.
-        binned = ops[self.method](grouped.astype(np.float32), axis=(-3, -1))
-
         context.pixel_size_um = float(context.pixel_size_um) * f
+        # Recorded so LoadROI can place an ROI file that has no pixel-size
+        # provenance: such a file was drawn on the unbinned image, and without
+        # this it would keep its original coordinates on a smaller canvas.
+        # Cumulative, so two Binning steps compose.
+        context.metadata["binning_factor"] = (
+            float(context.metadata.get("binning_factor", 1.0)) * f
+        )
         return StepResult(
             image=binned,
             info={"factor": f, "method": self.method,

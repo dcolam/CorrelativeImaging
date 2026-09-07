@@ -4582,11 +4582,64 @@ class _DaskDashboardDialog(QDialog):
 # Tab 6 – Run
 # ──────────────────────────────────────────────────────────────────
 
+class _CropSelectionDialog(QDialog):
+    """Pick which ROI selections get cropped diagnostic images.
+
+    Cropping every selection is rarely what you want: a whole-image or
+    background selection produces a "crop" the size of the full frame, which
+    doubles the output for no information. Ticking only the tight selections
+    (e.g. the hole) keeps the diagnostics folder readable.
+    """
+
+    def __init__(self, selections: list[tuple[str, str]], chosen: set[str] | None,
+                 parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Crop which selections?")
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel(
+            "Diagnostic crops are written for the ticked selections only.\n"
+            "Each produces a JPG composite plus, with 'real per-channel TIFs'\n"
+            "on, an uncompressed multi-channel TIF (and the BF projection\n"
+            "cropped to the same box, when that option is on)."
+        ))
+
+        self._boxes: dict[str, QCheckBox] = {}
+        if not selections:
+            lay.addWidget(QLabel(
+                "<i>No ROI selections defined yet — set them up in the\n"
+                "'ROI &amp; Selections' tab first.</i>"))
+        for mask_key, label in selections:
+            cb = QCheckBox(f"{label}   ({mask_key})")
+            # No stored choice yet → everything on, matching the old behaviour
+            # of cropping every selection.
+            cb.setChecked(chosen is None or mask_key in chosen)
+            self._boxes[mask_key] = cb
+            lay.addWidget(cb)
+
+        btn_row = QHBoxLayout()
+        all_btn = QPushButton("All")
+        all_btn.clicked.connect(lambda: [b.setChecked(True) for b in self._boxes.values()])
+        none_btn = QPushButton("None")
+        none_btn.clicked.connect(lambda: [b.setChecked(False) for b in self._boxes.values()])
+        btn_row.addWidget(all_btn); btn_row.addWidget(none_btn); btn_row.addStretch()
+        ok = QPushButton("OK"); ok.setDefault(True); ok.clicked.connect(self.accept)
+        cancel = QPushButton("Cancel"); cancel.clicked.connect(self.reject)
+        btn_row.addWidget(ok); btn_row.addWidget(cancel)
+        lay.addLayout(btn_row)
+
+    def chosen(self) -> set[str]:
+        return {k for k, cb in self._boxes.items() if cb.isChecked()}
+
+
 class RunTab(QWidget):
     def __init__(self, get_setup, get_pipeline_dict, get_bf_config=None,
                  make_well_pipeline_dict_fn=None, napari_viewer=None,
-                 get_channel_colors=None, parent=None):
+                 get_channel_colors=None, get_roi_selections=None, parent=None):
         super().__init__(parent)
+        # () -> list[(mask_key, label)] for the crop-selection dialog
+        self._get_roi_selections = get_roi_selections
+        # None = crop every selection (the historical behaviour)
+        self._crop_selection: set[str] | None = None
         self._get_setup         = get_setup
         self._get_pipeline_dict = get_pipeline_dict
         self._get_bf_config     = get_bf_config
@@ -4736,8 +4789,20 @@ class RunTab(QWidget):
         diag_check_row = QHBoxLayout()
         self._diag_whole_cb = QCheckBox("Whole image")
         self._diag_crops_cb = QCheckBox("Crop around each ROI")
+        self._crop_which_btn = QPushButton("Which selections …")
+        self._crop_which_btn.setToolTip(
+            "Choose which ROI selections get cropped images.\n"
+            "Untick e.g. a background selection whose 'crop' is the whole frame."
+        )
+        self._crop_which_btn.clicked.connect(self._on_choose_crop_selections)
+        self._crop_which_btn.setEnabled(False)
+        self._diag_crops_cb.toggled.connect(self._crop_which_btn.setEnabled)
+        self._crop_which_lbl = QLabel("")
+        self._crop_which_lbl.setStyleSheet("color:#aaa; font-size:11px;")
         diag_check_row.addWidget(self._diag_whole_cb)
         diag_check_row.addWidget(self._diag_crops_cb)
+        diag_check_row.addWidget(self._crop_which_btn)
+        diag_check_row.addWidget(self._crop_which_lbl)
         diag_check_row.addStretch()
         dfl.addLayout(diag_check_row)
 
@@ -4829,6 +4894,12 @@ class RunTab(QWidget):
         self._log_edit.setStyleSheet("font-family:monospace; font-size:11px;")
         ll.addWidget(self._log_edit)
         lay.addWidget(log_box)
+
+        # Restore the diagnostics choices and keep them saved from here on:
+        # they used to reset every session, so a run could silently produce no
+        # crops because the checkbox had come back unticked.
+        self._load_settings()
+        self._connect_persistence()
 
     def _set_all_layers_visible(self, visible: bool) -> None:
         if self._viewer is None:
@@ -5081,6 +5152,84 @@ class RunTab(QWidget):
             self._preview_btn.setEnabled(True)
             self._preview_btn.setText("Run pipeline on sample image (shows in napari)")
 
+    # ── Crop-selection choice ────────────────────────────────────────
+
+    def _roi_selection_list(self) -> list[tuple[str, str]]:
+        if self._get_roi_selections is None:
+            return []
+        try:
+            return list(self._get_roi_selections())
+        except Exception:
+            log.debug("Could not read ROI selections for the crop dialog", exc_info=True)
+            return []
+
+    def _on_choose_crop_selections(self) -> None:
+        sels = self._roi_selection_list()
+        dlg = _CropSelectionDialog(sels, self._crop_selection, self)
+        if dlg.exec_() if hasattr(dlg, "exec_") else dlg.exec():
+            chosen = dlg.chosen()
+            # "everything ticked" is stored as None so a selection added later
+            # is cropped too, instead of being silently excluded by an old list.
+            all_keys = {k for k, _ in sels}
+            self._crop_selection = None if chosen == all_keys else chosen
+            self._refresh_crop_which_label()
+            self._save_settings()
+
+    def _refresh_crop_which_label(self) -> None:
+        if self._crop_selection is None:
+            self._crop_which_lbl.setText("all selections")
+            return
+        if not self._crop_selection:
+            self._crop_which_lbl.setText("⚠ none — no crops will be written")
+            return
+        names = sorted(self._crop_selection)
+        shown = ", ".join(names[:3]) + (f" +{len(names)-3}" if len(names) > 3 else "")
+        self._crop_which_lbl.setText(shown)
+
+    # ── Persistence ──────────────────────────────────────────────────
+
+    def _diag_widgets(self) -> dict:
+        return {
+            "diag_whole":        self._diag_whole_cb,
+            "diag_crops":        self._diag_crops_cb,
+            "diag_tiff":         self._diag_tiff_cb,
+            "diag_jpg":          self._diag_jpg_cb,
+            "diag_stamp":        self._diag_stamp_cb,
+            "diag_particles":    self._diag_particles_cb,
+            "diag_multichannel": self._diag_multichannel_cb,
+            "diag_bf":           self._diag_bf_cb,
+        }
+
+    def _load_settings(self) -> None:
+        """Restore the diagnostics choices. These used to reset every session,
+        so a run could silently produce no crops because the box had come back
+        unticked."""
+        s = QSettings("CorrelativeImaging", "CorrelativeImaging")
+        s.beginGroup("run")
+        for key, cb in self._diag_widgets().items():
+            cb.setChecked(s.value(key, cb.isChecked(), type=bool))
+        self._diag_crop_pad.setValue(float(s.value("diag_crop_pad", self._diag_crop_pad.value())))
+        raw = s.value("diag_crop_selection", "")
+        self._crop_selection = set(str(raw).split("\x1f")) if raw else None
+        s.endGroup()
+        self._crop_which_btn.setEnabled(self._diag_crops_cb.isChecked())
+        self._refresh_crop_which_label()
+
+    def _save_settings(self) -> None:
+        s = QSettings("CorrelativeImaging", "CorrelativeImaging")
+        s.beginGroup("run")
+        for key, cb in self._diag_widgets().items():
+            s.setValue(key, cb.isChecked())
+        s.setValue("diag_crop_pad", self._diag_crop_pad.value())
+        s.setValue("diag_crop_selection",
+                   "\x1f".join(sorted(self._crop_selection)) if self._crop_selection else "")
+        s.endGroup()
+
+    def _connect_persistence(self) -> None:
+        for cb in self._diag_widgets().values():
+            cb.toggled.connect(self._save_settings)
+        self._diag_crop_pad.valueChanged.connect(self._save_settings)
+
     def _on_run(self) -> None:
         setup = self._get_setup()
         if setup.input_dir is None:
@@ -5117,6 +5266,9 @@ class RunTab(QWidget):
                     "save_particle_labels": self._diag_particles_cb.isChecked(),
                     "multichannel_tif": self._diag_multichannel_cb.isChecked(),
                     "include_bf": self._diag_bf_cb.isChecked(),
+                    # None → crop every selection; a list → only those mask keys.
+                    "crop_selections": (sorted(self._crop_selection)
+                                        if self._crop_selection is not None else None),
                     # "output_dir" is filled in per-plate below.
                 }
             else:
@@ -5275,6 +5427,12 @@ class CorrelativeImagingWidget(QWidget):
             get_pipeline_dict = self.build_pipeline_dict,
             get_bf_config     = self._bf_tab.get_config,
             make_well_pipeline_dict_fn = self.make_well_pipeline_dict_fn,
+            # Only selections that produce an ROI mask can be cropped — a
+            # "whole image" selection has no mask_key and its crop would be
+            # the frame itself.
+            get_roi_selections = lambda: [(sel.mask_key, sel.label)
+                                          for sel in self._roi_tab.get_selections()
+                                          if sel.mask_key],
             napari_viewer     = napari_viewer,
             get_channel_colors = lambda: [p.display_color for p in self._channels_tab.get_panels()],
         )

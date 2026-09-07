@@ -221,7 +221,7 @@ class LoadROI(Step):
 
         h, w = image.shape[-2], image.shape[-1]
         suffix = src.suffix.lower()
-        scale = self._pixel_scale(src, context.pixel_size_um)
+        scale = self._pixel_scale(src, context.pixel_size_um, context)
 
         if suffix == ".roi":
             mask = self._from_imagej(src, h, w, scale=scale)
@@ -238,35 +238,42 @@ class LoadROI(Step):
     # ── Private helpers ──────────────────────────────────────────────
 
     @staticmethod
-    def _pixel_scale(src, target_pixel_size_um: float) -> float:
+    def _pixel_scale(src, target_pixel_size_um: float, context=None) -> float:
         """Ratio to convert pixel coordinates stored in *src* into the
         target image's pixel grid.
 
-        Looks for a ``<src>.json`` sidecar (written by the BF Pipeline tab,
-        see ``gui._save_roi``) recording the physical pixel size of the
-        image the ROI was drawn on. If the ROI's source image had a
-        different pixel size than the image it's now being applied to (e.g.
-        a brightfield ROI applied to a differently-scaled fluorescence
-        image), returns the ratio needed to rescale raw stored pixel
-        coordinates onto the target's pixel grid. Returns ``1.0`` (no
-        rescaling — today's behavior) when there's no sidecar, no recorded
-        pixel size, or the target's pixel size is unknown/zero — this is the
-        case for pre-existing ROI files with no provenance to rescale from.
+        Two sources of truth, in order:
+
+        1. A ``<src>.json`` sidecar (written by the BF Pipeline tab, see
+           ``gui._save_roi``) recording the physical pixel size of the image
+           the ROI was drawn on. If that differs from the image the ROI is now
+           being applied to — a brightfield ROI on a differently-scaled
+           fluorescence image, or any image the pipeline has binned — this
+           gives the exact ratio.
+        2. Failing that, the cumulative ``Binning`` factor recorded on the
+           context. An ROI file with no provenance was necessarily drawn on the
+           unbinned image, so its coordinates must shrink by the same factor;
+           without this it would keep full-resolution coordinates on a smaller
+           canvas and be clipped into the corner.
+
+        Returns ``1.0`` when neither applies — an unbinned run with an ROI file
+        that has no sidecar, which is the historical behaviour.
         """
         import json
         from pathlib import Path as _Path
 
         sidecar = _Path(str(src) + ".json")
-        if not sidecar.exists() or not target_pixel_size_um:
-            return 1.0
-        try:
-            info = json.loads(sidecar.read_text())
-            source_px = info.get("pixel_size_um")
-        except Exception:
-            return 1.0
-        if not source_px:
-            return 1.0
-        return source_px / target_pixel_size_um
+        source_px = None
+        if sidecar.exists() and target_pixel_size_um:
+            try:
+                source_px = json.loads(sidecar.read_text()).get("pixel_size_um")
+            except Exception:
+                source_px = None
+        if source_px:
+            return source_px / target_pixel_size_um
+
+        binning = float(getattr(context, "metadata", {}).get("binning_factor", 1.0) or 1.0)
+        return 1.0 / binning if binning > 1 else 1.0
 
     @staticmethod
     def _from_imagej(src, h: int, w: int, scale: float = 1.0) -> np.ndarray:
