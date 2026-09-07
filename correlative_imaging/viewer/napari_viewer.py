@@ -20,6 +20,62 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
+def ensure_display_dims(viewer, data_ndim: int) -> bool:
+    """Drop the viewer out of 3-D display when the layers about to be added are
+    2-D. Returns True if the mode was changed.
+
+    napari renders a 3-D view with vispy's Volume visual, which raises
+    ``ValueError: Volume visual needs a 3D array`` the moment a 2-D layer is
+    inserted — and it raises from inside the layer-inserted event, so the layer
+    is half-added and the whole call blows up. Projected previews and overviews
+    are always 2-D, so switch first rather than let that happen.
+
+    Only ever steps *down* to 2-D: a 3-D stack (the "none (scroll Z)" view) is
+    perfectly viewable in 2-D slice mode, so a viewer left in 2-D is not forced
+    into a 3-D rendering the user did not ask for.
+    """
+    if viewer is None or data_ndim >= 3:
+        return False
+    try:
+        if viewer.dims.ndisplay != 2:
+            viewer.dims.ndisplay = 2
+            log.info("Switched napari back to 2-D display — the layers being "
+                     "added are 2-D and cannot be rendered as a volume.")
+            return True
+    except Exception:          # non-napari stub, or a viewer without dims
+        log.debug("Could not check/set ndisplay", exc_info=True)
+    return False
+
+
+def safe_clear_layers(viewer) -> None:
+    """Empty the viewer's layer list, tolerating layers napari cannot remove.
+
+    ``layers.clear()`` can raise ``KeyError`` from inside napari's own
+    ``_remove_layer`` when a layer exists in the model but its vispy
+    counterpart was never built — which happens when a previous ``add_image``
+    failed part-way (e.g. a 2-D layer added while the canvas was in 3-D mode).
+    One such orphan then makes *every* later clear fail, so the viewer stays
+    broken until napari is restarted.
+
+    Falls back to removing layers one at a time, skipping the ones that raise,
+    so a single orphan cannot block the rest.
+    """
+    if viewer is None:
+        return
+    try:
+        viewer.layers.clear()
+        return
+    except Exception as exc:
+        log.warning("napari layers.clear() failed (%s) — removing layers "
+                    "individually.", exc)
+    for layer in list(getattr(viewer, "layers", [])):
+        try:
+            viewer.layers.remove(layer)
+        except Exception:
+            log.debug("Could not remove layer %r; leaving it in place.",
+                      getattr(layer, "name", layer), exc_info=True)
+
+
 def _require_napari():
     try:
         import napari
@@ -77,6 +133,7 @@ class NapariViewer:
         px = image_data.pixel_size_um
 
         if projection == "none" and image_data.data.ndim == 4:
+            ensure_display_dims(self._viewer, 3)
             # (C, Z, Y, X) → one 3-D layer per channel. The Z scale comes from
             # the file; read_image falls back to 1.0 when the format carries no
             # spacing, which is fine for scrolling but makes a rotated 3-D view
@@ -93,6 +150,7 @@ class NapariViewer:
                 )
             return
 
+        ensure_display_dims(self._viewer, 2)
         mip = image_data.project(projection)   # (C, Y, X) or (Y, X)
         if mip.ndim == 2:
             mip = mip[np.newaxis]        # ensure (C, Y, X) shape

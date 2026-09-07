@@ -51,7 +51,9 @@ from correlative_imaging.diagnostics import CHANNEL_COLOR_CHOICES as _CHANNEL_CO
 from correlative_imaging.diagnostics import CHANNEL_COLOR_RGB as _CHANNEL_COLOR_RGB
 from correlative_imaging.io import supported_extensions
 from correlative_imaging.pipeline.analyze import INTENSITY_METRIC_CHOICES, PARTICLE_METRIC_CHOICES
-from correlative_imaging.viewer.napari_viewer import auto_contrast_limits
+from correlative_imaging.viewer.napari_viewer import (
+    auto_contrast_limits, ensure_display_dims, safe_clear_layers,
+)
 
 log = logging.getLogger(__name__)
 
@@ -2158,7 +2160,9 @@ class BFPipelineTab(QWidget):
         # whenever pixel_size_um != 1.
         scale = [pixel_size_um, pixel_size_um]
         if ch_vis is not None:
+            ensure_display_dims(self._viewer, 2)
             self._viewer.add_image(ch_vis, name=f"BF proj/{well_id}", colormap="gray", scale=scale)
+        ensure_display_dims(self._viewer, 2)
         self._viewer.add_labels(seg, name=f"Segmentation/{well_id}", opacity=0.45, scale=scale)
         for i, (kind, mask) in enumerate(masks.items(), start=1):
             if mask.max() > 0:
@@ -5205,7 +5209,10 @@ class RunTab(QWidget):
             raw_layer_by_ch: dict[int, object] = {}
 
             if self._viewer is not None:
-                self._viewer.layers.clear()
+                # Projected preview layers are 2-D; a viewer left in 3-D mode
+                # would abort the whole preview inside vispy.
+                ensure_display_dims(self._viewer, 2)
+                safe_clear_layers(self._viewer)
                 px = img_data.pixel_size_um
                 scale = [px, px]
                 raw_mip = img_data.project("max")
@@ -5670,6 +5677,7 @@ class CorrelativeImagingWidget(QWidget):
         except Exception:
             px = image_data.pixel_size_um; scale = [px, px]
             if projection == "none" and image_data.data.ndim == 4:
+                ensure_display_dims(self._viewer, 3)
                 # Unprojected: one 3-D layer per channel, Z first in the scale.
                 # ImageData.project() has no "none" mode, so this must branch
                 # before it — otherwise the fallback would quietly re-project.
@@ -5680,6 +5688,7 @@ class CorrelativeImagingWidget(QWidget):
                 return
             # ImageData.data always keeps the channel axis first (C,Y,X) or
             # (C,Z,Y,X) per its contract, so .project() always returns (C,Y,X).
+            ensure_display_dims(self._viewer, 2)
             mip = image_data.project(projection)
             for i, ch in enumerate(image_data.channel_names):
                 self._viewer.add_image(mip[i], name=f"{label}/{ch}",
@@ -5711,7 +5720,9 @@ class CorrelativeImagingWidget(QWidget):
             )
 
     def _show_well_overview(self, well, bf_data, fl_data, projection: str) -> None:
-        self._viewer.layers.clear()
+        # "none" keeps the Z axis, so that view may legitimately stay in 3-D.
+        ensure_display_dims(self._viewer, 3 if projection == "none" else 2)
+        safe_clear_layers(self._viewer)
         shape_yx = None
         pixel_size_um = 1.0
         if bf_data is not None:
@@ -5769,7 +5780,7 @@ class CorrelativeImagingWidget(QWidget):
             try:
                 from correlative_imaging.viewer.napari_viewer import NapariViewer
                 v = NapariViewer.__new__(NapariViewer); v._viewer = self._viewer
-                self._viewer.layers.clear()
+                safe_clear_layers(self._viewer)
                 v.show_image(img, group="sample")
             except Exception:
                 pass
