@@ -84,9 +84,12 @@ class AutoThreshold(Step):
             binary = remove_small_objects(binary, max_size=self.min_size)
 
         mask_key = f"mask_ch{self.channel}"
+        ch_name = (context.channel_names[self.channel]
+                   if self.channel < len(context.channel_names)
+                   else f"ch{self.channel}")
         return StepResult(
             masks={mask_key: binary},
-            info={"threshold_value": threshold_value, "mask_key": mask_key},
+            info={"threshold_value": threshold_value, "mask_key": mask_key, "channel": ch_name},
         )
 
 

@@ -57,7 +57,13 @@ CREATE TABLE IF NOT EXISTS particle_measurements (
     max_intensity   REAL,
     min_intensity   REAL,
     centroid_row    REAL,
-    centroid_col    REAL
+    centroid_col    REAL,
+    area_full_um2   REAL,
+    cut_at_edge     INTEGER,
+    share_inside    REAL,
+    dist_centre_um  REAL,
+    dist_centre_rel REAL,
+    dist_rim_um     REAL
 );
 
 CREATE TABLE IF NOT EXISTS colocalization_results (
@@ -71,7 +77,8 @@ CREATE TABLE IF NOT EXISTS colocalization_results (
     pearson_r               REAL,
     manders_m1_random       REAL,
     manders_m2_random       REAL,
-    n_primary_particles     INTEGER
+    n_primary_particles     INTEGER,
+    pearson_mode            TEXT
 );
 
 CREATE TABLE IF NOT EXISTS colocalization_per_particle (
@@ -85,7 +92,8 @@ CREATE TABLE IF NOT EXISTS colocalization_per_particle (
     n_secondary_pixels      INTEGER,
     secondary_mean_intensity REAL,
     secondary_max_intensity REAL,
-    overlap_fraction        REAL
+    overlap_fraction        REAL,
+    mask_overlap_fraction   REAL
 );
 
 CREATE TABLE IF NOT EXISTS intensity_measurements (
@@ -98,7 +106,20 @@ CREATE TABLE IF NOT EXISTS intensity_measurements (
     sum_intensity   REAL,
     std_intensity   REAL,
     area_px         INTEGER,
-    area_um2        REAL
+    area_um2        REAL,
+    median_intensity REAL
+);
+
+-- The threshold AutoThreshold actually computed, one row per image and
+-- channel (thresholds are computed once per channel on the whole frame).
+CREATE TABLE IF NOT EXISTS thresholds (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    image_id        INTEGER NOT NULL REFERENCES images(id),
+    channel         TEXT    NOT NULL,
+    channel_index   INTEGER,
+    method          TEXT,
+    z_projection    TEXT,
+    threshold_value REAL
 );
 
 CREATE TABLE IF NOT EXISTS pipeline_runs (
@@ -139,6 +160,16 @@ class ResultsDB:
             ("particle_measurements",       "roi_mask TEXT"),
             ("particle_measurements",       "roi_path TEXT"),
             ("intensity_measurements",      "roi_path TEXT"),
+            ("particle_measurements",       "area_full_um2 REAL"),
+            ("particle_measurements",       "cut_at_edge INTEGER"),
+            ("particle_measurements",       "share_inside REAL"),
+            ("particle_measurements",       "dist_centre_um REAL"),
+            ("particle_measurements",       "dist_centre_rel REAL"),
+            ("particle_measurements",       "dist_rim_um REAL"),
+            # NULL = run from before Pearson was restricted to ROI pixels.
+            ("colocalization_results",      "pearson_mode TEXT"),
+            ("colocalization_per_particle", "mask_overlap_fraction REAL"),
+            ("intensity_measurements",      "median_intensity REAL"),
         ]
         for table, col_def in new_columns:
             try:
@@ -210,6 +241,12 @@ class ResultsDB:
                     _as_float(r.get("min_intensity")),
                     _as_float(r.get("centroid_row")),
                     _as_float(r.get("centroid_col")),
+                    _as_float(r.get("area_full_um2")),
+                    _as_int(r.get("cut_at_edge")),
+                    _as_float(r.get("share_inside")),
+                    _as_float(r.get("dist_centre_um")),
+                    _as_float(r.get("dist_centre_rel")),
+                    _as_float(r.get("dist_rim_um")),
                 )
             )
         self._con.executemany(
@@ -217,8 +254,10 @@ class ResultsDB:
             INSERT INTO particle_measurements
                 (image_id, channel, roi_mask, roi_path, label, area_px, area_um2, perimeter_px,
                  circularity, eccentricity, solidity, mean_intensity,
-                 max_intensity, min_intensity, centroid_row, centroid_col)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 max_intensity, min_intensity, centroid_row, centroid_col,
+                 area_full_um2, cut_at_edge, share_inside,
+                 dist_centre_um, dist_centre_rel, dist_rim_um)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             rows,
         )
@@ -242,6 +281,7 @@ class ResultsDB:
                 _as_float(r.get("std_intensity")),
                 _as_int(r.get("area_px")),
                 _as_float(r.get("area_um2")),
+                _as_float(r.get("median_intensity")),
             )
             for _, r in df.iterrows()
         ]
@@ -249,10 +289,35 @@ class ResultsDB:
             """
             INSERT INTO intensity_measurements
                 (image_id, channel, roi_mask, roi_path,
-                 mean_intensity, sum_intensity, std_intensity, area_px, area_um2)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 mean_intensity, sum_intensity, std_intensity, area_px, area_um2,
+                 median_intensity)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             rows,
+        )
+        self._con.commit()
+
+    # ------------------------------------------------------------------
+    # Threshold values
+    # ------------------------------------------------------------------
+
+    def save_threshold(
+        self,
+        image_id: int,
+        channel: str,
+        channel_index: int | None,
+        method: str,
+        z_projection: str,
+        threshold_value: float | None,
+    ) -> None:
+        self._con.execute(
+            """
+            INSERT INTO thresholds
+                (image_id, channel, channel_index, method, z_projection, threshold_value)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (image_id, channel, _as_int(channel_index), method, z_projection,
+             _as_float(threshold_value)),
         )
         self._con.commit()
 
@@ -278,8 +343,9 @@ class ResultsDB:
             INSERT INTO colocalization_results
                 (image_id, primary_channel, secondary_channel, roi_mask,
                  manders_m1, manders_m2, pearson_r,
-                 manders_m1_random, manders_m2_random, n_primary_particles)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 manders_m1_random, manders_m2_random, n_primary_particles,
+                 pearson_mode)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 image_id, p_ch, s_ch, roi,
@@ -289,6 +355,7 @@ class ResultsDB:
                 global_stats.get("manders_m1_random"),
                 global_stats.get("manders_m2_random"),
                 len(per_particle_df),
+                global_stats.get("pearson_mode"),
             ),
         )
 
@@ -301,6 +368,7 @@ class ResultsDB:
                 float(r.get("secondary_mean_intensity", 0)),
                 float(r.get("secondary_max_intensity", 0)),
                 float(r.get("overlap_fraction", 0)),
+                _as_float(r.get("mask_overlap_fraction")),
             )
             for _, r in per_particle_df.iterrows()
         ]
@@ -309,8 +377,8 @@ class ResultsDB:
             INSERT INTO colocalization_per_particle
                 (image_id, primary_channel, secondary_channel, roi_mask, primary_label,
                  primary_area_um2, n_secondary_pixels, secondary_mean_intensity,
-                 secondary_max_intensity, overlap_fraction)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 secondary_max_intensity, overlap_fraction, mask_overlap_fraction)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             rows,
         )
@@ -385,9 +453,11 @@ class ResultsDB:
             for table in (
                 "particle_measurements", "intensity_measurements",
                 "colocalization_results", "colocalization_per_particle",
-                "pipeline_runs",
+                "thresholds", "pipeline_runs",
             ):
                 cols = [c[1] for c in src.execute(f"PRAGMA table_info({table})") if c[1] != "id"]
+                if not cols:
+                    continue   # table predates the source database
                 col_list = ", ".join(cols)
                 placeholders = ", ".join(f":{c}" for c in cols)
                 for row in src.execute(f"SELECT * FROM {table}"):  # noqa: S608
@@ -418,6 +488,7 @@ class ResultsDB:
             "intensity_measurements",
             "colocalization_results",
             "colocalization_per_particle",
+            "thresholds",
         ]
         for table in tables:
             df = pd.read_sql_query(f"SELECT * FROM {table}", self._con)  # noqa: S608

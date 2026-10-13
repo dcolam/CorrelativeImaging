@@ -25,6 +25,7 @@ from correlative_imaging.io.plate import WellInfo
 from correlative_imaging.pipeline.base import Pipeline, PipelineContext, Step
 from correlative_imaging.pipeline.analyze import IntensityMeasurement, ParticleAnalysis
 from correlative_imaging.pipeline.colocalize import ColocalizationAnalysis
+from correlative_imaging.pipeline.segment import AutoThreshold
 from correlative_imaging.storage import ResultsDB
 
 log = logging.getLogger(__name__)
@@ -130,9 +131,13 @@ class BatchRunner:
                     _, results = self.pipeline.run(image_data.data, context)
 
                     for step, result in zip(self.pipeline.steps, results):
+                        if isinstance(step, AutoThreshold):
+                            _save_threshold(db, image_id, step, result)
                         if result.measurements is not None and not result.measurements.empty:
                             if isinstance(step, ParticleAnalysis):
                                 db.save_particle_measurements(image_id, result.measurements)
+                            elif isinstance(step, IntensityMeasurement):
+                                db.save_intensity_measurements(image_id, result.measurements)
                             elif isinstance(step, ColocalizationAnalysis):
                                 db.save_colocalization(
                                     image_id,
@@ -590,6 +595,8 @@ class WellBatchRunner:
         )
         n_particles = 0
         for step, step_result in result.steps_and_results:
+            if isinstance(step, AutoThreshold):
+                _save_threshold(db, image_id, step, step_result)
             if step_result.measurements is None or step_result.measurements.empty:
                 continue
             if isinstance(step, ParticleAnalysis):
@@ -836,3 +843,15 @@ class WellBatchRunner:
                 warn_fn(summary)
 
         log.info("Well batch complete. Results → %s", self.db_path)
+
+
+def _save_threshold(db: ResultsDB, image_id: int, step: Step, result) -> None:
+    """Record the threshold an AutoThreshold step computed for this image."""
+    db.save_threshold(
+        image_id,
+        channel=result.info.get("channel", f"ch{step.channel}"),
+        channel_index=step.channel,
+        method=step.method,
+        z_projection=step.z_projection,
+        threshold_value=result.info.get("threshold_value"),
+    )

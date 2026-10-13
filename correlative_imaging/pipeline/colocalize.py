@@ -33,6 +33,14 @@ class ColocalizationAnalysis(Step):
     - ``measurements``:         per-primary-particle colocalization stats
     - ``info['global_stats']``: image-level Manders + Pearson values
 
+    Per-particle overlap columns:
+    - ``overlap_fraction``:      legacy "non-zero fraction" — share of the
+      particle's pixels where the secondary channel is > 0. After black-level
+      normalisation + blur this is ~1 for nearly every particle.
+    - ``mask_overlap_fraction``: share of the particle's pixels inside the
+      secondary channel's thresholded mask (``mask_ch{secondary}``); NaN when
+      that channel has no AutoThreshold mask.
+
     Parameters
     ----------
     primary_channel:    Channel index with already-analysed particles.
@@ -74,9 +82,25 @@ class ColocalizationAnalysis(Step):
             ch_s = ch_s * roi_bool
             primary_labels = primary_labels * roi_bool.astype(primary_labels.dtype)
 
+        # Secondary channel's thresholded mask (AutoThreshold output, whole
+        # frame) — not particles_ch{c}, which is overwritten by every
+        # ParticleAnalysis call and so depends on which selection ran last.
+        sec_mask = context.masks.get(f"mask_ch{self.secondary_channel}")
+        sec_bool = None
+        if sec_mask is not None:
+            sec_bool = sec_mask.astype(bool)
+            if roi is not None:
+                sec_bool = sec_bool & roi_bool
+
         # --- Global Manders + Pearson (within ROI or whole image) ---
+        # Manders are sums, so the zeros outside the ROI don't change them.
+        # Pearson must only see ROI pixels: zeros outside would enter as
+        # (0, 0) pairs and r would measure "inside vs outside the mask".
         m1, m2 = _manders(ch_p, ch_s, primary_labels > 0)
-        pearson = _pearson(ch_p, ch_s)
+        if roi is not None:
+            pearson = _pearson(ch_p[roi_bool], ch_s[roi_bool])
+        else:
+            pearson = _pearson(ch_p, ch_s)
         ch_s_rot = np.rot90(ch_s)
         m1_rand, m2_rand = _manders(ch_p, ch_s_rot, primary_labels > 0)
 
@@ -86,6 +110,9 @@ class ColocalizationAnalysis(Step):
             "pearson_r": pearson,
             "manders_m1_random": m1_rand,
             "manders_m2_random": m2_rand,
+            # Old runs (before Pearson was restricted to ROI pixels) have no
+            # pearson_mode — never pool them with these.
+            "pearson_mode": "roi_pixels" if roi is not None else "whole_image",
         }
 
         # --- Per-particle colocalization ---
@@ -108,6 +135,10 @@ class ColocalizationAnalysis(Step):
                 "secondary_max_intensity": float(ch_s[particle_mask].max())
                     if particle_mask.any() else 0.0,
                 "overlap_fraction": n_secondary_px / max(particle_mask.sum(), 1),
+                "mask_overlap_fraction": (
+                    float((particle_mask & sec_bool).sum()) / max(particle_mask.sum(), 1)
+                    if sec_bool is not None else float("nan")
+                ),
             })
 
         df = pd.DataFrame(rows)

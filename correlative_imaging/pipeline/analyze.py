@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
+from scipy.ndimage import binary_dilation, center_of_mass, distance_transform_edt
 from skimage.measure import label as sk_label, regionprops_table
 
 from .base import PipelineContext, Step, StepResult, register_step
@@ -42,7 +43,18 @@ _PARTICLE_METRIC_COLUMNS = {
 # User-selectable gross/bulk metrics (Channels tab). "area_px"/"area_um2" are
 # the selection's own area — independently toggleable from mean/sum/std so a
 # selection's area can be recorded without also measuring bulk intensity.
-INTENSITY_METRIC_CHOICES = ["mean_intensity", "sum_intensity", "std_intensity", "area_px", "area_um2"]
+INTENSITY_METRIC_CHOICES = [
+    "mean_intensity", "median_intensity", "sum_intensity", "std_intensity", "area_px", "area_um2",
+]
+
+# Where each particle sits relative to its selection, computed from the WHOLE
+# whole-image object it was cut from (not the piece inside the selection).
+# Always output — not user-selectable — so a particle cut at the selection
+# edge can always be told apart from one lying fully inside it.
+PARTICLE_EDGE_COLUMNS = [
+    "area_full_um2", "cut_at_edge", "share_inside",
+    "dist_centre_um", "dist_centre_rel", "dist_rim_um",
+]
 
 
 @dataclass
@@ -99,7 +111,10 @@ class ParticleAnalysis(Step):
             # Binary mask from AutoThreshold (no watershed yet)
             label_image = sk_label(label_image.astype(bool))
 
-        # Restrict to ROI if requested
+        # Restrict to ROI if requested. Objects crossing the selection edge
+        # are cut there — keep the whole-image labels to describe the object
+        # each piece was cut from (see _edge_columns).
+        full_labels = label_image
         roi = context.masks.get(self.roi_mask) if self.roi_mask else None
         if roi is not None:
             label_image = label_image * roi.astype(label_image.dtype)
@@ -135,6 +150,8 @@ class ParticleAnalysis(Step):
         if self.min_circularity > 0:
             df = df[df["circularity"] >= self.min_circularity]
 
+        df = _edge_columns(df, full_labels, roi, px)
+
         ch_name = context.channel_names[self.channel] if self.channel < len(context.channel_names) else f"ch{self.channel}"
         df.insert(0, "channel", ch_name)
         df.insert(1, "roi_mask", self.roi_mask or "whole_image")
@@ -155,6 +172,7 @@ class ParticleAnalysis(Step):
         keep = ["channel", "roi_mask", "roi_path", "label"]
         for m in selected:
             keep.extend(_PARTICLE_METRIC_COLUMNS.get(m, [m]))
+        keep.extend(PARTICLE_EDGE_COLUMNS)
         df = df[[c for c in keep if c in df.columns]]
 
         return StepResult(
@@ -162,6 +180,57 @@ class ParticleAnalysis(Step):
             masks={f"particles_ch{self.channel}": filtered_labels},
             info={"n_particles": len(df)},
         )
+
+
+def _edge_columns(
+    df: pd.DataFrame, full_labels: np.ndarray, roi: np.ndarray | None, px: float,
+) -> pd.DataFrame:
+    """Add PARTICLE_EDGE_COLUMNS to *df* (one row per particle piece inside
+    the selection, ``label`` matching *full_labels*).
+
+    - ``area_full_um2``:   area of the whole-image object the piece was cut from
+    - ``cut_at_edge``:     part of that object lies outside the selection
+    - ``share_inside``:    piece area / whole object area
+    - ``dist_centre_um``:  selection centre of mass → whole object's centroid
+    - ``dist_centre_rel``: the same / the selection's equal-area radius
+                           (0 = centre, 1 = rim, > 1 = centred outside)
+    - ``dist_rim_um``:     whole object's centroid → selection outline,
+                           positive inside, negative outside
+
+    Without a selection the pieces are the whole objects: share_inside = 1,
+    cut_at_edge = False, distances NaN.
+    """
+    df = df.copy()
+    labels = df["label"].to_numpy().astype(np.int64)
+    full_area = np.bincount(full_labels.ravel().astype(np.int64))
+    full_px = full_area[labels] if len(labels) else np.zeros(0, dtype=np.int64)
+    df["area_full_um2"] = full_px * px ** 2
+    df["share_inside"] = df["area"].to_numpy() / np.maximum(full_px, 1)
+    # Compare pixel counts, not the float ratio.
+    df["cut_at_edge"] = df["area"].to_numpy() < full_px
+    for c in ("dist_centre_um", "dist_centre_rel", "dist_rim_um"):
+        df[c] = np.nan
+    if roi is None or df.empty:
+        return df
+
+    rb = roi.astype(bool)
+    # Centroids of the WHOLE objects that have a piece in the selection —
+    # the piece's own centroid is pulled inwards.
+    fc = pd.DataFrame(regionprops_table(
+        np.where(np.isin(full_labels, labels), full_labels, 0).astype(np.int64),
+        properties=["label", "centroid"],
+    )).set_index("label").loc[labels]
+    fr, fcl = fc["centroid-0"].to_numpy(), fc["centroid-1"].to_numpy()
+    cr, cc = center_of_mass(rb)
+    r_eq = np.sqrt(rb.sum() / np.pi)
+    d = np.hypot(fr - cr, fcl - cc)
+    df["dist_centre_um"] = d * px
+    df["dist_centre_rel"] = d / r_eq
+    rim = distance_transform_edt(rb) - distance_transform_edt(~rb)   # + inside, - outside, px
+    ri = np.clip(np.round(fr).astype(int), 0, rb.shape[0] - 1)
+    ci = np.clip(np.round(fcl).astype(int), 0, rb.shape[1] - 1)
+    df["dist_rim_um"] = rim[ri, ci] * px
+    return df
 
 
 @dataclass
@@ -186,11 +255,21 @@ class IntensityMeasurement(Step):
                     default). ``area_px``/``area_um2`` are independent of
                     mean/sum/std — a selection's area can be recorded without
                     also measuring bulk intensity.
+    outside_particles: Also report the background: the selection's pixels
+                    that belong to no segmented object of any channel
+                    (every ``mask_ch*`` AutoThreshold mask, whole frame).
+                    Written as a second row with
+                    ``roi_mask = '<selection>:outside_particles'``. Must run
+                    after all channels' AutoThreshold steps.
+    outside_margin_um: Dilate the particle masks by this margin (blur halo)
+                    before taking the outside pixels.
     """
     channel: int
     z_projection: str = "max"
     roi_mask: str = ""
     metrics: list[str] | None = None   # None = all of INTENSITY_METRIC_CHOICES
+    outside_particles: bool = False
+    outside_margin_um: float = 1.0
 
     @property
     def name(self) -> str:
@@ -205,6 +284,7 @@ class IntensityMeasurement(Step):
             pixels  = plane[mask]
             area_px = int(mask.sum())
         else:
+            mask    = None
             pixels  = plane.ravel()
             area_px = int(plane.size)
 
@@ -217,19 +297,50 @@ class IntensityMeasurement(Step):
 
         all_vals = {
             "mean_intensity": float(pixels.mean()) if pixels.size > 0 else 0.0,
+            "median_intensity": float(np.median(pixels)) if pixels.size > 0 else 0.0,
             "sum_intensity":  float(pixels.sum())  if pixels.size > 0 else 0.0,
             "std_intensity":  float(pixels.std())  if pixels.size > 0 else 0.0,
             "area_px":        area_px,
             "area_um2":       area_um2,
         }
         selected = self.metrics if self.metrics is not None else INTENSITY_METRIC_CHOICES
-        vals = {
+        roi_name = self.roi_mask or "whole_image"
+        roi_path = context.mask_paths.get(self.roi_mask, "") if self.roi_mask else ""
+        rows = [{
             "channel":        ch_name,
-            "roi_mask":       self.roi_mask or "whole_image",
-            "roi_path":       context.mask_paths.get(self.roi_mask, "") if self.roi_mask else "",
+            "roi_mask":       roi_name,
+            "roi_path":       roi_path,
             **{m: all_vals[m] for m in selected if m in all_vals},
-        }
+        }]
+
+        if self.outside_particles:
+            fg = np.zeros(plane.shape, bool)
+            for k, m in context.masks.items():
+                if k.startswith("mask_ch") and m is not None:
+                    fg |= m.astype(bool)
+            r = int(round(self.outside_margin_um / px)) if self.outside_margin_um > 0 else 0
+            if r > 0:   # iterations=0 would dilate until nothing changes
+                fg = binary_dilation(fg, iterations=r)
+            sel = mask if mask is not None else np.ones(plane.shape, bool)
+            bg = plane[sel & ~fg]
+            # A selection fully covered by particles stays NaN — not filled in.
+            bg_vals = {
+                "mean_intensity": float(bg.mean()) if bg.size else float("nan"),
+                # robust choice for background: a few unsegmented dim cells skew the mean
+                "median_intensity": float(np.median(bg)) if bg.size else float("nan"),
+                "sum_intensity":  float(bg.sum()),
+                "std_intensity":  float(bg.std()) if bg.size else float("nan"),
+                "area_px":        int(bg.size),
+                "area_um2":       bg.size * px * px,
+            }
+            rows.append({
+                "channel":        ch_name,
+                "roi_mask":       f"{roi_name}:outside_particles",
+                "roi_path":       roi_path,
+                **{m: bg_vals[m] for m in selected if m in bg_vals},
+            })
+
         return StepResult(
-            measurements=pd.DataFrame([vals]),
+            measurements=pd.DataFrame(rows),
             info={"mean_intensity": all_vals["mean_intensity"]},
         )

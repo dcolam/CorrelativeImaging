@@ -107,9 +107,11 @@ _STEP_FORMS: dict[str, list[tuple]] = {
         ("roi_mask",        "str",                "ROI mask key",    "",     None),
     ],
     "IntensityMeasurement": [
-        ("channel",      "int",                "Channel index", 0,     (0, 32)),
-        ("z_projection", "choice:max,mean,sum", "Z projection", "max", None),
-        ("roi_mask",     "str",                "ROI mask key",  "",    None),
+        ("channel",           "int",                "Channel index", 0,     (0, 32)),
+        ("z_projection",      "choice:max,mean,sum", "Z projection", "max", None),
+        ("roi_mask",          "str",                "ROI mask key",  "",    None),
+        ("outside_particles", "bool",               "Also background outside particles", False, None),
+        ("outside_margin_um", "float",              "Background margin (µm)", 1.0, (0.0, 50.0)),
     ],
     "ColocalizationAnalysis": [
         ("primary_channel",   "int",                "Primary channel",   0,   (0, 32)),
@@ -1699,6 +1701,7 @@ class PlateTab(QWidget):
             return
         self._load_btn.setEnabled(False)
         self._load_btn.setText("Loading …")
+        self._sample_path = path
         self._load_worker = _LoadImageWorker(path)
         self._load_worker.loaded.connect(self._on_image_loaded)
         self._load_worker.error.connect(self._on_load_error)
@@ -1724,6 +1727,17 @@ class PlateTab(QWidget):
     def get_selected_well(self):
         wid = self._grid._selected
         return self._wells.get(wid) if wid else None
+
+    @property
+    def sample_path(self) -> Path | None:
+        """File the current sample image was read from."""
+        return getattr(self, "_sample_path", None)
+
+    def set_sample_image(self, image_data, path: Path) -> None:
+        """Swap the sample image without emitting ``channels_ready`` — used
+        when a test run picks up the selected well, so no tab is reset."""
+        self._image_data = image_data
+        self._sample_path = path
 
     def get_all_wells(self) -> list:
         return list(self._wells.values())
@@ -3132,11 +3146,25 @@ class ChannelPanel(QWidget):
         gfl.setLabelAlignment(Qt.AlignRight)
         self._gross_metrics = _build_metric_checklist(INTENSITY_METRIC_CHOICES)
         self._gross_metrics.setToolTip(
-            "mean/sum/std_intensity and area_px/area_um2 are independently\n"
+            "mean/median/sum/std_intensity and area_px/area_um2 are independently\n"
             "toggleable — e.g. record a selection's area without also\n"
             "measuring its bulk intensity."
         )
         gfl.addRow("Save metrics:", self._gross_metrics)
+        self._outside_en = QCheckBox("Also measure background outside all particles")
+        self._outside_en.setToolTip(
+            "Adds a second row per selection, '<selection>:outside_particles':\n"
+            "the same metrics over the selection's pixels that belong to no\n"
+            "segmented object of ANY channel (every channel's threshold mask),\n"
+            "grown by the margin below to exclude the blur halo."
+        )
+        self._outside_margin = QDoubleSpinBox()
+        self._outside_margin.setRange(0, 50); self._outside_margin.setValue(1.0)
+        self._outside_margin.setSingleStep(0.5); self._outside_margin.setSuffix(" µm")
+        self._outside_margin.setEnabled(False)
+        self._outside_en.toggled.connect(self._outside_margin.setEnabled)
+        gfl.addRow("", self._outside_en)
+        gfl.addRow("Background margin:", self._outside_margin)
         lay.addWidget(gross_box)
 
         lay.addStretch()
@@ -3171,6 +3199,8 @@ class ChannelPanel(QWidget):
         self._an_z_proj.setCurrentText(other._an_z_proj.currentText())
         _set_checked_metrics(self._particle_metrics, _checked_metrics(other._particle_metrics))
         _set_checked_metrics(self._gross_metrics, _checked_metrics(other._gross_metrics))
+        self._outside_en.setChecked(other._outside_en.isChecked())
+        self._outside_margin.setValue(other._outside_margin.value())
 
     # ── Step generators ────────────────────────────────────────────
 
@@ -3275,7 +3305,9 @@ class ChannelPanel(QWidget):
         if gross_metrics:
             steps.append({"type": "IntensityMeasurement", "channel": self._ch_index,
                           "z_projection": self._an_z_proj.currentText(), "roi_mask": roi_mask_key,
-                          "metrics": gross_metrics})
+                          "metrics": gross_metrics,
+                          "outside_particles": self._outside_en.isChecked(),
+                          "outside_margin_um": self._outside_margin.value()})
         return steps
 
     def set_from_steps(self, steps: list[dict]) -> None:
@@ -3344,6 +3376,8 @@ class ChannelPanel(QWidget):
             self._gross_metrics,
             intensity.get("metrics") if intensity else [],
         )
+        self._outside_en.setChecked(bool(intensity and intensity.get("outside_particles", False)))
+        self._outside_margin.setValue((intensity or {}).get("outside_margin_um", 1.0))
 
 
 class ChannelColorDialog(QDialog):
@@ -3667,6 +3701,7 @@ class ChannelsTab(QWidget):
             panel._norm_en.setChecked(False)
             panel._ws_en.setChecked(False)
             _set_checked_metrics(panel._gross_metrics, [])
+            panel._outside_en.setChecked(False)
 
     def get_panels(self) -> list[ChannelPanel]:
         return self._panels
@@ -3785,8 +3820,12 @@ class ROISelectionsTab(QWidget):
 
     def set_channels(self, names: list[str]) -> None:
         self._channel_names = names
+        prev = self._ch_combo.currentIndex()
+        self._ch_combo.blockSignals(True)   # don't overwrite the selection's channel
         self._ch_combo.clear()
         self._ch_combo.addItems([f"{i}: {n}" for i, n in enumerate(names)])
+        self._ch_combo.setCurrentIndex(min(max(prev, 0), len(names) - 1))
+        self._ch_combo.blockSignals(False)
 
     def set_viewer(self, v) -> None:
         self._viewer = v
@@ -4313,8 +4352,10 @@ def _step_repr(s: dict) -> str:
                 f"circ≥{s.get('min_circularity')}, {s.get('z_projection')}"
                 f"{_metrics_suffix(s.get('metrics'), PARTICLE_METRIC_CHOICES)})")
     if t == "IntensityMeasurement":
+        bg = (f", +background outside particles ({s.get('outside_margin_um', 1.0)} µm margin)"
+              if s.get("outside_particles") else "")
         return (f"IntensityMeasurement(ch{s.get('channel')}, {s.get('z_projection')}"
-                f"{_metrics_suffix(s.get('metrics'), INTENSITY_METRIC_CHOICES)})")
+                f"{_metrics_suffix(s.get('metrics'), INTENSITY_METRIC_CHOICES)}{bg})")
     if t == "ColocalizationAnalysis":
         return (f"ColocalizationAnalysis(ch{s.get('primary_channel')}↔ch{s.get('secondary_channel')}, "
                 f"dilation={s.get('dilation_um')}µm, {s.get('z_projection')})")
@@ -5124,12 +5165,45 @@ class RunTab(QWidget):
         """
         setup    = self._get_setup()
         img_data = setup.image_data
+        well = setup.get_selected_well() if hasattr(setup, "get_selected_well") else None
+
+        # Run on whichever well is selected in the Plate tab. The sample image
+        # loaded earlier may belong to another well — read this well's own FL
+        # file instead (without re-emitting channels_ready, so no settings reset).
+        if well is not None and well.fl_path is not None:
+            current = getattr(setup, "sample_path", None) or getattr(img_data, "source_path", None)
+            if img_data is None or current is None or Path(current) != Path(well.fl_path):
+                self._load_preview_image(setup, well)
+                return
+
         if img_data is None:
             QMessageBox.information(self, "No image", "Load a sample image in the Setup tab first.")
             return
+        self._preview_well(img_data, well)
 
-        well = setup.get_selected_well() if hasattr(setup, "get_selected_well") else None
+    def _load_preview_image(self, setup, well) -> None:
+        self._log(f"Loading FL image of selected well {well.well_id} …")
+        self._preview_btn.setEnabled(False)
+        self._preview_btn.setText("Loading image …")
+        self._preview_load_worker = _LoadImageWorker(well.fl_path)
 
+        def _loaded(img):
+            self._preview_btn.setEnabled(True)
+            self._preview_btn.setText("Run pipeline on sample image (shows in napari)")
+            if hasattr(setup, "set_sample_image"):
+                setup.set_sample_image(img, well.fl_path)
+            self._preview_well(img, well)
+
+        def _failed(msg):
+            self._preview_btn.setEnabled(True)
+            self._preview_btn.setText("Run pipeline on sample image (shows in napari)")
+            self._log(f"Error loading {well.fl_path}:\n{msg}")
+
+        self._preview_load_worker.loaded.connect(_loaded)
+        self._preview_load_worker.error.connect(_failed)
+        self._preview_load_worker.start()
+
+    def _preview_well(self, img_data, well) -> None:
         if well is not None and self._make_well_pipeline_dict_fn is not None:
             pipeline_dict_fn, needs_bf = self._make_well_pipeline_dict_fn()
             bf_cfg = self._get_bf_config() if (needs_bf and self._get_bf_config) else None
@@ -5287,7 +5361,11 @@ class RunTab(QWidget):
                             colormap=cmap, blending="additive", opacity=0.4, scale=scale,
                             contrast_limits=auto_contrast_limits(mask_f),
                         )
-                self._log(f"  ✓ {step_name}")
+                thr = result.info.get("threshold_value")
+                if thr is not None:
+                    self._log(f"  ✓ {step_name}  (threshold = {thr:.4g})")
+                else:
+                    self._log(f"  ✓ {step_name}")
 
             def _on_done():
                 # Default display (#23): the last pre-threshold per-channel
@@ -5790,10 +5868,14 @@ class CorrelativeImagingWidget(QWidget):
             nz = int(img.data.shape[1])
         self._channels_tab.set_stack_depth(nz)
 
+        # Same channel count = another well of the same plate: keep the
+        # configured settings (set_channels keeps the panels) and the pairs.
+        same_channels = len(self._channels_tab.get_panels()) == len(channel_names)
         self._channels_tab.set_channels(channel_names)
         self._roi_tab.set_channels(channel_names)
         self._combine_tab.set_channels(channel_names)
-        self._combine_tab.auto_populate(channel_names)
+        if not same_channels:
+            self._combine_tab.auto_populate(channel_names)
         self._advanced_tab.set_channel_names(channel_names)
         self._tabs.setCurrentWidget(self._channels_tab)
 
