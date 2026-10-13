@@ -110,16 +110,20 @@ CREATE TABLE IF NOT EXISTS intensity_measurements (
     median_intensity REAL
 );
 
--- The threshold AutoThreshold actually computed, one row per image and
--- channel (thresholds are computed once per channel on the whole frame).
-CREATE TABLE IF NOT EXISTS thresholds (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    image_id        INTEGER NOT NULL REFERENCES images(id),
-    channel         TEXT    NOT NULL,
-    channel_index   INTEGER,
-    method          TEXT,
-    z_projection    TEXT,
-    threshold_value REAL
+-- Per-image, per-channel levels the pipeline actually computed: the black
+-- level BlackLevelNormalization subtracted and the threshold AutoThreshold
+-- used (both computed once per channel on the whole frame). NULL = that step
+-- isn't in the pipeline for this channel.
+CREATE TABLE IF NOT EXISTS channel_levels (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    image_id                INTEGER NOT NULL REFERENCES images(id),
+    channel                 TEXT    NOT NULL,
+    channel_index           INTEGER,
+    black_level             REAL,
+    black_method            TEXT,
+    threshold_value         REAL,
+    threshold_method        TEXT,
+    threshold_z_projection  TEXT
 );
 
 CREATE TABLE IF NOT EXISTS pipeline_runs (
@@ -298,26 +302,26 @@ class ResultsDB:
         self._con.commit()
 
     # ------------------------------------------------------------------
-    # Threshold values
+    # Per-channel black level / threshold
     # ------------------------------------------------------------------
 
-    def save_threshold(
-        self,
-        image_id: int,
-        channel: str,
-        channel_index: int | None,
-        method: str,
-        z_projection: str,
-        threshold_value: float | None,
-    ) -> None:
-        self._con.execute(
+    def save_channel_levels(self, image_id: int, rows: list[dict]) -> None:
+        if not rows:
+            return
+        self._con.executemany(
             """
-            INSERT INTO thresholds
-                (image_id, channel, channel_index, method, z_projection, threshold_value)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO channel_levels
+                (image_id, channel, channel_index, black_level, black_method,
+                 threshold_value, threshold_method, threshold_z_projection)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (image_id, channel, _as_int(channel_index), method, z_projection,
-             _as_float(threshold_value)),
+            [
+                (image_id, str(r.get("channel", "")), _as_int(r.get("channel_index")),
+                 _as_float(r.get("black_level")), r.get("black_method"),
+                 _as_float(r.get("threshold_value")), r.get("threshold_method"),
+                 r.get("threshold_z_projection"))
+                for r in rows
+            ],
         )
         self._con.commit()
 
@@ -453,7 +457,7 @@ class ResultsDB:
             for table in (
                 "particle_measurements", "intensity_measurements",
                 "colocalization_results", "colocalization_per_particle",
-                "thresholds", "pipeline_runs",
+                "channel_levels", "pipeline_runs",
             ):
                 cols = [c[1] for c in src.execute(f"PRAGMA table_info({table})") if c[1] != "id"]
                 if not cols:
@@ -488,7 +492,7 @@ class ResultsDB:
             "intensity_measurements",
             "colocalization_results",
             "colocalization_per_particle",
-            "thresholds",
+            "channel_levels",
         ]
         for table in tables:
             df = pd.read_sql_query(f"SELECT * FROM {table}", self._con)  # noqa: S608

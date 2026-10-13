@@ -85,25 +85,35 @@ def test_old_database_is_migrated(tmp_path):
     _check(path)
 
 
-def test_threshold_saved_and_merged(tmp_path):
-    from correlative_imaging.batch import _save_threshold
+def test_channel_levels_saved_and_merged(tmp_path):
+    from correlative_imaging.batch import _save_channel_levels
     from correlative_imaging.pipeline.base import PipelineContext
+    from correlative_imaging.pipeline.preprocess import BlackLevelNormalization
     from correlative_imaging.pipeline.segment import AutoThreshold
 
-    plane = np.zeros((1, 20, 20)); plane[0, 5:15, 5:15] = 100.0
-    step = AutoThreshold(0, method="otsu", min_size=0)
-    res = step.process(plane, PipelineContext(channel_names=["GFP"]))
+    img = np.full((2, 20, 20), 7.0); img[:, 5:15, 5:15] = 100.0
+    ctx = PipelineContext(channel_names=["GFP", "RFP"])
+    black = BlackLevelNormalization(0)
+    r_black = black.process(img, ctx)
+    thr0, thr1 = AutoThreshold(0, min_size=0), AutoThreshold(1, method="li", min_size=0)
+    pairs = [(black, r_black), (thr0, thr0.process(r_black.image, ctx)),
+             (thr1, thr1.process(img, ctx))]
 
     sub = tmp_path / "sub.db"
     with ResultsDB(sub) as db:
         image_id = db.register_image(Path("x.tif"))
-        _save_threshold(db, image_id, step, res)
+        _save_channel_levels(db, image_id, pairs)
     with ResultsDB(tmp_path / "merged.db") as db:
         db.register_image(Path("other.tif"))         # shifts ids, exercises remapping
         db.merge_from(sub)
     con = sqlite3.connect(tmp_path / "merged.db")
-    row = con.execute("SELECT image_id, channel, channel_index, method, z_projection, "
-                      "threshold_value FROM thresholds").fetchone()
+    rows = con.execute("SELECT image_id, channel, channel_index, black_level, black_method, "
+                       "threshold_value, threshold_method, threshold_z_projection "
+                       "FROM channel_levels ORDER BY channel_index").fetchall()
     con.close()
-    assert row[:5] == (2, "GFP", 0, "otsu", "max")
-    assert 0 < row[5] < 100
+    assert len(rows) == 2
+    gfp, rfp = rows
+    assert gfp[:5] == (2, "GFP", 0, 7.0, "mode")
+    assert 0 < gfp[5] < 93 and gfp[6:] == ("otsu", "max")
+    assert rfp[3] is None and rfp[4] is None        # no black-level step on that channel
+    assert rfp[6] == "li"

@@ -3040,6 +3040,12 @@ class ChannelPanel(QWidget):
         self._black_method = QComboBox(); self._black_method.addItems(["mode", "percentile"])
         self._black_pct = QDoubleSpinBox()
         self._black_pct.setRange(0.0, 50.0); self._black_pct.setValue(1.0); self._black_pct.setSuffix(" %")
+        self._black_clip = QCheckBox("Clip negatives to 0 (old behaviour)")
+        self._black_clip.setToolTip(
+            "Off (default): values below the black level stay negative, so the\n"
+            "background noise stays symmetric and dim regions aren't biased up.\n"
+            "On: everything below the black level becomes 0, as before."
+        )
 
         pfl.addRow(self._bg_en)
         pfl.addRow("  Method:",  self._bg_method)
@@ -3049,6 +3055,7 @@ class ChannelPanel(QWidget):
         pfl.addRow(self._black_en)
         pfl.addRow("  Estimator:", self._black_method)
         pfl.addRow("  Percentile:", self._black_pct)
+        pfl.addRow("", self._black_clip)
         pfl.addRow(self._blur_en)
         pfl.addRow("  Sigma:",   self._blur_sigma)
 
@@ -3067,12 +3074,14 @@ class ChannelPanel(QWidget):
 
         def _black_toggle(c):
             self._black_method.setEnabled(c)
+            self._black_clip.setEnabled(c)
             self._black_pct.setEnabled(c and self._black_method.currentText() == "percentile")
         self._black_en.toggled.connect(_black_toggle)
         self._black_method.currentTextChanged.connect(
             lambda t: self._black_pct.setEnabled(self._black_en.isChecked() and t == "percentile")
         )
         self._black_method.setEnabled(False); self._black_pct.setEnabled(False)
+        self._black_clip.setEnabled(False)
         # keep the order summary live as steps are toggled/tuned
         for w in (self._bg_en, self._blur_en, self._norm_en, self._black_en):
             w.toggled.connect(self._update_order_summary)
@@ -3185,6 +3194,7 @@ class ChannelPanel(QWidget):
         self._black_en.setChecked(other._black_en.isChecked())
         self._black_method.setCurrentText(other._black_method.currentText())
         self._black_pct.setValue(other._black_pct.value())
+        self._black_clip.setChecked(other._black_clip.isChecked())
         self._preproc_order = list(other._preproc_order)   # copy step order too
         self._update_order_summary()
         self._thresh.setCurrentText(other._thresh.currentText())
@@ -3235,7 +3245,8 @@ class ChannelPanel(QWidget):
         if step_type == "BlackLevelNormalization" and self._black_en.isChecked():
             return {"type": step_type, "channel": self._ch_index,
                     "method": self._black_method.currentText(),
-                    "percentile": self._black_pct.value()}
+                    "percentile": self._black_pct.value(),
+                    "clip": self._black_clip.isChecked()}
         if step_type == "Normalize" and self._norm_en.isChecked():
             return {"type": step_type, "channel": self._ch_index,
                     "method": self._norm_method.currentText()}
@@ -3256,7 +3267,8 @@ class ChannelPanel(QWidget):
             return f"{self._bg_method.currentText()}, r={self._bg_radius.value()}px"
         if step_type == "BlackLevelNormalization":
             m = self._black_method.currentText()
-            return m if m != "percentile" else f"percentile {self._black_pct.value()}%"
+            s = m if m != "percentile" else f"percentile {self._black_pct.value()}%"
+            return s + (", clipped" if self._black_clip.isChecked() else "")
         if step_type == "Normalize":
             return self._norm_method.currentText()
         if step_type == "GaussianBlur":
@@ -3341,6 +3353,7 @@ class ChannelPanel(QWidget):
         if black:
             self._black_method.setCurrentText(black.get("method", "mode"))
             self._black_pct.setValue(black.get("percentile", 1.0))
+            self._black_clip.setChecked(bool(black.get("clip", False)))
 
         # Reconstruct the preprocessing order from the loaded step sequence:
         # preprocessing types appear in their run order; any type not present is
@@ -5362,8 +5375,11 @@ class RunTab(QWidget):
                             contrast_limits=auto_contrast_limits(mask_f),
                         )
                 thr = result.info.get("threshold_value")
+                blk = result.info.get("black_level")
                 if thr is not None:
                     self._log(f"  ✓ {step_name}  (threshold = {thr:.4g})")
+                elif blk is not None:
+                    self._log(f"  ✓ {step_name}  (black level = {blk:.4g})")
                 else:
                     self._log(f"  ✓ {step_name}")
 

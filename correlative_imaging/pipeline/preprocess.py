@@ -185,14 +185,25 @@ class BlackLevelNormalization(Step):
                  usual "black point") or 'percentile' (a low percentile — the
                  dark floor).
     percentile:  Percentile used when method='percentile' (default 1.0).
-    bins:        Histogram bins used when method='mode' (default 256).
+    bins:        Kept so old pipeline JSONs still load; no longer used.
     target:      Value the estimated black level is shifted to (default 0.0).
+    mode_upper_pct: 'mode' looks for the background peak only below this
+                 percentile, so the bin width doesn't depend on how bright the
+                 brightest cell is (default 99).
+    clip:        Clip negative values to 0. Default False: keeps
+                 negative values, so background noise stays symmetric and means
+                 of dim regions aren't biased upwards. True = old behaviour.
+
+    The output channel is always float32 (negative values would wrap around
+    in an integer image).
     """
     channel: int
     method: str = "mode"
     percentile: float = 1.0
-    bins: int = 256
+    bins: int = 256                 # kept for old JSONs; no longer used by 'mode'
     target: float = 0.0
+    mode_upper_pct: float = 99.0
+    clip: bool = False
 
     @property
     def name(self) -> str:
@@ -205,22 +216,75 @@ class BlackLevelNormalization(Step):
         if self.method == "mode":
             # Peak of the intensity histogram = most common (typical) value,
             # which in a mostly-background image is the background level.
-            lo, hi = float(flat.min()), float(flat.max())
+            lo = float(flat.min())
+            hi = float(np.percentile(flat, self.mode_upper_pct))   # ignore the bright cells' range
             if hi <= lo:
                 return lo
-            counts, edges = np.histogram(flat, bins=self.bins, range=(lo, hi))
-            peak = int(np.argmax(counts))
-            return float((edges[peak] + edges[peak + 1]) / 2.0)
+            integer = bool(np.array_equal(flat, np.round(flat)))
+            centre, width, fwhm = _histogram_peak(flat, lo, hi, integer)
+            # Refine around the coarse peak until the background peak is
+            # resolved (≥ 8 bins at half height, or 1-count bins for integer
+            # data). Needed when more than (100 - mode_upper_pct) % of the
+            # pixels are bright: the range above is then still wide and the
+            # first bins coarse.
+            for _ in range(4):
+                if fwhm >= 8 or (integer and width <= 1):
+                    break
+                half = max(8, 2 * fwhm) * width
+                w_lo, w_hi = max(lo, centre - half), min(hi, centre + half)
+                window = flat[(flat >= w_lo) & (flat <= w_hi)]
+                c, w, f = _histogram_peak(window, w_lo, w_hi, integer)
+                if w >= width:
+                    break
+                centre, width, fwhm = c, w, f
+            return centre
         raise ValueError(f"Unknown black-level method: {self.method!r}")
 
     def process(self, image: np.ndarray, context: PipelineContext) -> StepResult:
         ch = image[self.channel].astype(np.float32)
         black = self._estimate_black(ch)
-        shifted = np.clip(ch - black + self.target, 0.0, None)
-        result_image = image.copy()
-        result_image[self.channel] = shifted.astype(image.dtype) \
-            if np.issubdtype(image.dtype, np.integer) else shifted
-        return StepResult(image=result_image, info={"black_level": black})
+        shifted = ch - black + self.target
+        if self.clip:
+            shifted = np.clip(shifted, 0.0, None)
+        # Negative values need a float image: integer dtypes would wrap around.
+        result_image = image.astype(np.float32, copy=True)
+        result_image[self.channel] = shifted
+        ch_name = (context.channel_names[self.channel]
+                   if self.channel < len(context.channel_names)
+                   else f"ch{self.channel}")
+        return StepResult(image=result_image, info={"black_level": black, "channel": ch_name})
+
+
+def _histogram_peak(
+    flat: np.ndarray, lo: float, hi: float, integer: bool,
+) -> tuple[float, float, int]:
+    """Centre and width of the most populated histogram bin over [lo, hi],
+    and the peak's full width at half maximum in bins.
+
+    Integer counts get bins of a whole number of counts centred on integers
+    (at most 4096 of them) — non-integer widths would give some bins two
+    values and others one, biasing the peak. Other data get 1024 bins.
+    """
+    from scipy.ndimage import gaussian_filter1d
+
+    if integer:
+        width = max(1, int(np.ceil((hi - lo + 1) / 4096)))
+        edges = np.arange(np.floor(lo) - 0.5, np.ceil(hi) + 0.5 + width, width)
+    else:
+        edges = np.linspace(lo, hi, 1025)
+    counts, edges = np.histogram(flat, bins=edges)
+    # Light smoothing so one noisy bin can't win on a small image.
+    counts = gaussian_filter1d(counts.astype(float), sigma=1.0, mode="constant")
+    peak = int(np.argmax(counts))
+    half = counts[peak] / 2.0
+    left = peak
+    while left > 0 and counts[left - 1] >= half:
+        left -= 1
+    right = peak
+    while right < len(counts) - 1 and counts[right + 1] >= half:
+        right += 1
+    centre = float((edges[peak] + edges[peak + 1]) / 2.0)
+    return centre, float(edges[1] - edges[0]), right - left + 1
 
 
 # ------------------------------------------------------------------

@@ -95,8 +95,7 @@ def run(
     from correlative_imaging.pipeline.base import PipelineContext
     from correlative_imaging.pipeline.analyze import ParticleAnalysis, IntensityMeasurement
     from correlative_imaging.pipeline.colocalize import ColocalizationAnalysis
-    from correlative_imaging.pipeline.segment import AutoThreshold
-    from correlative_imaging.batch import _save_threshold
+    from correlative_imaging.batch import _save_channel_levels
     from correlative_imaging.storage import ResultsDB
 
     output_dir = output or image_path.parent / "output"
@@ -121,9 +120,8 @@ def run(
             pixel_size_um=image_data.pixel_size_um,
             metadata=image_data.metadata,
         )
+        _save_channel_levels(db, image_id, zip(pl.steps, results))
         for step, result in zip(pl.steps, results):
-            if isinstance(step, AutoThreshold):
-                _save_threshold(db, image_id, step, result)
             if result.measurements is not None and not result.measurements.empty:
                 if isinstance(step, ParticleAnalysis):
                     db.save_particle_measurements(image_id, result.measurements)
