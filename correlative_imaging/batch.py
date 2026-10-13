@@ -846,17 +846,19 @@ class WellBatchRunner:
 
 def _save_channel_levels(db: ResultsDB, image_id: int, steps_and_results) -> None:
     """Record, per channel, the black level and threshold this image got —
-    one ``channel_levels`` row per channel that has either step."""
-    rows: dict[int, dict] = {}
+    one ``channel_levels`` row per channel that has either step, plus one per
+    (channel, selection) with per-selection thresholding."""
+    rows: dict[tuple, dict] = {}
     for step, result in steps_and_results:
         if isinstance(step, BlackLevelNormalization):
-            r = rows.setdefault(step.channel, {"channel_index": step.channel})
+            r = rows.setdefault((step.channel, ""), {"channel_index": step.channel})
             r["channel"] = result.info.get("channel", f"ch{step.channel}")
             r["black_level"] = result.info.get("black_level")
             r["black_method"] = (step.method if step.method != "percentile"
                                  else f"percentile {step.percentile}")
         elif isinstance(step, AutoThreshold):
-            r = rows.setdefault(step.channel, {"channel_index": step.channel})
+            r = rows.setdefault((step.channel, step.roi_mask),
+                                {"channel_index": step.channel, "roi_mask": step.roi_mask})
             r["channel"] = result.info.get("channel", f"ch{step.channel}")
             r["threshold_value"] = result.info.get("threshold_value")
             r["threshold_method"] = step.method

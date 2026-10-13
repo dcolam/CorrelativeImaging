@@ -119,6 +119,7 @@ CREATE TABLE IF NOT EXISTS channel_levels (
     image_id                INTEGER NOT NULL REFERENCES images(id),
     channel                 TEXT    NOT NULL,
     channel_index           INTEGER,
+    roi_mask                TEXT,   -- 'whole_image' = global; else per-selection threshold
     black_level             REAL,
     black_method            TEXT,
     threshold_value         REAL,
@@ -174,6 +175,7 @@ class ResultsDB:
             ("colocalization_results",      "pearson_mode TEXT"),
             ("colocalization_per_particle", "mask_overlap_fraction REAL"),
             ("intensity_measurements",      "median_intensity REAL"),
+            ("channel_levels",              "roi_mask TEXT"),
         ]
         for table, col_def in new_columns:
             try:
@@ -311,12 +313,13 @@ class ResultsDB:
         self._con.executemany(
             """
             INSERT INTO channel_levels
-                (image_id, channel, channel_index, black_level, black_method,
+                (image_id, channel, channel_index, roi_mask, black_level, black_method,
                  threshold_value, threshold_method, threshold_z_projection)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (image_id, str(r.get("channel", "")), _as_int(r.get("channel_index")),
+                 str(r.get("roi_mask") or "whole_image"),
                  _as_float(r.get("black_level")), r.get("black_method"),
                  _as_float(r.get("threshold_value")), r.get("threshold_method"),
                  r.get("threshold_z_projection"))

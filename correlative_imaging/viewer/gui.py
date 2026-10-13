@@ -3297,13 +3297,16 @@ class ChannelPanel(QWidget):
             self._preproc_order = dlg.result_order()
             self._update_order_summary()
 
-    def get_segment_steps(self) -> list[dict]:
+    def get_segment_steps(self, roi_mask_key: str = "") -> list[dict]:
+        """Threshold (+ watershed) steps; with *roi_mask_key*, the
+        per-selection variant whose threshold comes from that selection."""
+        roi = {"roi_mask": roi_mask_key} if roi_mask_key else {}
         steps = [{"type": "AutoThreshold", "channel": self._ch_index,
                   "method": self._thresh.currentText(), "z_projection": self._z_proj.currentText(),
-                  "min_size": self._min_obj.value()}]
+                  "min_size": self._min_obj.value(), **roi}]
         if self._ws_en.isChecked():
             steps.append({"type": "WatershedSplit", "channel": self._ch_index,
-                          "min_distance": self._ws_dist.value()})
+                          "min_distance": self._ws_dist.value(), **roi})
         return steps
 
     def get_analysis_steps(self, roi_mask_key: str) -> list[dict]:
@@ -3735,7 +3738,8 @@ class ChannelsTab(QWidget):
                          "BlackLevelNormalization",
                          "AutoThreshold", "WatershedSplit", "ParticleAnalysis", "IntensityMeasurement"}
         for i, panel in enumerate(self._panels):
-            ch_steps = [s for s in steps if s.get("channel") == i and s.get("type") in per_ch_types]
+            ch_steps = [s for s in steps if s.get("channel") == i and s.get("type") in per_ch_types
+                        and not (s.get("type") in ("AutoThreshold", "WatershedSplit") and s.get("roi_mask"))]
             panel.set_from_steps(ch_steps)
 
 
@@ -3764,6 +3768,9 @@ class _ROISel:
     # class table) to match — matched the same way as existing_tag, just
     # against this project's own generated ROI files instead of imported ones.
     class_name: str = ""
+    # Threshold every channel from this selection's own pixels (applied to the
+    # whole frame, then cut to the selection) instead of the global threshold.
+    own_threshold: bool = False
 
     # Sources that need a `well` to resolve against, and which tag field
     # each one uses for matching (see _find_well_roi).
@@ -3784,7 +3791,8 @@ class _ROISel:
                "well_class":   f"BF-pipeline ROI (per well){f' — {self.class_name}' if self.class_name else ''}",
                "well_existing":f"existing project ROI (per well){f' — {self.existing_tag}' if self.existing_tag else ''}",
                }.get(self.source, self.source)
-        return f"{self.label}  [{src}]"
+        own = ", own threshold" if self.own_threshold and self.source != "whole" else ""
+        return f"{self.label}  [{src}{own}]"
 
     def get_roi_step(self, well=None) -> dict | None:
         """Build this selection's ROI-extraction step dict.
@@ -3862,6 +3870,8 @@ class ROISelectionsTab(QWidget):
         steps = pl_dict.get("steps", [])
         groups: dict[str, dict] = {}
         order: list[str] = []
+        own_thr = {s["roi_mask"] for s in steps
+                   if s["type"] == "AutoThreshold" and s.get("roi_mask")}
         for s in steps:
             if s["type"] in ("LoadROI", "ExtractROI"):
                 key = s["roi_name"]
@@ -3890,6 +3900,7 @@ class ROISelectionsTab(QWidget):
                     "not per-well matched. Reconfigure its source manually if you "
                     "need per-well matching (well_class / existing project ROI)."
                 )
+            sel.own_threshold = sel.mask_key in own_thr
             self._add_sel(sel)
         return warnings
 
@@ -4025,6 +4036,18 @@ class ROISelectionsTab(QWidget):
         dfl.addRow(self._fill_cb)
         dfl.addRow("Dilation / erosion:", self._dil_spin)
 
+        self._own_thr_cb = QCheckBox("Threshold within this selection")
+        self._own_thr_cb.setToolTip(
+            "Compute every channel's threshold from this selection's pixels only\n"
+            "(same method as in Channels), instead of once on the whole image.\n"
+            "The threshold is then applied to the whole frame and objects are cut\n"
+            "at the selection edge as usual, so the edge columns stay meaningful.\n"
+            "Each value is stored in channel_levels with this selection's name.\n"
+            "Not available for the whole-image selection (it IS the global one)."
+        )
+        dfl.addRow(self._own_thr_cb)
+        self._rb_whole.toggled.connect(lambda c: self._own_thr_cb.setEnabled(not c))
+
         self._detail.setEnabled(False)
         lay.addWidget(self._detail)
         lay.addStretch()
@@ -4048,6 +4071,7 @@ class ROISelectionsTab(QWidget):
             self._dil_spin.valueChanged,
             self._class_name_edit.textChanged,
             self._existing_tag_edit.textChanged,
+            self._own_thr_cb.toggled,
         ]:
             sig.connect(self._on_form_changed)
         self._src_grp.buttonToggled.connect(self._on_form_changed)
@@ -4114,6 +4138,8 @@ class ROISelectionsTab(QWidget):
         self._dil_spin.setValue(sel.dilation_um)
         self._class_name_edit.setText(sel.class_name)
         self._existing_tag_edit.setText(sel.existing_tag)
+        self._own_thr_cb.setChecked(sel.own_threshold)
+        self._own_thr_cb.setEnabled(sel.source != "whole")
         self._loading = False
 
     def _save_form(self, sel: _ROISel) -> None:
@@ -4131,6 +4157,7 @@ class ROISelectionsTab(QWidget):
         sel.dilation_um = self._dil_spin.value()
         sel.class_name = self._class_name_edit.text().strip()
         sel.existing_tag = self._existing_tag_edit.text().strip()
+        sel.own_threshold = self._own_thr_cb.isChecked()
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -4357,9 +4384,11 @@ def _step_repr(s: dict) -> str:
         detail = f"p={s.get('percentile')}" if m == "percentile" else "histogram peak"
         return f"BlackLevelNormalization({m}, {detail})"
     if t == "AutoThreshold":
-        return f"AutoThreshold({s.get('method')}, {s.get('z_projection')}, min_size={s.get('min_size')}px)"
+        within = f", within {s['roi_mask']}" if s.get("roi_mask") else ""
+        return f"AutoThreshold({s.get('method')}, {s.get('z_projection')}, min_size={s.get('min_size')}px{within})"
     if t == "WatershedSplit":
-        return f"WatershedSplit(min_dist={s.get('min_distance')}px)"
+        within = f", within {s['roi_mask']}" if s.get("roi_mask") else ""
+        return f"WatershedSplit(min_dist={s.get('min_distance')}px{within})"
     if t == "ParticleAnalysis":
         return (f"ParticleAnalysis(ch{s.get('channel')}, area {s.get('min_size_um2')}-{s.get('max_size_um2')}µm², "
                 f"circ≥{s.get('min_circularity')}, {s.get('z_projection')}"
@@ -5975,8 +6004,10 @@ class CorrelativeImagingWidget(QWidget):
           2. Segmentation    — once per channel  (AutoThreshold, WatershedSplit)
           3. Per ROI selection:
                a. ROI extraction (ExtractROI or LoadROI) — skipped for "whole image"
-               b. ParticleAnalysis per channel, restricted to that ROI
-               c. ColocalizationAnalysis per pair, restricted to that ROI
+               b. If "Threshold within this selection": AutoThreshold (+ Watershed)
+                  per channel with the threshold computed from the ROI's pixels
+               c. ParticleAnalysis per channel, restricted to that ROI
+               d. ColocalizationAnalysis per pair, restricted to that ROI
 
         ``well`` resolves per-well-dynamic ROI selections ("BF-pipeline hole
         ROI" / "existing project ROI") against that well's own ROI files —
@@ -6015,6 +6046,9 @@ class CorrelativeImagingWidget(QWidget):
                 continue  # per-well or file source didn't resolve — skip this selection
             if roi_step:
                 steps.append(roi_step)
+            if sel.own_threshold and sel.mask_key:
+                for p in panels:
+                    steps.extend(p.get_segment_steps(sel.mask_key))
             for p in panels:
                 steps.extend(p.get_analysis_steps(sel.mask_key))
             for coloc in self._combine_tab.get_coloc_steps(sel.mask_key):
@@ -6085,6 +6119,10 @@ class CorrelativeImagingWidget(QWidget):
         per_sel_tail: list[tuple] = []
         for sel in sels:
             tail: list[dict] = []
+            if sel.own_threshold and sel.mask_key:
+                # After the selection's ROI step (prepended in _fn), before analysis.
+                for p in panels:
+                    tail.extend(p.get_segment_steps(sel.mask_key))
             for p in panels:
                 tail.extend(p.get_analysis_steps(sel.mask_key))
             tail.extend(self._combine_tab.get_coloc_steps(sel.mask_key))

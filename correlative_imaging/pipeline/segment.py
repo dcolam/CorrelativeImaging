@@ -42,6 +42,24 @@ def _project(arr: np.ndarray, method: str = "max") -> np.ndarray:
             raise ValueError(f"Unknown projection method: {method!r}")
 
 
+def mask_key(channel: int, roi_mask: str = "") -> str:
+    """Context key of a channel's threshold mask: ``mask_ch{c}`` for the
+    global (whole-frame) threshold, ``mask_ch{c}@{roi}`` for one computed
+    from a selection's pixels."""
+    return f"mask_ch{channel}@{roi_mask}" if roi_mask else f"mask_ch{channel}"
+
+
+def channel_mask(context: PipelineContext, channel: int, roi_mask: str = "") -> np.ndarray | None:
+    """The threshold mask to use for *channel* within selection *roi_mask*:
+    the selection's own (per-selection thresholding) if there is one, else
+    the global one."""
+    if roi_mask:
+        m = context.masks.get(mask_key(channel, roi_mask))
+        if m is not None:
+            return m
+    return context.masks.get(mask_key(channel))
+
+
 # ------------------------------------------------------------------
 # Auto-threshold  →  binary mask
 # ------------------------------------------------------------------
@@ -53,21 +71,33 @@ class AutoThreshold(Step):
 
     Produces a binary mask stored in the context as ``'mask_ch{channel}'``.
 
+    With ``roi_mask`` set (per-selection thresholding), the threshold is
+    computed from that selection's pixels only, then applied to the whole
+    frame — so objects crossing the selection edge stay whole and
+    ParticleAnalysis cuts them at the edge exactly as with the global mask.
+    Stored as ``'mask_ch{channel}@{roi_mask}'``; ParticleAnalysis,
+    ColocalizationAnalysis and IntensityMeasurement for that selection use it
+    in place of the global mask. An empty selection gives an empty mask and
+    a NaN threshold.
+
     Parameters
     ----------
     channel:        Channel index to threshold.
     method:         One of 'otsu', 'li', 'yen', 'triangle', 'isodata'.
     z_projection:   How to flatten Z before thresholding ('max', 'mean', 'sum').
     min_size:       Remove objects smaller than this many pixels after thresholding.
+    roi_mask:       Selection whose pixels set the threshold. Empty = whole frame.
     """
     channel: int
     method: str = "otsu"
     z_projection: str = "max"
     min_size: int = 50
+    roi_mask: str = ""
 
     @property
     def name(self) -> str:
-        return f"auto_threshold_ch{self.channel}"
+        roi_suffix = f"_{self.roi_mask}" if self.roi_mask else ""
+        return f"auto_threshold_ch{self.channel}{roi_suffix}"
 
     def process(self, image: np.ndarray, context: PipelineContext) -> StepResult:
         if self.method not in _THRESHOLD_METHODS:
@@ -78,19 +108,32 @@ class AutoThreshold(Step):
         ch = image[self.channel]
         plane = _project(ch, self.z_projection)
         thresh_fn = _THRESHOLD_METHODS[self.method]
-        threshold_value = float(thresh_fn(plane))  # type: ignore[operator]
+        key = mask_key(self.channel, self.roi_mask)
+        ch_name = (context.channel_names[self.channel]
+                   if self.channel < len(context.channel_names)
+                   else f"ch{self.channel}")
+        info = {"mask_key": key, "channel": ch_name, "roi_mask": self.roi_mask or "whole_image"}
+
+        if self.roi_mask:
+            roi = context.masks.get(self.roi_mask)
+            if roi is None:
+                raise RuntimeError(
+                    f"No selection mask '{self.roi_mask}' in context — the per-selection "
+                    "AutoThreshold must run after that selection's ROI step."
+                )
+            pixels = plane[roi.astype(bool)]
+            if pixels.size == 0 or pixels.min() == pixels.max():
+                # Nothing to threshold: no objects in this selection.
+                return StepResult(masks={key: np.zeros(plane.shape, bool)},
+                                  info={**info, "threshold_value": float("nan")})
+        else:
+            pixels = plane
+        threshold_value = float(thresh_fn(pixels))  # type: ignore[operator]
         binary = plane > threshold_value
         if self.min_size > 0:
             binary = remove_small_objects(binary, max_size=self.min_size)
 
-        mask_key = f"mask_ch{self.channel}"
-        ch_name = (context.channel_names[self.channel]
-                   if self.channel < len(context.channel_names)
-                   else f"ch{self.channel}")
-        return StepResult(
-            masks={mask_key: binary},
-            info={"threshold_value": threshold_value, "mask_key": mask_key, "channel": ch_name},
-        )
+        return StepResult(masks={key: binary}, info={**info, "threshold_value": threshold_value})
 
 
 # ------------------------------------------------------------------
@@ -109,25 +152,29 @@ class WatershedSplit(Step):
     ----------
     channel:        Must match the channel used in the preceding AutoThreshold step.
     min_distance:   Minimum distance in pixels between object centres.
+    roi_mask:       Split the per-selection mask of this selection instead of
+                    the global one (see AutoThreshold.roi_mask).
     """
     channel: int
     min_distance: int = 5
+    roi_mask: str = ""
 
     @property
     def name(self) -> str:
-        return f"watershed_split_ch{self.channel}"
+        roi_suffix = f"_{self.roi_mask}" if self.roi_mask else ""
+        return f"watershed_split_ch{self.channel}{roi_suffix}"
 
     def process(self, image: np.ndarray, context: PipelineContext) -> StepResult:
-        mask_key = f"mask_ch{self.channel}"
-        binary = context.masks.get(mask_key)
+        key = mask_key(self.channel, self.roi_mask)
+        binary = context.masks.get(key)
         if binary is None:
             raise RuntimeError(
-                f"No mask '{mask_key}' found in context. "
+                f"No mask '{key}' found in context. "
                 "Run AutoThreshold for this channel first."
             )
 
         labels = _watershed_labels(binary.astype(bool), self.min_distance)
-        return StepResult(masks={mask_key: labels})
+        return StepResult(masks={key: labels})
 
 
 def _watershed_labels(binary: np.ndarray, min_distance: int) -> np.ndarray:

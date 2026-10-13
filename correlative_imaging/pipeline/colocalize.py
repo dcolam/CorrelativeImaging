@@ -10,7 +10,7 @@ from scipy.ndimage import binary_dilation
 from skimage.measure import regionprops_table
 
 from .base import PipelineContext, Step, StepResult, register_step
-from .segment import _project
+from .segment import _project, channel_mask
 
 _COLOC_PROPS = [
     "label", "area", "mean_intensity", "max_intensity", "centroid",
@@ -83,9 +83,10 @@ class ColocalizationAnalysis(Step):
             primary_labels = primary_labels * roi_bool.astype(primary_labels.dtype)
 
         # Secondary channel's thresholded mask (AutoThreshold output, whole
-        # frame) — not particles_ch{c}, which is overwritten by every
-        # ParticleAnalysis call and so depends on which selection ran last.
-        sec_mask = context.masks.get(f"mask_ch{self.secondary_channel}")
+        # frame; this selection's own if it has per-selection thresholding) —
+        # not particles_ch{c}, which is overwritten by every ParticleAnalysis
+        # call and so depends on which selection ran last.
+        sec_mask = channel_mask(context, self.secondary_channel, self.roi_mask)
         sec_bool = None
         if sec_mask is not None:
             sec_bool = sec_mask.astype(bool)

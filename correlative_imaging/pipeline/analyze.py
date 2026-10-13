@@ -10,7 +10,7 @@ from scipy.ndimage import binary_dilation, center_of_mass, distance_transform_ed
 from skimage.measure import label as sk_label, regionprops_table
 
 from .base import PipelineContext, Step, StepResult, register_step
-from .segment import _project
+from .segment import _project, channel_mask
 
 _REGION_PROPS = [
     "label",
@@ -99,9 +99,9 @@ class ParticleAnalysis(Step):
         intensity = _project(ch, self.z_projection)
         px = context.pixel_size_um
 
-        # Resolve label image
-        mask_key = f"mask_ch{self.channel}"
-        label_image: np.ndarray = context.masks.get(mask_key)  # type: ignore[assignment]
+        # Resolve label image — the selection's own threshold mask if it has
+        # one (per-selection thresholding), else the global one.
+        label_image: np.ndarray = channel_mask(context, self.channel, self.roi_mask)  # type: ignore[assignment]
         if label_image is None:
             # No prior segmentation — fall back to a simple Otsu threshold
             from skimage.filters import threshold_otsu
@@ -314,9 +314,13 @@ class IntensityMeasurement(Step):
         }]
 
         if self.outside_particles:
+            # Every channel's threshold mask — this selection's own where it
+            # has per-selection thresholding, else the global one.
             fg = np.zeros(plane.shape, bool)
-            for k, m in context.masks.items():
-                if k.startswith("mask_ch") and m is not None:
+            for c in sorted({int(k[len("mask_ch"):]) for k in context.masks
+                             if k.startswith("mask_ch") and k[len("mask_ch"):].isdigit()}):
+                m = channel_mask(context, c, self.roi_mask)
+                if m is not None:
                     fg |= m.astype(bool)
             r = int(round(self.outside_margin_um / px)) if self.outside_margin_um > 0 else 0
             if r > 0:   # iterations=0 would dilate until nothing changes
