@@ -50,6 +50,7 @@ from qtpy.QtWidgets import (
 from correlative_imaging.diagnostics import CHANNEL_COLOR_CHOICES as _CHANNEL_COLOR_CHOICES
 from correlative_imaging.diagnostics import CHANNEL_COLOR_RGB as _CHANNEL_COLOR_RGB
 from correlative_imaging.diagnostics import default_channel_color as _default_channel_color
+from correlative_imaging.batch import BF_FOCUS_SAVED
 from correlative_imaging.io import supported_extensions
 from correlative_imaging.pipeline.analyze import INTENSITY_METRIC_CHOICES, PARTICLE_METRIC_CHOICES
 from correlative_imaging.viewer.napari_viewer import (
@@ -1369,30 +1370,34 @@ class PlateTab(QWidget):
 
     # ── Load pipeline JSON ────────────────────────────────────────────
 
-    def refresh_json_dropdown(self, input_dir=None, output_dir=None) -> None:
-        """Repopulate the dropdown with *_pipeline.json files found anywhere
-        under the input and output folders (the naming convention from RunTab's
+    def refresh_json_dropdown(self, input_dir=None, output_dir=None,
+                              rescan_input: bool = True) -> None:
+        """Repopulate the dropdown with *_pipeline.json files found under the
+        input and output folders (the naming convention from RunTab's
         auto-save, see _run_basename — but a JSON could also have been saved
         or copied next to the raw data). Call whenever either folder might
-        have changed, e.g. right after a plate scan."""
+        have changed, e.g. right after a plate scan.
+
+        ``rescan_input=False`` (switching back to the Setup tab) reuses the
+        input folder's last result and only re-searches the output folder,
+        where new runs write their JSON: the input folder is usually a large
+        raw-data tree on a network share, and searching it on every tab switch
+        froze the GUI."""
         self._json_combo.blockSignals(True)
         current = self._json_combo.currentText()
         self._json_combo.clear()
         seen: set[Path] = set()
         found: list[Path] = []
-        for d in (input_dir, output_dir):
-            if not d:
-                continue
-            d = Path(d)
-            if not d.is_dir():
-                continue
-            # Recursive: with multiple plates each JSON is written inside that
-            # plate's own output subfolder, so a top-level glob finds nothing.
-            for p in sorted(d.rglob("*_pipeline.json")):
-                resolved = p.resolve()
-                if resolved not in seen:
-                    seen.add(resolved)
-                    found.append(p)
+        in_key = str(input_dir) if input_dir else ""
+        cache = getattr(self, "_json_input_cache", None)
+        if rescan_input or cache is None or cache[0] != in_key:
+            cache = (in_key, _find_pipeline_jsons(input_dir))
+            self._json_input_cache = cache
+        for p in [*cache[1], *_find_pipeline_jsons(output_dir)]:
+            resolved = p.resolve()
+            if resolved not in seen:
+                seen.add(resolved)
+                found.append(p)
         if found:
             for p in found:
                 # Every plate writes the same base name, so the parent folder
@@ -2415,9 +2420,14 @@ class _BFWorker(QThread):
                     try:
                         img     = read_image(well.bf_path)
                         ch_data = img.data[ch]          # (Z,H,W) or (H,W)
+                        focus_msg = ""
                         if ch_data.ndim == 3:
                             ch_data = select_z_range(ch_data, z_start, z_stop,
                                                      axis=0, label=well.well_id)
+                            if proj_dir:
+                                from correlative_imaging.batch import _write_bf_focus
+                                z_f = _write_bf_focus(ch_data, z_start, well.well_id, proj_dir)
+                                focus_msg = f", focal plane {z_f}"
                             ch_data = proj_fn(ch_data, axis=0)   # → (H,W), original dtype
 
                         stem = well.bf_path.stem
@@ -2445,7 +2455,7 @@ class _BFWorker(QThread):
                             tifffile.imwrite(str(proj_out), ch_vis)
                             self.log_msg.emit(
                                 f"  ✓ {well.well_id}: projected "
-                                f"(dtype={ch_data.dtype}) → {proj_out.name}"
+                                f"(dtype={ch_data.dtype}{focus_msg}) → {proj_out.name}"
                             )
                         else:
                             self.log_msg.emit(
@@ -2742,6 +2752,29 @@ class _BFWorker(QThread):
 def _find_ilastik_exe() -> str | None:
     from correlative_imaging.pipeline.ilastik import _find_ilastik_exe as _f
     return _f()
+
+
+def _find_pipeline_jsons(folder, max_depth: int = 3) -> list[Path]:
+    """``*_pipeline.json`` files at most *max_depth* folders below *folder*.
+
+    With multiple plates each run writes its JSON into that plate's own
+    output subfolder, so the top level alone isn't enough — but the depth is
+    capped and VSI companion folders (``_<image name>_/``, one per .vsi, full
+    of .ets tiles) are skipped: a plain recursive search walked all of them.
+    """
+    if not folder or not Path(folder).is_dir():
+        return []
+    root = str(folder)
+    base_depth = root.rstrip("/\\").count(os.sep)
+    found = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        depth = dirpath.count(os.sep) - base_depth
+        dirnames[:] = ([] if depth >= max_depth else
+                       [d for d in dirnames
+                        if not (d.startswith("_") and d.endswith("_") and len(d) > 2)
+                        and not d.startswith(".")])
+        found += [Path(dirpath) / f for f in filenames if f.endswith("_pipeline.json")]
+    return sorted(found)
 
 
 def _roi_filename_for_well(well, kind: str, ext: str = ".roi") -> str:
@@ -5098,8 +5131,27 @@ class RunTab(QWidget):
         )
         self._diag_bf_cb.setEnabled(False)
         self._diag_multichannel_cb.toggled.connect(self._diag_bf_cb.setEnabled)
+        self._diag_bf_focus_cb = QCheckBox("…include BF focal plane")
+        self._diag_bf_focus_cb.setToolTip(
+            "Append the sharpest plane of this well's brightfield stack as a\n"
+            "'BF focus' channel, plus the chosen number of planes either side\n"
+            "('BF focus-1', 'BF focus+1', …). The BF pipeline picks the plane\n"
+            "(variance of the Laplacian, within its Z range) and saves it with\n"
+            f"up to {BF_FOCUS_SAVED} neighbours each side as <well>_focus.tif — wells\n"
+            "projected before this option existed need the BF pipeline rerun."
+        )
+        self._diag_bf_focus_cb.setEnabled(False)
+        self._diag_multichannel_cb.toggled.connect(self._diag_bf_focus_cb.setEnabled)
+        self._diag_bf_around = QSpinBox()
+        self._diag_bf_around.setRange(0, BF_FOCUS_SAVED); self._diag_bf_around.setValue(1)
+        self._diag_bf_around.setPrefix("± "); self._diag_bf_around.setSuffix(" planes")
+        self._diag_bf_around.setToolTip("Planes either side of the sharpest BF plane to include.")
+        self._diag_bf_around.setEnabled(False)
+        self._diag_bf_focus_cb.toggled.connect(self._diag_bf_around.setEnabled)
         mc_row.addWidget(self._diag_multichannel_cb)
         mc_row.addWidget(self._diag_bf_cb)
+        mc_row.addWidget(self._diag_bf_focus_cb)
+        mc_row.addWidget(self._diag_bf_around)
         mc_row.addStretch()
         dfl.addLayout(mc_row)
 
@@ -5492,7 +5544,10 @@ class RunTab(QWidget):
         fmts = [n for n, cb in (("tiff", self._diag_tiff_cb), ("jpg", self._diag_jpg_cb))
                 if cb.isChecked()]
         if self._diag_multichannel_cb.isChecked():
-            fmts.append("per-channel TIF" + (" +BF" if self._diag_bf_cb.isChecked() else ""))
+            fmts.append("per-channel TIF"
+                        + (" +BF" if self._diag_bf_cb.isChecked() else "")
+                        + (f" +BF focus ±{self._diag_bf_around.value()}"
+                           if self._diag_bf_focus_cb.isChecked() else ""))
         if self._diag_crops_cb.isChecked() and self._diag_zstack_cb.isChecked():
             fmts.append("Z-stack crops")
         self._diag_summary_lbl.setText(
@@ -5545,6 +5600,7 @@ class RunTab(QWidget):
             "diag_particles":    self._diag_particles_cb,
             "diag_multichannel": self._diag_multichannel_cb,
             "diag_bf":           self._diag_bf_cb,
+            "diag_bf_focus":     self._diag_bf_focus_cb,
             "diag_zstack":       self._diag_zstack_cb,
         }
 
@@ -5557,11 +5613,16 @@ class RunTab(QWidget):
         for key, cb in self._diag_widgets().items():
             cb.setChecked(s.value(key, cb.isChecked(), type=bool))
         self._diag_crop_pad.setValue(float(s.value("diag_crop_pad", self._diag_crop_pad.value())))
+        self._diag_bf_around.setValue(int(s.value("diag_bf_around", self._diag_bf_around.value())))
         raw = s.value("diag_crop_selection", "")
         self._crop_selection = set(str(raw).split("\x1f")) if raw else None
         s.endGroup()
         self._crop_which_btn.setEnabled(self._diag_crops_cb.isChecked())
         self._diag_zstack_cb.setEnabled(self._diag_crops_cb.isChecked())
+        self._diag_bf_cb.setEnabled(self._diag_multichannel_cb.isChecked())
+        self._diag_bf_focus_cb.setEnabled(self._diag_multichannel_cb.isChecked())
+        self._diag_bf_around.setEnabled(self._diag_multichannel_cb.isChecked()
+                                        and self._diag_bf_focus_cb.isChecked())
         self._refresh_crop_which_label()
         self._refresh_diag_summary()
 
@@ -5571,6 +5632,7 @@ class RunTab(QWidget):
         for key, cb in self._diag_widgets().items():
             s.setValue(key, cb.isChecked())
         s.setValue("diag_crop_pad", self._diag_crop_pad.value())
+        s.setValue("diag_bf_around", self._diag_bf_around.value())
         s.setValue("diag_crop_selection",
                    "\x1f".join(sorted(self._crop_selection)) if self._crop_selection else "")
         s.endGroup()
@@ -5580,6 +5642,8 @@ class RunTab(QWidget):
             cb.toggled.connect(self._save_settings)
             cb.toggled.connect(self._refresh_diag_summary)
         self._diag_crop_pad.valueChanged.connect(self._save_settings)
+        self._diag_bf_around.valueChanged.connect(self._save_settings)
+        self._diag_bf_around.valueChanged.connect(self._refresh_diag_summary)
         self._diag_crop_pad.valueChanged.connect(self._refresh_diag_summary)
 
     def _on_run(self) -> None:
@@ -5619,6 +5683,8 @@ class RunTab(QWidget):
                     "save_particle_labels": self._diag_particles_cb.isChecked(),
                     "multichannel_tif": self._diag_multichannel_cb.isChecked(),
                     "include_bf": self._diag_bf_cb.isChecked(),
+                    "include_bf_focus": self._diag_bf_focus_cb.isChecked(),
+                    "bf_focus_around": self._diag_bf_around.value(),
                     "zstack_crops": zstack,
                     # None → crop every selection; a list → only those mask keys.
                     "crop_selections": (sorted(self._crop_selection)
@@ -6028,7 +6094,9 @@ class CorrelativeImagingWidget(QWidget):
 
     def _on_tab_changed(self, index: int) -> None:
         if self._tabs.widget(index) is self._plate_tab.setup_page:
-            self._plate_tab.refresh_json_dropdown(self._plate_tab.input_dir, self._plate_tab.output_dir)
+            self._plate_tab.refresh_json_dropdown(self._plate_tab.input_dir,
+                                                  self._plate_tab.output_dir,
+                                                  rescan_input=False)
 
     def _on_load_pipeline_json(self, pl_dict: dict) -> None:
         """Apply a loaded pipeline JSON to Channels, ROI & Selections,

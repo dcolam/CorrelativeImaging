@@ -219,8 +219,6 @@ def _load_bf_projection(diag_dir, well_id: str, target_shape=None):
     import numpy as np
     import tifffile
 
-    from correlative_imaging.pipeline.preprocess import bin_array
-
     proj = Path(diag_dir).parent / "bf_pipeline" / "projections" / f"{well_id}_proj.tif"
     if not proj.exists():
         return None
@@ -231,19 +229,59 @@ def _load_bf_projection(diag_dir, well_id: str, target_shape=None):
         arr = np.asarray(arr, dtype=np.float32)
     except Exception:
         return None
+    return _match_grid(arr, target_shape, well_id, "BF projection")
+
+
+def _load_bf_focus(diag_dir, well_id: str, n_around: int, target_shape=None) -> dict:
+    """The sharpest BF plane and up to *n_around* planes either side of it,
+    from ``<well>_focus.tif`` (see :func:`_write_bf_focus`), as
+    ``{"BF focus-1": plane, "BF focus": plane, "BF focus+1": plane, …}``.
+    Neighbours past the end of the stack are left out. An older single-plane
+    file gives just ``"BF focus"``. Empty dict if there is no file."""
+    import re
+
+    import numpy as np
+    import tifffile
+
+    path = Path(diag_dir).parent / "bf_pipeline" / "projections" / f"{well_id}_focus.tif"
+    if not path.exists():
+        return {}
+    try:
+        with tifffile.TiffFile(str(path)) as tf:
+            arr = tf.asarray()
+            info = (tf.imagej_metadata or {}).get("Info", "")
+    except Exception:
+        return {}
+    if arr.ndim == 2:
+        arr, k = arr[None], 0
+    else:
+        m = re.search(r"focus_index_in_file\s*=\s*(\d+)", info)
+        k = int(m.group(1)) if m else arr.shape[0] // 2
+    out = {}
+    for off in range(-n_around, n_around + 1):
+        if 0 <= k + off < arr.shape[0]:
+            plane = _match_grid(np.asarray(arr[k + off], dtype=np.float32),
+                                target_shape, well_id, "BF focal plane")
+            if plane is not None:
+                out["BF focus" + (f"{off:+d}" if off else "")] = plane
+    return out
+
+
+def _match_grid(arr, target_shape, well_id: str, what: str):
+    """Bin a BF plane onto the pipeline's (possibly binned) grid; None, with a
+    warning, if the two are not a whole binning factor apart."""
+    from correlative_imaging.pipeline.preprocess import bin_array
 
     if target_shape is None or tuple(arr.shape) == tuple(target_shape):
         return arr
-
     th, tw = target_shape
     fy, fx = arr.shape[0] // th if th else 0, arr.shape[1] // tw if tw else 0
     if fy >= 1 and fy == fx and arr.shape[0] // fy == th and arr.shape[1] // fx == tw:
         return bin_array(arr, fy, "mean")
-
     log.warning(
-        "Well %s: BF projection is %s but the pipeline planes are %s — not a whole "
-        "binning factor apart, so the BF channel is omitted from diagnostics.",
-        well_id, tuple(arr.shape), tuple(target_shape),
+        "Well %s: %s is %s but the pipeline planes are %s — not a whole "
+        "binning factor apart, so it is omitted from diagnostics.",
+        well_id, what, tuple(arr.shape), tuple(target_shape),
     )
     return None
 
@@ -275,7 +313,7 @@ def _imagej_luts(colors, n: int):
     return luts
 
 
-def _save_multichannel_tif(planes, channel_names, bf_plane, path, colors=None,
+def _save_multichannel_tif(planes, channel_names, bf_planes, path, colors=None,
                            pixel_size_um: float | None = None, info: str | None = None) -> None:
     """Write real per-channel data as an ImageJ-readable multi-channel TIF
     (axes CYX, one slice per channel, channel labels preserved). Fluorescence
@@ -291,19 +329,25 @@ def _save_multichannel_tif(planes, channel_names, bf_plane, path, colors=None,
     while len(labels) < len(chans):
         labels.append(f"ch{len(labels)}")
 
-    if bf_plane is not None:
-        bf = np.asarray(bf_plane, dtype=np.float32)
+    # bf_planes: {label: plane}, e.g. {"BF": projection, "BF focus": plane};
+    # a bare array (older callers) is labelled "BF".
+    if bf_planes is not None and not isinstance(bf_planes, dict):
+        bf_planes = {"BF": bf_planes}
+    n_fl = len(chans)
+    for label, plane in (bf_planes or {}).items():
+        bf = np.asarray(plane, dtype=np.float32)
         mn, mx = float(bf.min()), float(bf.max())
         bf = (bf - mn) / (mx - mn) if mx > mn else np.zeros_like(bf)
         chans.append(bf)
-        labels.append("BF")
+        labels.append(label)
 
     stack = np.stack(chans, axis=0)   # (C, Y, X)
     meta = {"axes": "CYX", "Labels": labels, "mode": "composite"}
-    # BF, when appended, is always the last channel and is grayscale.
+    # BF channels, when appended, are always last and grayscale.
     lut_colors = list(colors or [])
-    if bf_plane is not None:
-        lut_colors = lut_colors[:len(chans) - 1] + ["gray"]
+    if len(chans) > n_fl:
+        fl_colors = (lut_colors + ["gray"] * n_fl)[:n_fl]
+        lut_colors = fl_colors + ["gray"] * (len(chans) - n_fl)
     luts = _imagej_luts(lut_colors, len(chans))
     if luts is not None:
         meta["LUTs"] = luts
@@ -417,11 +461,19 @@ def _save_well_diagnostics(
     multichannel = diag_cfg.get("multichannel_tif", False)
     channel_names = list(getattr(context, "channel_names", []) or [])
     # Pass the pipeline's own plane shape so a binned run still lines up.
-    bf_plane = (
-        _load_bf_projection(out_dir, well.well_id,
-                            target_shape=planes[0].shape[-2:] if planes else None)
-        if diag_cfg.get("include_bf") else None
-    )
+    target = planes[0].shape[-2:] if planes else None
+    bf_planes = {}
+    if diag_cfg.get("include_bf"):
+        plane = _load_bf_projection(out_dir, well.well_id, target_shape=target)
+        if plane is not None:
+            bf_planes["BF"] = plane
+    if diag_cfg.get("include_bf_focus"):
+        focus = _load_bf_focus(out_dir, well.well_id,
+                               int(diag_cfg.get("bf_focus_around", 1) or 0), target)
+        if not focus:
+            log.info("Well %s: no BF focal-plane image (%s_focus.tif) — rerun the "
+                     "BF pipeline to create it.", well.well_id, well.well_id)
+        bf_planes.update(focus)
 
     roi_masks = _selection_masks(_selection_names(pl_dict.get("steps", [])), context)
     crops: dict = {}
@@ -434,7 +486,7 @@ def _save_well_diagnostics(
         save_diagnostic_image(rgb, out_dir / f"{well.well_id}_whole", formats)
         if multichannel:
             _save_multichannel_tif(
-                planes, channel_names, bf_plane,
+                planes, channel_names, bf_planes,
                 out_dir / f"{well.well_id}_whole_channels.tif", colors=colors,
             )
 
@@ -471,7 +523,7 @@ def _save_well_diagnostics(
                 rgb = stamp_outlines(rgb, {roi_name: mask[r0:r1, c0:c1]})
             save_diagnostic_image(rgb, out_dir / stem, formats)
             if multichannel:
-                bf_crop = bf_plane[r0:r1, c0:c1] if bf_plane is not None else None
+                bf_crop = {k: v[r0:r1, c0:c1] for k, v in bf_planes.items()}
                 _save_multichannel_tif(
                     cropped_planes, channel_names, bf_crop,
                     out_dir / f"{stem}_channels.tif",
@@ -557,6 +609,70 @@ def _with_crop_positions(df, selection_rows: list[dict]):
     return df
 
 
+def bf_focus_plane(stack) -> tuple[int, list[float]]:
+    """Index of the sharpest plane of a (Z, Y, X) stack and every plane's score.
+
+    Score = variance of the Laplacian of the lightly smoothed plane (sigma 1,
+    so pixel noise doesn't decide it); large planes are subsampled 2x for
+    speed, which doesn't change which plane wins. Unstained cells in
+    brightfield can be faintest exactly in focus; this picks the plane with
+    the most fine edge detail, which for well/hole outlines is the focal one.
+    """
+    import numpy as np
+    from scipy.ndimage import gaussian_filter, laplace
+
+    scores = []
+    for plane in stack:
+        a = np.asarray(plane, dtype=np.float32)
+        if min(a.shape) > 1024:
+            a = a[::2, ::2]
+        scores.append(float(laplace(gaussian_filter(a, 1.0)).var()))
+    return int(np.argmax(scores)), scores
+
+
+# Planes saved either side of the sharpest BF plane; the diagnostics export
+# includes 0 up to this many of them (Run tab → Diagnostic images).
+BF_FOCUS_SAVED = 3
+
+
+def _write_bf_vis(plane, path, info: str | None = None) -> None:
+    """uint8 min–max scaled copy of a BF plane (or a Z, Y, X stack, scaled as
+    one so the planes stay comparable), for display and diagnostics."""
+    import numpy as np
+    import tifffile
+
+    mn, mx = plane.min(), plane.max()
+    vis = (((plane - mn) / (mx - mn) * 255).astype(np.uint8)
+           if mx > mn else np.zeros(plane.shape, dtype=np.uint8))
+    if vis.ndim == 3:
+        tifffile.imwrite(str(path), vis, imagej=True, compression="zlib",
+                         metadata={"axes": "ZYX", **({"Info": info} if info else {})})
+    else:
+        tifffile.imwrite(str(path), vis, imagej=bool(info),
+                         metadata={"Info": info} if info else None)
+
+
+def _write_bf_focus(sub_stack, z_start: int, well_id: str, proj_dir) -> int:
+    """Write ``<well>_focus.tif`` next to the projection: the sharpest plane of
+    the BF stack (within the configured Z range) and up to
+    :data:`BF_FOCUS_SAVED` planes either side, as one ImageJ Z-stack. Its Info
+    says which plane in the file is the sharpest. Returns that plane's 1-based
+    number in the full stack."""
+    import numpy as np
+
+    idx, scores = bf_focus_plane(sub_stack)
+    first = max(1, z_start or 1)                      # plane number of sub_stack[0]
+    lo, hi = max(0, idx - BF_FOCUS_SAVED), min(len(sub_stack), idx + BF_FOCUS_SAVED + 1)
+    info = "\n".join([f"well = {well_id}", f"focus_plane = {first + idx}",
+                       f"focus_index_in_file = {idx - lo}",
+                       f"planes_in_file = {first + lo}-{first + hi - 1}",
+                       f"planes_scored = {first}-{first + len(scores) - 1}",
+                       "metric = variance of Laplacian (sigma 1)",
+                       "scores = " + ", ".join(f"{v:.4g}" for v in scores)])
+    _write_bf_vis(np.asarray(sub_stack[lo:hi]), Path(proj_dir) / f"{well_id}_focus.tif", info)
+    return first + idx
+
+
 def _bf_project_one(task: tuple) -> tuple:
     """Read one brightfield image, z-project the chosen channel, write the
     Ilastik HDF5 input, and (optionally) a uint8 projection TIFF.
@@ -590,15 +706,14 @@ def _bf_project_one(task: tuple) -> tuple:
         ch_data = img.data[bf_channel]              # (Z,H,W) or (H,W)
         if ch_data.ndim == 3:
             ch_data = select_z_range(ch_data, z_start, z_stop, axis=0, label=well_id)
+            if proj_dir_str:
+                _write_bf_focus(ch_data, z_start, well_id, proj_dir_str)
             ch_data = proj_fn(ch_data, axis=0)      # → (H,W), original dtype
         h5_in = Path(in_dir_str) / f"{stem}.h5"
         with h5py.File(h5_in, "w") as f:
             f.create_dataset("data", data=ch_data[np.newaxis, np.newaxis, np.newaxis])
         if proj_dir_str:
-            mn, mx = ch_data.min(), ch_data.max()
-            ch_vis = (((ch_data - mn) / (mx - mn) * 255).astype(np.uint8)
-                      if mx > mn else np.zeros_like(ch_data, dtype=np.uint8))
-            tifffile.imwrite(str(Path(proj_dir_str) / f"{well_id}_proj.tif"), ch_vis)
+            _write_bf_vis(ch_data, Path(proj_dir_str) / f"{well_id}_proj.tif")
         return (stem, well_id, float(img.pixel_size_um), str(ch_data.dtype), None)
     except Exception:
         return (None, well_id, None, None, traceback.format_exc())

@@ -569,8 +569,11 @@ class _DiagnosticViewer(QWidget):
 
     def _add_channel_row(self, label: str, source: tuple, checked: bool = True) -> None:
         row = QHBoxLayout(); row.setSpacing(4)
-        name = "BF (brightfield)" if label == "BF" else self._channel_name_fn(label)
-        hexc = "#cccccc" if label == "BF" else self._channel_hex_fn(label)
+        # "BF" = brightfield projection, "BF focus" = its sharpest plane.
+        is_bf = label.startswith("BF")
+        name = ({"BF": "BF (brightfield)", "BF focus": "BF focal plane"}.get(label, label)
+                if is_bf else self._channel_name_fn(label))
+        hexc = "#cccccc" if is_bf else self._channel_hex_fn(label)
         cb = QCheckBox(name); cb.setChecked(checked)
         cb.setStyleSheet(f"color:{hexc}; font-weight:bold; font-size:11px;")
         cb.toggled.connect(self._render_diag)
@@ -594,7 +597,7 @@ class _DiagnosticViewer(QWidget):
             if stack is not None:
                 _arr, labels = stack
                 for i, lab in enumerate(labels):
-                    self._add_channel_row(lab, source=("stack", i), checked=(lab != "BF"))
+                    self._add_channel_row(lab, source=("stack", i), checked=not lab.startswith("BF"))
             self._diag_hint.setText(
                 "Per-channel view: untick channels to view singly; sliders adjust "
                 "display brightness (display-only). The ROI outline is only on the "
@@ -628,7 +631,7 @@ class _DiagnosticViewer(QWidget):
                     if source[0] != "stack" or not cb.isChecked():
                         continue
                     planes.append(arr[source[1]])
-                    colors.append((1.0, 1.0, 1.0) if lab == "BF"
+                    colors.append((1.0, 1.0, 1.0) if lab.startswith("BF")
                                   else hex_to_rgb01(self._channel_hex_fn(lab)))
                     gains.append(sld.value() / 100.0)
                     limits.append(all_limits[source[1]])
