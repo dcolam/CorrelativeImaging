@@ -49,6 +49,7 @@ from qtpy.QtWidgets import (
 
 from correlative_imaging.diagnostics import CHANNEL_COLOR_CHOICES as _CHANNEL_COLOR_CHOICES
 from correlative_imaging.diagnostics import CHANNEL_COLOR_RGB as _CHANNEL_COLOR_RGB
+from correlative_imaging.diagnostics import default_channel_color as _default_channel_color
 from correlative_imaging.io import supported_extensions
 from correlative_imaging.pipeline.analyze import INTENSITY_METRIC_CHOICES, PARTICLE_METRIC_CHOICES
 from correlative_imaging.viewer.napari_viewer import (
@@ -2998,11 +2999,12 @@ class ChannelPanel(QWidget):
         ifl.addRow("Display name:", self._name_edit)
         self._color_combo = QComboBox()
         self._color_combo.addItems(_CHANNEL_COLOR_CHOICES)
-        self._color_combo.setCurrentText(_CHANNEL_COLOR_CHOICES[self._ch_index % len(_CHANNEL_COLOR_CHOICES)])
+        self._color_combo.setCurrentText(_default_channel_color(self._ch_index))
         self._color_combo.setToolTip(
             "Used for the preview display and for diagnostic image export "
             "(Run tab) — not copied by 'Copy settings to all other channels' "
-            "since channels usually want distinct colors."
+            "since channels usually want distinct colors. Changing a channel's\n"
+            "colormap in the napari layer controls updates this too."
         )
         ifl.addRow("Color:", self._color_combo)
         copy_btn = QPushButton("Copy settings to all other channels")
@@ -3233,6 +3235,13 @@ class ChannelPanel(QWidget):
     @property
     def display_color(self) -> str:
         return self._color_combo.currentText()
+
+    def set_display_color(self, color: str) -> bool:
+        """Set the colour if it is one of the choices; returns whether it was."""
+        if color not in _CHANNEL_COLOR_CHOICES:
+            return False
+        self._color_combo.setCurrentText(color)
+        return True
 
     # ── Preprocessing step registry (build / enabled / summary) ──────
 
@@ -3683,6 +3692,9 @@ class ChannelsTab(QWidget):
                     self._panels[i].set_raw_name(name)
             return
 
+        # A different channel count rebuilds the panels; keep the colours
+        # already chosen for the channel positions that still exist.
+        old_colors = [p.display_color for p in self._panels]
         for panel in self._panels:
             self._stack.removeWidget(panel)
         self._panels.clear()
@@ -3690,6 +3702,8 @@ class ChannelsTab(QWidget):
 
         for i, name in enumerate(raw_names):
             panel = ChannelPanel(i, name)
+            if i < len(old_colors):
+                panel.set_display_color(old_colors[i])
             panel.name_changed.connect(lambda text, idx=i: self._update_label(idx, text))
             panel.copy_requested.connect(lambda p=panel: self._copy_to_all(p))
             self._panels.append(panel)
@@ -5089,6 +5103,21 @@ class RunTab(QWidget):
         mc_row.addStretch()
         dfl.addLayout(mc_row)
 
+        zs_row = QHBoxLayout()
+        self._diag_zstack_cb = QCheckBox("Also save crops un-projected (Z-stack TIF)")
+        self._diag_zstack_cb.setToolTip(
+            "For every crop, also write <well>_<roi>_crop_zstack.tif: the raw\n"
+            "input cropped to the same box but with every Z plane kept (ImageJ\n"
+            "hyperstack, original bit depth, calibrated XY and Z, channel colours).\n"
+            "Raw values, before any preprocessing; binned like the pipeline if it\n"
+            "bins. Skipped for images without a Z axis. Large files."
+        )
+        self._diag_zstack_cb.setEnabled(False)
+        self._diag_crops_cb.toggled.connect(self._diag_zstack_cb.setEnabled)
+        zs_row.addWidget(self._diag_zstack_cb)
+        zs_row.addStretch()
+        dfl.addLayout(zs_row)
+
         diag_note = QLabel(
             "Colors come from each channel's \"Color\" setting in the Channels tab.\n"
             "The base image is each channel's last pre-threshold (e.g. post-Normalize) "
@@ -5464,6 +5493,8 @@ class RunTab(QWidget):
                 if cb.isChecked()]
         if self._diag_multichannel_cb.isChecked():
             fmts.append("per-channel TIF" + (" +BF" if self._diag_bf_cb.isChecked() else ""))
+        if self._diag_crops_cb.isChecked() and self._diag_zstack_cb.isChecked():
+            fmts.append("Z-stack crops")
         self._diag_summary_lbl.setText(
             f"{' + '.join(what)} → {', '.join(fmts) or 'NO FORMAT CHECKED'}")
 
@@ -5514,6 +5545,7 @@ class RunTab(QWidget):
             "diag_particles":    self._diag_particles_cb,
             "diag_multichannel": self._diag_multichannel_cb,
             "diag_bf":           self._diag_bf_cb,
+            "diag_zstack":       self._diag_zstack_cb,
         }
 
     def _load_settings(self) -> None:
@@ -5529,6 +5561,7 @@ class RunTab(QWidget):
         self._crop_selection = set(str(raw).split("\x1f")) if raw else None
         s.endGroup()
         self._crop_which_btn.setEnabled(self._diag_crops_cb.isChecked())
+        self._diag_zstack_cb.setEnabled(self._diag_crops_cb.isChecked())
         self._refresh_crop_which_label()
         self._refresh_diag_summary()
 
@@ -5573,7 +5606,8 @@ class RunTab(QWidget):
                 formats.add("tiff")
             if self._diag_jpg_cb.isChecked():
                 formats.add("jpg")
-            if formats or self._diag_multichannel_cb.isChecked():
+            zstack = self._diag_crops_cb.isChecked() and self._diag_zstack_cb.isChecked()
+            if formats or self._diag_multichannel_cb.isChecked() or zstack:
                 colors = self._get_channel_colors() if self._get_channel_colors else []
                 diag_cfg = {
                     "whole": self._diag_whole_cb.isChecked(),
@@ -5585,6 +5619,7 @@ class RunTab(QWidget):
                     "save_particle_labels": self._diag_particles_cb.isChecked(),
                     "multichannel_tif": self._diag_multichannel_cb.isChecked(),
                     "include_bf": self._diag_bf_cb.isChecked(),
+                    "zstack_crops": zstack,
                     # None → crop every selection; a list → only those mask keys.
                     "crop_selections": (sorted(self._crop_selection)
                                         if self._crop_selection is not None else None),
@@ -5753,7 +5788,7 @@ class CorrelativeImagingWidget(QWidget):
                                           for sel in self._roi_tab.get_selections()
                                           if sel.mask_key],
             napari_viewer     = napari_viewer,
-            get_channel_colors = lambda: [p.display_color for p in self._channels_tab.get_panels()],
+            get_channel_colors = self._channel_colors,
         )
 
         self._roi_tab.set_viewer(napari_viewer)
@@ -5791,12 +5826,54 @@ class CorrelativeImagingWidget(QWidget):
         root.addWidget(self._tabs)
         self.setMinimumWidth(420)
 
+        self._watch_layer_colormaps()
+
+    # ── napari colormap → Channels tab colour ────────────────────────
+
+    def _watch_layer_colormaps(self) -> None:
+        """Changing a channel layer's colormap in napari updates that channel's
+        Color in the Channels tab, so the choice survives loading the next
+        image (which re-adds the layers) and is used for diagnostics too."""
+        if self._viewer is None:
+            return
+        try:
+            self._viewer.layers.events.inserted.connect(
+                lambda e: self._watch_layer(e.value))
+            for layer in self._viewer.layers:
+                self._watch_layer(layer)
+        except Exception:
+            log.debug("Could not watch napari layer colormaps", exc_info=True)
+
+    def _watch_layer(self, layer) -> None:
+        ev = getattr(getattr(layer, "events", None), "colormap", None)
+        if ev is not None:
+            ev.connect(lambda e, lyr=layer: self._on_layer_colormap(lyr))
+
+    def _on_layer_colormap(self, layer) -> None:
+        """Layers are named ``<group>/<channel>`` (``sample/GFP``, ``FL/GFP``,
+        ``raw/GFP``, ``gaussian_blur_ch1/GFP``); napari may append `` [1]``.
+        Brightfield layers and colormaps outside the colour choices are ignored."""
+        group, _, ch = str(layer.name).partition("/")
+        if not ch or group.startswith("BF"):
+            return
+        ch = re.sub(r" \[\d+\]$", "", ch)
+        name = str(getattr(layer.colormap, "name", "")).lower()
+        name = {"grey": "gray", "grays": "gray", "greys": "gray"}.get(name, name)
+        for p in self._channels_tab.get_panels():
+            if ch in (p._raw_name, p.display_name):
+                p.set_display_color(name)
+                return
+
+    def _channel_colors(self) -> list[str]:
+        return [p.display_color for p in self._channels_tab.get_panels()]
+
     def _add_image_layers(self, image_data, label: str, projection: str,
-                          blending: str = "additive") -> None:
+                          blending: str = "additive", colors: list[str] | None = None) -> None:
         try:
             from correlative_imaging.viewer.napari_viewer import NapariViewer
             nv = NapariViewer.__new__(NapariViewer); nv._viewer = self._viewer
-            nv.show_image(image_data, group=label, projection=projection, blending=blending)
+            nv.show_image(image_data, group=label, projection=projection, blending=blending,
+                          colors=colors)
         except Exception:
             px = image_data.pixel_size_um; scale = [px, px]
             if projection == "none" and image_data.data.ndim == 4:
@@ -5852,11 +5929,12 @@ class CorrelativeImagingWidget(QWidget):
             # BF as a translucent (not additive) base layer — additively
             # summing it with FL would wash the whole view out to white,
             # since BF is often bright across most of the frame.
-            self._add_image_layers(bf_data, "BF", projection, blending="translucent")
+            self._add_image_layers(bf_data, "BF", projection, blending="translucent",
+                                   colors=["gray"] * len(bf_data.channel_names))
             shape_yx = bf_data.data.shape[-2:]
             pixel_size_um = bf_data.pixel_size_um
         if fl_data is not None:
-            self._add_image_layers(fl_data, "FL", projection)
+            self._add_image_layers(fl_data, "FL", projection, colors=self._channel_colors())
             shape_yx = shape_yx or fl_data.data.shape[-2:]
             if bf_data is None:
                 pixel_size_um = fl_data.pixel_size_um
@@ -5899,15 +5977,6 @@ class CorrelativeImagingWidget(QWidget):
 
     def _on_channels_ready(self, channel_names: list[str]) -> None:
         img = self._plate_tab.image_data
-        if img is not None and self._viewer is not None:
-            try:
-                from correlative_imaging.viewer.napari_viewer import NapariViewer
-                v = NapariViewer.__new__(NapariViewer); v._viewer = self._viewer
-                safe_clear_layers(self._viewer)
-                v.show_image(img, group="sample")
-            except Exception:
-                pass
-
         nz = None
         if img is not None and getattr(img, "data", None) is not None and img.data.ndim == 4:
             nz = int(img.data.shape[1])
@@ -5917,6 +5986,17 @@ class CorrelativeImagingWidget(QWidget):
         # configured settings (set_channels keeps the panels) and the pairs.
         same_channels = len(self._channels_tab.get_panels()) == len(channel_names)
         self._channels_tab.set_channels(channel_names)
+
+        # After set_channels, so the layers get the panels' (kept) colours
+        # rather than resetting to the defaults on every newly loaded image.
+        if img is not None and self._viewer is not None:
+            try:
+                from correlative_imaging.viewer.napari_viewer import NapariViewer
+                v = NapariViewer.__new__(NapariViewer); v._viewer = self._viewer
+                safe_clear_layers(self._viewer)
+                v.show_image(img, group="sample", colors=self._channel_colors())
+            except Exception:
+                pass
         self._roi_tab.set_channels(channel_names)
         self._combine_tab.set_channels(channel_names)
         if not same_channels:

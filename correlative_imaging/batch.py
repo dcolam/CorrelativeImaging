@@ -131,6 +131,10 @@ class BatchRunner:
                     )
                     _, results = self.pipeline.run(image_data.data, context)
 
+                    db.set_analysis_scale(image_id, context.pixel_size_um,
+                                          context.metadata.get("binning_factor", 1.0))
+                    db.save_selections(image_id, _selection_rows(
+                        _selection_names(self.pipeline.steps), context))
                     _save_channel_levels(db, image_id, zip(self.pipeline.steps, results))
                     for step, result in zip(self.pipeline.steps, results):
                         if result.measurements is not None and not result.measurements.empty:
@@ -187,6 +191,7 @@ class _WellComputeResult:
     image_meta: dict | None = None   # n_channels, pixel_size_um, metadata
     error: str | None = None
     missing_selections: list[str] = field(default_factory=list)  # unmatched per-well selection labels
+    selections: list[dict] = field(default_factory=list)   # rows for the `selections` table
 
 
 def _project_planes(arr) -> "np.ndarray":
@@ -270,7 +275,8 @@ def _imagej_luts(colors, n: int):
     return luts
 
 
-def _save_multichannel_tif(planes, channel_names, bf_plane, path, colors=None) -> None:
+def _save_multichannel_tif(planes, channel_names, bf_plane, path, colors=None,
+                           pixel_size_um: float | None = None, info: str | None = None) -> None:
     """Write real per-channel data as an ImageJ-readable multi-channel TIF
     (axes CYX, one slice per channel, channel labels preserved). Fluorescence
     planes are saved as float32 as-is (lossless, comparable across wells); the
@@ -301,15 +307,87 @@ def _save_multichannel_tif(planes, channel_names, bf_plane, path, colors=None) -
     luts = _imagej_luts(lut_colors, len(chans))
     if luts is not None:
         meta["LUTs"] = luts
-    tifffile.imwrite(str(path), stack, imagej=True, metadata=meta)
+    kw = {}
+    if pixel_size_um:
+        meta["unit"] = "um"
+        kw["resolution"] = (1.0 / pixel_size_um, 1.0 / pixel_size_um)
+    if info:
+        meta["Info"] = info
+    tifffile.imwrite(str(path), stack, imagej=True, metadata=meta, **kw)
+
+
+def _crop_info(well_id: str, roi_name: str, bbox, pixel_size_um: float,
+               bin_factor: int) -> str:
+    """ImageJ 'Info' text (Image > Show Info in Fiji) placing a crop in its
+    frame: origin in pixels of the analysis grid and in µm."""
+    r0, r1, c0, c1 = bbox
+    px = float(pixel_size_um or 1.0)
+    return "\n".join([
+        f"well = {well_id}", f"selection = {roi_name}",
+        f"crop_row0 = {r0}", f"crop_row1 = {r1}", f"crop_col0 = {c0}", f"crop_col1 = {c1}",
+        f"origin_row_um = {r0 * px:.4f}", f"origin_col_um = {c0 * px:.4f}",
+        f"pixel_size_um = {px:.6g}", f"binning_factor = {bin_factor}",
+        "Pixel positions are on the analysis grid (binned if the pipeline bins).",
+        "Position in this crop = whole-frame position - origin.",
+    ])
+
+
+def _save_zstack_crop(raw_stack, bbox, bin_factor: int, bin_method: str,
+                      channel_names, colors, pixel_size_um: float,
+                      z_step_um: float | None, path, info: str | None = None) -> bool:
+    """Write the *un-projected* (C, Z, Y, X) input cropped to *bbox* as an
+    ImageJ hyperstack (axes ZCYX, raw dtype, calibrated XY/Z, channel LUTs).
+
+    *bbox* is on the pipeline's grid, which is binned when the pipeline bins;
+    the raw stack is not, so the matching raw region is cut first and then
+    binned by the same factor/method — only the crop is binned, not the frame.
+    Raw (pre-preprocessing) values, so it opens like the source file in Fiji.
+    Returns False (nothing written) if the image has no Z axis.
+    """
+    import numpy as np
+    import tifffile
+
+    from correlative_imaging.pipeline.preprocess import bin_array
+
+    arr = np.asarray(raw_stack)
+    if arr.ndim != 4:
+        return False
+    f = max(int(bin_factor or 1), 1)
+    r0, r1, c0, c1 = bbox
+    crop = arr[:, :, r0 * f:r1 * f, c0 * f:c1 * f]
+    if f > 1:
+        crop = bin_array(crop, f, bin_method).astype(arr.dtype, copy=False)
+    zcyx = np.ascontiguousarray(crop.transpose(1, 0, 2, 3))
+    n_c = zcyx.shape[1]
+    meta = {"axes": "ZCYX", "mode": "composite", "unit": "um",
+            "spacing": float(z_step_um or 1.0)}
+    luts = _imagej_luts(colors, n_c)
+    if luts is not None:
+        meta["LUTs"] = luts
+    names = list(channel_names[:n_c]) + [f"ch{i}" for i in range(len(channel_names), n_c)]
+    meta["Labels"] = [names[c] for _ in range(zcyx.shape[0]) for c in range(n_c)]
+    if info:
+        meta["Info"] = info
+    px = float(pixel_size_um or 1.0)
+    tifffile.imwrite(str(path), zcyx, imagej=True, metadata=meta,
+                     resolution=(1.0 / px, 1.0 / px))
+    return True
 
 
 def _save_well_diagnostics(
     well, final_image, pixel_size_um: float, pl_dict: dict,
-    context: PipelineContext, diag_cfg: dict,
-) -> None:
+    context: PipelineContext, diag_cfg: dict, raw_stack=None,
+    z_step_um: float | None = None,
+) -> dict:
     """Write whole-image and/or per-ROI-crop composite diagnostic images for
     one well, per ``diag_cfg`` (see ``RunTab._on_run`` for the dict shape).
+
+    ``raw_stack`` is the unprocessed (C, Z, Y, X) input; with
+    ``diag_cfg["zstack_crops"]`` each crop is also written un-projected from it
+    as ``<well>_<roi>_crop_zstack.tif``.
+
+    Returns ``{roi_name: {"bbox": (r0, r1, c0, c1), "files": [...]}}`` for
+    every crop written, the box on the analysis grid (r1/c1 exclusive).
 
     ``final_image`` is the array ``Pipeline.run()`` returns (not the raw
     ``image_data.data``) — since ``AutoThreshold``/``WatershedSplit`` never
@@ -345,11 +423,9 @@ def _save_well_diagnostics(
         if diag_cfg.get("include_bf") else None
     )
 
-    roi_names = [
-        s["roi_name"] for s in pl_dict.get("steps", [])
-        if s.get("type") in ("LoadROI", "ExtractROI") and "roi_name" in s
-    ]
-    roi_masks = {name: context.masks[name] for name in roi_names if context.masks.get(name) is not None}
+    roi_masks = _selection_masks(_selection_names(pl_dict.get("steps", [])), context)
+    crops: dict = {}
+    px_an = context.pixel_size_um
 
     if diag_cfg.get("whole"):
         rgb = composite_rgb(planes, colors)
@@ -368,6 +444,10 @@ def _save_well_diagnostics(
         # crops to those mask keys — a background/whole selection's "crop" is
         # the full frame, so cropping it only doubles the output.
         wanted = diag_cfg.get("crop_selections")
+        zstack = diag_cfg.get("zstack_crops", False)
+        bin_factor = int(context.metadata.get("binning_factor", 1) or 1)
+        bin_method = next((s.get("method", "mean") for s in pl_dict.get("steps", [])
+                           if s.get("type") == "Binning"), "mean")
         to_crop = (roi_masks if wanted is None
                    else {k: v for k, v in roi_masks.items() if k in set(wanted)})
         if wanted is not None and not to_crop and roi_masks:
@@ -381,24 +461,100 @@ def _save_well_diagnostics(
             if bbox is None:
                 continue
             r0, r1, c0, c1 = bbox
+            info = _crop_info(well.well_id, roi_name, bbox, px_an, bin_factor)
+            stem = f"{well.well_id}_{roi_name}_crop"
+            files = [f"{stem}{ext}" for fmt, ext in (("tiff", ".tif"), ("jpg", ".jpg"))
+                     if fmt in formats]
             cropped_planes = [p[r0:r1, c0:c1] for p in planes]
             rgb = composite_rgb(cropped_planes, colors)
             if stamp:
                 rgb = stamp_outlines(rgb, {roi_name: mask[r0:r1, c0:c1]})
-            save_diagnostic_image(rgb, out_dir / f"{well.well_id}_{roi_name}_crop", formats)
+            save_diagnostic_image(rgb, out_dir / stem, formats)
             if multichannel:
                 bf_crop = bf_plane[r0:r1, c0:c1] if bf_plane is not None else None
                 _save_multichannel_tif(
                     cropped_planes, channel_names, bf_crop,
-                    out_dir / f"{well.well_id}_{roi_name}_crop_channels.tif",
-                    colors=colors,
+                    out_dir / f"{stem}_channels.tif",
+                    colors=colors, pixel_size_um=px_an, info=info,
                 )
+                files.append(f"{stem}_channels.tif")
+            if zstack and raw_stack is not None:
+                if _save_zstack_crop(
+                    raw_stack, bbox, bin_factor, bin_method, channel_names, colors,
+                    px_an, z_step_um, out_dir / f"{stem}_zstack.tif", info=info,
+                ):
+                    files.append(f"{stem}_zstack.tif")
+                else:
+                    log.info("Well %s: image has no Z axis — no Z-stack crop written.",
+                             well.well_id)
+                    zstack = False
+            crops[roi_name] = {"bbox": bbox, "files": files}
 
     if diag_cfg.get("save_particle_labels"):
         import tifffile
         for key, mask in context.masks.items():
             if key.startswith("particles_ch") and mask is not None and mask.max() > 0:
                 tifffile.imwrite(str(out_dir / f"{well.well_id}_{key}.tif"), mask.astype("uint16"))
+
+    return crops
+
+
+def _selection_names(steps) -> list[str]:
+    """Mask keys of the ROI selections in a pipeline — step dicts or Step
+    objects. Other masks in the context (thresholds, particle labels) aren't
+    selections."""
+    names = []
+    for st in steps:
+        typ = st.get("type") if isinstance(st, dict) else type(st).__name__
+        name = st.get("roi_name") if isinstance(st, dict) else getattr(st, "roi_name", None)
+        if typ in ("LoadROI", "ExtractROI") and name and name not in names:
+            names.append(name)
+    return names
+
+
+def _selection_masks(names, context: PipelineContext) -> dict:
+    return {n: context.masks[n] for n in names if context.masks.get(n) is not None}
+
+
+def _selection_rows(names, context: PipelineContext, crops: dict | None = None) -> list[dict]:
+    """Rows for the ``selections`` table: each selection's geometry on the
+    analysis grid plus, if one was written, its diagnostic crop box."""
+    import numpy as np
+
+    px = float(context.pixel_size_um or 1.0)
+    rows = []
+    for name, mask in _selection_masks(names, context).items():
+        m = np.asarray(mask, dtype=bool)
+        ys, xs = np.nonzero(m)
+        row = {"roi_mask": name, "roi_path": context.mask_paths.get(name, ""),
+               "area_px": int(ys.size), "area_um2": ys.size * px * px}
+        if ys.size:
+            row.update(centroid_row=float(ys.mean()), centroid_col=float(xs.mean()),
+                       bbox_row0=int(ys.min()), bbox_row1=int(ys.max()) + 1,
+                       bbox_col0=int(xs.min()), bbox_col1=int(xs.max()) + 1)
+        crop = (crops or {}).get(name)
+        if crop:
+            r0, r1, c0, c1 = crop["bbox"]
+            row.update(crop_row0=r0, crop_row1=r1, crop_col0=c0, crop_col1=c1,
+                       crop_files=crop["files"])
+        rows.append(row)
+    return rows
+
+
+def _with_crop_positions(df, selection_rows: list[dict]):
+    """Add ``crop_row``/``crop_col`` — the particle's centroid in its own
+    selection's diagnostic crop. NaN where that selection has no crop."""
+    import numpy as np
+
+    origins = {r["roi_mask"]: (r["crop_row0"], r["crop_col0"])
+               for r in selection_rows if r.get("crop_row0") is not None}
+    if not origins or "centroid_row" not in df.columns:
+        return df
+    df = df.copy()
+    o = df["roi_mask"].map(origins)
+    df["crop_row"] = df["centroid_row"] - o.map(lambda t: t[0] if isinstance(t, tuple) else np.nan)
+    df["crop_col"] = df["centroid_col"] - o.map(lambda t: t[1] if isinstance(t, tuple) else np.nan)
+    return df
 
 
 def _bf_project_one(task: tuple) -> tuple:
@@ -499,16 +655,21 @@ def _run_pipeline_for_well(
 
         final_image, results = pl.run(image_data.data, context, on_step=on_step)
 
+        crops: dict = {}
         if diag_cfg:
             try:
-                _save_well_diagnostics(
+                crops = _save_well_diagnostics(
                     well, final_image, image_data.pixel_size_um, pl_dict, context, diag_cfg,
+                    raw_stack=image_data.data, z_step_um=image_data.z_step_um,
                 )
             except Exception:
                 log.warning(
                     "Diagnostic image export failed for well %s:\n%s",
                     well.well_id, traceback.format_exc(),
                 )
+
+        # Before trimming: needs the selection masks.
+        selections = _selection_rows(_selection_names(pl_dict.get("steps", [])), context, crops)
 
         if trim_arrays:
             for r in results:
@@ -522,6 +683,8 @@ def _run_pipeline_for_well(
             image_meta={
                 "n_channels": image_data.n_channels,
                 "pixel_size_um": image_data.pixel_size_um,
+                "analysis_pixel_size_um": context.pixel_size_um,
+                "binning_factor": context.metadata.get("binning_factor", 1.0),
                 "metadata": {
                     **image_data.metadata,
                     "well_id": well.well_id,
@@ -532,6 +695,7 @@ def _run_pipeline_for_well(
                 },
             },
             missing_selections=missing,
+            selections=selections,
         )
     except Exception:
         return _WellComputeResult(
@@ -592,14 +756,18 @@ class WellBatchRunner:
             n_channels=result.image_meta["n_channels"],
             pixel_size_um=result.image_meta["pixel_size_um"],
             metadata=result.image_meta["metadata"],
+            analysis_pixel_size_um=result.image_meta.get("analysis_pixel_size_um"),
+            binning_factor=result.image_meta.get("binning_factor"),
         )
         n_particles = 0
         _save_channel_levels(db, image_id, result.steps_and_results)
+        db.save_selections(image_id, result.selections)
         for step, step_result in result.steps_and_results:
             if step_result.measurements is None or step_result.measurements.empty:
                 continue
             if isinstance(step, ParticleAnalysis):
-                db.save_particle_measurements(image_id, step_result.measurements)
+                db.save_particle_measurements(
+                    image_id, _with_crop_positions(step_result.measurements, result.selections))
                 n_particles += step_result.info.get("n_particles", 0)
             elif isinstance(step, IntensityMeasurement):
                 db.save_intensity_measurements(image_id, step_result.measurements)

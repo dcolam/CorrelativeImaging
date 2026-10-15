@@ -48,6 +48,16 @@ CHANNEL_COLOR_RGB = {
 }
 
 
+# Colour a freshly loaded channel gets, first channel to last: blue, green,
+# red, gray, then the remaining choices. Only a default — once a channel's
+# colour is changed (Channels tab or napari) that choice is kept.
+DEFAULT_CHANNEL_COLORS = ["blue", "green", "red", "gray", "cyan", "magenta", "yellow"]
+
+
+def default_channel_color(index: int) -> str:
+    return DEFAULT_CHANNEL_COLORS[index % len(DEFAULT_CHANNEL_COLORS)]
+
+
 def composite_rgb(channel_planes: list, colors: list[str]) -> np.ndarray:
     """Combine 2-D (Y,X) arrays, one per channel, into one RGB uint8 image.
     Each channel is auto-contrast-stretched (same percentile stretch used

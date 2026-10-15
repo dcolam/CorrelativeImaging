@@ -35,9 +35,14 @@ CREATE TABLE IF NOT EXISTS images (
     filename        TEXT    NOT NULL,
     experiment      TEXT,
     n_channels      INTEGER,
-    pixel_size_um   REAL,
+    pixel_size_um   REAL,   -- of the file as read (unbinned)
     run_timestamp   TEXT,
-    metadata        TEXT    -- JSON blob
+    metadata        TEXT,   -- JSON blob
+    -- Pixel size of the grid the pipeline measured on, and the binning that
+    -- produced it: every *_row/*_col/bbox pixel value in the other tables is
+    -- on this grid. NULL = run from before these were recorded.
+    analysis_pixel_size_um REAL,
+    binning_factor  REAL
 );
 
 CREATE TABLE IF NOT EXISTS particle_measurements (
@@ -63,7 +68,11 @@ CREATE TABLE IF NOT EXISTS particle_measurements (
     share_inside    REAL,
     dist_centre_um  REAL,
     dist_centre_rel REAL,
-    dist_rim_um     REAL
+    dist_rim_um     REAL,
+    centroid_row_um REAL,   -- absolute, µm from the frame's top-left corner
+    centroid_col_um REAL,
+    crop_row        REAL,   -- position in this selection's diagnostic crop
+    crop_col        REAL    -- (crop pixels); NULL if no crop was written
 );
 
 CREATE TABLE IF NOT EXISTS colocalization_results (
@@ -127,6 +136,31 @@ CREATE TABLE IF NOT EXISTS channel_levels (
     threshold_z_projection  TEXT
 );
 
+-- One row per selection per image: where the selection lies in the frame
+-- and, if a diagnostic crop was written for it, the crop's box. All pixel
+-- values are on the analysis grid (images.analysis_pixel_size_um), rows/cols
+-- from the top-left corner, *_row1/*_col1 exclusive. A particle's position in
+-- the crop is centroid_row - crop_row0 (stored as particle_measurements.crop_row).
+CREATE TABLE IF NOT EXISTS selections (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    image_id        INTEGER NOT NULL REFERENCES images(id),
+    roi_mask        TEXT    NOT NULL,
+    roi_path        TEXT,
+    area_px         INTEGER,
+    area_um2        REAL,
+    centroid_row    REAL,
+    centroid_col    REAL,
+    bbox_row0       INTEGER,
+    bbox_row1       INTEGER,
+    bbox_col0       INTEGER,
+    bbox_col1       INTEGER,
+    crop_row0       INTEGER,
+    crop_row1       INTEGER,
+    crop_col0       INTEGER,
+    crop_col1       INTEGER,
+    crop_files      TEXT    -- JSON list of the crop files written
+);
+
 CREATE TABLE IF NOT EXISTS pipeline_runs (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     image_id        INTEGER REFERENCES images(id),
@@ -176,6 +210,12 @@ class ResultsDB:
             ("colocalization_per_particle", "mask_overlap_fraction REAL"),
             ("intensity_measurements",      "median_intensity REAL"),
             ("channel_levels",              "roi_mask TEXT"),
+            ("images",                      "analysis_pixel_size_um REAL"),
+            ("images",                      "binning_factor REAL"),
+            ("particle_measurements",       "centroid_row_um REAL"),
+            ("particle_measurements",       "centroid_col_um REAL"),
+            ("particle_measurements",       "crop_row REAL"),
+            ("particle_measurements",       "crop_col REAL"),
         ]
         for table, col_def in new_columns:
             try:
@@ -195,13 +235,16 @@ class ResultsDB:
         n_channels: int = 0,
         pixel_size_um: float = 1.0,
         metadata: dict | None = None,
+        analysis_pixel_size_um: float | None = None,
+        binning_factor: float | None = None,
     ) -> int:
         """Insert an image record and return its row id."""
         cur = self._con.execute(
             """
             INSERT INTO images (path, filename, experiment, n_channels,
-                                pixel_size_um, run_timestamp, metadata)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                                pixel_size_um, run_timestamp, metadata,
+                                analysis_pixel_size_um, binning_factor)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 str(image_path),
@@ -211,10 +254,51 @@ class ResultsDB:
                 pixel_size_um,
                 datetime.utcnow().isoformat(),
                 json.dumps(metadata or {}),
+                _as_float(analysis_pixel_size_um),
+                _as_float(binning_factor),
             ),
         )
         self._con.commit()
         return cur.lastrowid  # type: ignore[return-value]
+
+    def set_analysis_scale(self, image_id: int, analysis_pixel_size_um: float,
+                           binning_factor: float) -> None:
+        """Record the analysis grid for an image registered before its run."""
+        self._con.execute(
+            "UPDATE images SET analysis_pixel_size_um = ?, binning_factor = ? WHERE id = ?",
+            (_as_float(analysis_pixel_size_um), _as_float(binning_factor), image_id),
+        )
+        self._con.commit()
+
+    # ------------------------------------------------------------------
+    # Selections (ROI geometry + diagnostic crop boxes)
+    # ------------------------------------------------------------------
+
+    def save_selections(self, image_id: int, rows: list[dict]) -> None:
+        if not rows:
+            return
+        self._con.executemany(
+            """
+            INSERT INTO selections
+                (image_id, roi_mask, roi_path, area_px, area_um2,
+                 centroid_row, centroid_col,
+                 bbox_row0, bbox_row1, bbox_col0, bbox_col1,
+                 crop_row0, crop_row1, crop_col0, crop_col1, crop_files)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (image_id, str(r["roi_mask"]), str(r.get("roi_path") or ""),
+                 _as_int(r.get("area_px")), _as_float(r.get("area_um2")),
+                 _as_float(r.get("centroid_row")), _as_float(r.get("centroid_col")),
+                 _as_int(r.get("bbox_row0")), _as_int(r.get("bbox_row1")),
+                 _as_int(r.get("bbox_col0")), _as_int(r.get("bbox_col1")),
+                 _as_int(r.get("crop_row0")), _as_int(r.get("crop_row1")),
+                 _as_int(r.get("crop_col0")), _as_int(r.get("crop_col1")),
+                 json.dumps(r["crop_files"]) if r.get("crop_files") else None)
+                for r in rows
+            ],
+        )
+        self._con.commit()
 
     # ------------------------------------------------------------------
     # Particle measurements
@@ -253,6 +337,10 @@ class ResultsDB:
                     _as_float(r.get("dist_centre_um")),
                     _as_float(r.get("dist_centre_rel")),
                     _as_float(r.get("dist_rim_um")),
+                    _as_float(r.get("centroid_row_um")),
+                    _as_float(r.get("centroid_col_um")),
+                    _as_float(r.get("crop_row")),
+                    _as_float(r.get("crop_col")),
                 )
             )
         self._con.executemany(
@@ -262,8 +350,10 @@ class ResultsDB:
                  circularity, eccentricity, solidity, mean_intensity,
                  max_intensity, min_intensity, centroid_row, centroid_col,
                  area_full_um2, cut_at_edge, share_inside,
-                 dist_centre_um, dist_centre_rel, dist_rim_um)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 dist_centre_um, dist_centre_rel, dist_rim_um,
+                 centroid_row_um, centroid_col_um, crop_row, crop_col)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?)
             """,
             rows,
         )
@@ -443,24 +533,22 @@ class ResultsDB:
         src.row_factory = sqlite3.Row
         try:
             id_map: dict[int, int] = {}
+            # Copy whichever image columns the source has — an older source
+            # lacks the newer ones, which then stay NULL here.
+            img_cols = [c[1] for c in src.execute("PRAGMA table_info(images)") if c[1] != "id"]
             for row in src.execute("SELECT * FROM images ORDER BY id"):
-                d = dict(row)
-                old_id = d.pop("id")
+                d = {c: row[c] for c in img_cols}
                 cur = self._con.execute(
-                    """
-                    INSERT INTO images (path, filename, experiment, n_channels,
-                                        pixel_size_um, run_timestamp, metadata)
-                    VALUES (:path, :filename, :experiment, :n_channels,
-                            :pixel_size_um, :run_timestamp, :metadata)
-                    """,
+                    f"INSERT INTO images ({', '.join(img_cols)}) "  # noqa: S608
+                    f"VALUES ({', '.join(':' + c for c in img_cols)})",
                     d,
                 )
-                id_map[old_id] = cur.lastrowid
+                id_map[row["id"]] = cur.lastrowid
 
             for table in (
                 "particle_measurements", "intensity_measurements",
                 "colocalization_results", "colocalization_per_particle",
-                "channel_levels", "pipeline_runs",
+                "channel_levels", "selections", "pipeline_runs",
             ):
                 cols = [c[1] for c in src.execute(f"PRAGMA table_info({table})") if c[1] != "id"]
                 if not cols:
@@ -496,6 +584,7 @@ class ResultsDB:
             "colocalization_results",
             "colocalization_per_particle",
             "channel_levels",
+            "selections",
         ]
         for table in tables:
             df = pd.read_sql_query(f"SELECT * FROM {table}", self._con)  # noqa: S608

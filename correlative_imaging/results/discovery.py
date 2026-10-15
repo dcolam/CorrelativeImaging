@@ -130,6 +130,8 @@ def find_diagnostic_images(diagnostics_dir: Path | None, well_id: str) -> dict[s
             continue  # particle label maps aren't display composites
         if stem.endswith("_channels"):
             continue  # real per-channel stacks are handled by find_channel_stack
+        if stem.endswith("_zstack"):
+            continue  # un-projected Z-stack crops are for Fiji, not the explorer
         # Prefer .jpg; only take .tif if no .jpg already recorded for this kind.
         if stem in out and out[stem].suffix.lower() == ".jpg":
             continue

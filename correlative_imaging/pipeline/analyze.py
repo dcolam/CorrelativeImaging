@@ -47,6 +47,12 @@ INTENSITY_METRIC_CHOICES = [
     "mean_intensity", "median_intensity", "sum_intensity", "std_intensity", "area_px", "area_um2",
 ]
 
+# Where each particle sits in the frame: centroid in pixels of the grid the
+# pipeline ran on (binned if it bins) and in µm from the frame's top-left
+# corner (independent of binning). Always output — positions are needed to
+# place particles on the image or a diagnostic crop.
+PARTICLE_POSITION_COLUMNS = ["centroid_row", "centroid_col", "centroid_row_um", "centroid_col_um"]
+
 # Where each particle sits relative to its selection, computed from the WHOLE
 # whole-image object it was cut from (not the piece inside the selection).
 # Always output — not user-selectable — so a particle cut at the selection
@@ -141,6 +147,8 @@ class ParticleAnalysis(Step):
         df = df.rename(
             columns={"centroid-0": "centroid_row", "centroid-1": "centroid_col"},
         )
+        df["centroid_row_um"] = df["centroid_row"] * px
+        df["centroid_col_um"] = df["centroid_col"] * px
 
         # Filtering
         if self.min_size_um2 > 0:
@@ -172,6 +180,7 @@ class ParticleAnalysis(Step):
         keep = ["channel", "roi_mask", "roi_path", "label"]
         for m in selected:
             keep.extend(_PARTICLE_METRIC_COLUMNS.get(m, [m]))
+        keep.extend(c for c in PARTICLE_POSITION_COLUMNS if c not in keep)
         keep.extend(PARTICLE_EDGE_COLUMNS)
         df = df[[c for c in keep if c in df.columns]]
 

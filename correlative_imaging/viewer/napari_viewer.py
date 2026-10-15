@@ -109,7 +109,7 @@ class NapariViewer:
     # ------------------------------------------------------------------
 
     def show_image(self, image_data: ImageData, group: str = "raw", projection: str = "max",
-                   blending: str = "additive") -> None:
+                   blending: str = "additive", colors: list[str] | None = None) -> None:
         """Add every channel as a separate napari Image layer.
 
         projection: 'min' | 'max' | 'mean' | 'sum'  (Z-projection method; no-op
@@ -121,6 +121,10 @@ class NapariViewer:
         enough to be misleading; it is still available on demand via the Run
         tab's "Auto" contrast button.
 
+        colors:     napari colormap name per channel (e.g. the Channels tab's
+                    colours); channels beyond the list fall back to
+                    ``default_channel_color`` (blue, green, red, gray, …).
+
         blending:   napari blending mode. Use 'translucent' (not the default
                     'additive') when this image will be shown alongside
                     another — e.g. brightfield next to fluorescence — since
@@ -129,7 +133,11 @@ class NapariViewer:
         """
         from napari.utils.colormaps import ensure_colormap
 
-        colormaps = ["gray", "green", "red", "cyan", "magenta", "yellow"]
+        from correlative_imaging.diagnostics import default_channel_color
+
+        colors = list(colors or [])
+        colormaps = [colors[i] if i < len(colors) else default_channel_color(i)
+                     for i in range(len(image_data.channel_names))]
         px = image_data.pixel_size_um
 
         if projection == "none" and image_data.data.ndim == 4:
@@ -144,7 +152,7 @@ class NapariViewer:
                 self._viewer.add_image(
                     stack[i],
                     name=f"{group}/{ch_name}",
-                    colormap=colormaps[i % len(colormaps)],
+                    colormap=colormaps[i],
                     blending=blending,
                     scale=scale,
                 )
@@ -156,7 +164,7 @@ class NapariViewer:
             mip = mip[np.newaxis]        # ensure (C, Y, X) shape
 
         for i, ch_name in enumerate(image_data.channel_names):
-            cmap = colormaps[i % len(colormaps)]
+            cmap = colormaps[i]
             self._viewer.add_image(
                 mip[i],
                 name=f"{group}/{ch_name}",
