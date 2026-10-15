@@ -233,3 +233,30 @@ def test_stack_depth_label_never_rewrites_the_range(qapp):
     ch._zproj_from.setValue(7)
     assert "no slices" in ch._zdepth_lbl.text()
     assert ch.get_zprojection_step()["z_start"] == 7
+
+
+def test_ilastik_input_is_raw_uint16_and_saved_identically(tmp_path):
+    """What goes into Ilastik is what is saved as <well>_proj.tif: the raw
+    projection values as uint16, not a rescaled display copy."""
+    from correlative_imaging.batch import _bf_project_one
+    import h5py
+
+    src = _write_stack(tmp_path / "well.tif")          # planes 10, 20, … 80
+    (tmp_path / "h5").mkdir(); proj = tmp_path / "proj"; proj.mkdir()
+    stem, _, _, dtype, err = _bf_project_one(
+        (str(src), "A1", 0, "min", str(tmp_path / "h5"), str(proj), 0, 0))
+    assert err is None, err
+    with h5py.File(tmp_path / "h5" / f"{stem}.h5") as f:
+        fed = f["data"][:][0, 0, 0]
+    saved = tifffile.imread(proj / "A1_proj.tif")
+    assert dtype == "uint16" and fed.dtype == np.uint16 and saved.dtype == np.uint16
+    np.testing.assert_array_equal(fed, saved)
+    assert int(saved.min()) == int(saved.max()) == 10    # raw min-projection value
+
+
+def test_ilastik_input_clips_out_of_range_projection():
+    from correlative_imaging.batch import bf_ilastik_input
+
+    out = bf_ilastik_input(np.array([[-5.0, 12.4], [70000.0, 300.6]], np.float32))
+    assert out.dtype == np.uint16
+    assert out.tolist() == [[0, 12], [65535, 301]]

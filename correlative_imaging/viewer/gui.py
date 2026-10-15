@@ -2434,32 +2434,39 @@ class _BFWorker(QThread):
                         well_map[stem] = well
                         px_map[stem] = img.pixel_size_um
 
-                        # HDF5 for Ilastik — original bit depth, tzcyx shape
+                        # HDF5 for Ilastik — raw values as uint16, tzcyx shape
+                        # (same helper as _bf_project_one, so both paths agree)
+                        from correlative_imaging.batch import bf_ilastik_input
+                        ilastik_in = bf_ilastik_input(ch_data, well.well_id)
                         h5_in = in_dir / f"{stem}.h5"
                         with h5py.File(h5_in, "w") as f:
                             f.create_dataset(
                                 "data",
-                                data=ch_data[np.newaxis, np.newaxis, np.newaxis],
+                                data=ilastik_in[np.newaxis, np.newaxis, np.newaxis],
                             )
                         h5_stems.append(stem)
                         h5_in_args.append(f"{h5_in}/data")
 
-                        # uint8 copy only for display / saved projection TIFF
+                        # uint8 copy for the napari test-mode display only (in
+                        # memory, never saved)
                         mn, mx = ch_data.min(), ch_data.max()
                         ch_vis = ((ch_data - mn) / (mx - mn) * 255).astype(np.uint8) \
                                  if mx > mn else np.zeros_like(ch_data, dtype=np.uint8)
                         ch_vis_map[stem] = ch_vis
 
                         if proj_dir:
+                            # Saved = exactly what Ilastik got, for reproducibility.
                             proj_out = proj_dir / f"{well.well_id}_proj.tif"
-                            tifffile.imwrite(str(proj_out), ch_vis)
+                            tifffile.imwrite(str(proj_out), ilastik_in)
                             self.log_msg.emit(
                                 f"  ✓ {well.well_id}: projected "
-                                f"(dtype={ch_data.dtype}{focus_msg}) → {proj_out.name}"
+                                f"(uint16, {int(ilastik_in.min())}–{int(ilastik_in.max())}"
+                                f"{focus_msg}) → {proj_out.name}"
                             )
                         else:
                             self.log_msg.emit(
-                                f"  ✓ {well.well_id}: projected (dtype={ch_data.dtype})"
+                                f"  ✓ {well.well_id}: projected (uint16, "
+                                f"{int(ilastik_in.min())}–{int(ilastik_in.max())})"
                             )
 
                     except Exception:

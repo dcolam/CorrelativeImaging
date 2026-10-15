@@ -630,6 +630,27 @@ def bf_focus_plane(stack) -> tuple[int, list[float]]:
     return int(np.argmax(scores)), scores
 
 
+def bf_ilastik_input(proj, well_id: str = ""):
+    """The exact array handed to Ilastik — and saved as ``<well>_proj.tif`` —
+    for a BF projection: the raw camera values as uint16.
+
+    The reader gives float32, but a min/max projection of camera data holds
+    whole numbers, so this is lossless for those. A mean projection is
+    rounded; values outside 0–65535 (e.g. a sum projection) are clipped, with
+    a warning, since uint16 cannot hold them. Never rescaled: what Ilastik was
+    trained on (raw 16-bit projections) is what it gets, and the saved file is
+    byte-for-byte that input, so a run can be reproduced from it.
+    """
+    import numpy as np
+
+    a = np.asarray(proj)
+    lo, hi = float(a.min()), float(a.max())
+    if lo < 0 or hi > 65535:
+        log.warning("Well %s: BF projection spans %.0f–%.0f, outside uint16 — clipped "
+                    "for Ilastik (use min/max/mean projection).", well_id, lo, hi)
+    return np.clip(np.rint(a), 0, 65535).astype(np.uint16)
+
+
 # Planes saved either side of the sharpest BF plane; the diagnostics export
 # includes 0 up to this many of them (Run tab → Diagnostic images).
 BF_FOCUS_SAVED = 3
@@ -709,12 +730,14 @@ def _bf_project_one(task: tuple) -> tuple:
             if proj_dir_str:
                 _write_bf_focus(ch_data, z_start, well_id, proj_dir_str)
             ch_data = proj_fn(ch_data, axis=0)      # → (H,W), original dtype
+        ilastik_in = bf_ilastik_input(ch_data, well_id)
         h5_in = Path(in_dir_str) / f"{stem}.h5"
         with h5py.File(h5_in, "w") as f:
-            f.create_dataset("data", data=ch_data[np.newaxis, np.newaxis, np.newaxis])
+            f.create_dataset("data", data=ilastik_in[np.newaxis, np.newaxis, np.newaxis])
         if proj_dir_str:
-            _write_bf_vis(ch_data, Path(proj_dir_str) / f"{well_id}_proj.tif")
-        return (stem, well_id, float(img.pixel_size_um), str(ch_data.dtype), None)
+            # Exactly the Ilastik input — reproducible, not a display copy.
+            tifffile.imwrite(str(Path(proj_dir_str) / f"{well_id}_proj.tif"), ilastik_in)
+        return (stem, well_id, float(img.pixel_size_um), str(ilastik_in.dtype), None)
     except Exception:
         return (None, well_id, None, None, traceback.format_exc())
 
