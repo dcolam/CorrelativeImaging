@@ -1937,6 +1937,23 @@ class BFPipelineTab(QWidget):
         btn_row.addWidget(self._abort_btn)
         rl.addLayout(btn_row)
 
+        train_row = QHBoxLayout()
+        self._train_n = QSpinBox(); self._train_n.setRange(1, 200); self._train_n.setValue(10)
+        self._train_n.setSuffix(" images")
+        self._train_btn = QPushButton("Export random training images for Ilastik")
+        self._train_btn.setToolTip(
+            "Pick wells at random (across all plates included in the batch) and save\n"
+            "their BF projections to <output>/ilastik_training_<date_time>/ — exactly\n"
+            "the uint16 images this pipeline hands Ilastik (same channel, Z range and\n"
+            "projection as set above), so a model trained on them sees the same\n"
+            "values at run time. No Ilastik project needed."
+        )
+        self._train_btn.clicked.connect(self._on_export_training)
+        train_row.addWidget(self._train_btn)
+        train_row.addWidget(self._train_n)
+        train_row.addStretch()
+        rl.addLayout(train_row)
+
         self._bar = QProgressBar()
         self._prog_lbl = QLabel("")
         rl.addWidget(self._bar)
@@ -2222,6 +2239,39 @@ class BFPipelineTab(QWidget):
         wells = list(plate._wells.values())
         self.run_on_wells(wells, test_mode=False)
 
+    def _on_export_training(self) -> None:
+        plate = self._get_plate_tab()
+        if plate is None or not plate._plates and not plate._wells:
+            QMessageBox.information(self, "No wells", "Scan a plate folder first.")
+            return
+        plates = plate.get_enabled_plates() if plate._plates else {}
+        if plates:
+            multi = len(plates) > 1
+            wells = [((f"{_sanitize_name(e.display_name)}_{w.well_id}" if multi else w.well_id), w)
+                     for e in plates.values() for w in e.wells.values()]
+        else:
+            wells = [(w.well_id, w) for w in plate._wells.values()]
+        out_dir = (plate.base_output_dir
+                   / f"ilastik_training_{datetime.datetime.now():%Y%m%d_%H%M%S}")
+        self._log_edit.clear()
+        self._log(f"Exporting {self._train_n.value()} random training image(s) from "
+                  f"{sum(w.bf_path is not None for _, w in wells)} BF well(s) → {out_dir}")
+        self._train_btn.setEnabled(False)
+        self._run_btn.setEnabled(False); self._test_btn.setEnabled(False)
+        self._abort_btn.setEnabled(True)
+        self._worker = _BFTrainingWorker(wells, self.get_config(), out_dir, self._train_n.value())
+        self._worker.log_msg.connect(self._log)
+        self._worker.finished.connect(self._on_training_done)
+        self._worker.start()
+
+    def _on_training_done(self, n_ok: int, out_dir: str) -> None:
+        self._train_btn.setEnabled(True)
+        self._run_btn.setEnabled(True); self._test_btn.setEnabled(True)
+        self._abort_btn.setEnabled(False)
+        self._log(f"Done — {n_ok} training image(s) in {out_dir}. Add them to the "
+                  "Ilastik project's Input Data, label, train.")
+        self._worker = None
+
     def _on_abort(self) -> None:
         if self._worker:
             self._worker.abort()
@@ -2248,6 +2298,32 @@ class BFPipelineTab(QWidget):
 
     def _log(self, msg: str) -> None:
         self._log_edit.append(msg)
+
+
+class _BFTrainingWorker(QThread):
+    """Background export of random BF training images (see
+    ``batch.export_bf_training_images``) — reading .vsi files is slow."""
+    log_msg  = Signal(str)
+    finished = Signal(int, str)          # n written, output folder
+
+    def __init__(self, wells: list, cfg: dict, out_dir: Path, n: int):
+        super().__init__()
+        self._wells, self._cfg, self._out_dir, self._n = wells, cfg, out_dir, n
+        self._abort = False
+
+    def abort(self) -> None:
+        self._abort = True
+
+    def run(self) -> None:
+        from correlative_imaging.batch import export_bf_training_images
+        try:
+            written = export_bf_training_images(
+                self._wells, self._cfg, self._out_dir, self._n,
+                log_fn=self.log_msg.emit, should_abort=lambda: self._abort)
+        except Exception:
+            self.log_msg.emit(traceback.format_exc())
+            written = []
+        self.finished.emit(len(written), str(self._out_dir))
 
 
 class _BFWorker(QThread):

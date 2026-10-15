@@ -260,3 +260,38 @@ def test_ilastik_input_clips_out_of_range_projection():
     out = bf_ilastik_input(np.array([[-5.0, 12.4], [70000.0, 300.6]], np.float32))
     assert out.dtype == np.uint16
     assert out.tolist() == [[0, 12], [65535, 301]]
+
+
+def test_training_images_equal_the_pipeline_input(tmp_path):
+    """A training image must be exactly what the pipeline later hands Ilastik."""
+    from correlative_imaging.batch import _bf_project_one, export_bf_training_images
+    from correlative_imaging.io.plate import WellInfo
+
+    wells = []
+    for i in range(5):
+        src = tmp_path / f"w{i}.tif"
+        arr = np.random.default_rng(i).integers(50, 800, (8, 6, 6)).astype("uint16")
+        tifffile.imwrite(src, arr, imagej=True, metadata={"axes": "ZYX"})
+        wells.append((f"B{i + 1}", WellInfo(row="B", col=i + 1, field=1, bf_path=src)))
+    wells.append(("C1", WellInfo(row="C", col=1, field=1)))            # no BF → never picked
+
+    cfg = {"bf_channel": 0, "z_method": "min", "z_start": 2, "z_stop": 6}
+    out = tmp_path / "train"
+    written = export_bf_training_images(wells, cfg, out, n=3, seed=1, log_fn=lambda m: None)
+    assert len(written) == 3 and (out / "training_images.txt").exists()
+    assert not (out / "C1_proj.tif").exists()
+
+    (tmp_path / "h5").mkdir(); proj = tmp_path / "proj"; proj.mkdir()
+    for f in written:
+        name = f.name.removesuffix("_proj.tif")
+        src = dict(wells)[name].bf_path
+        _bf_project_one((str(src), name, 0, "min", str(tmp_path / "h5"), str(proj), 2, 6))
+        np.testing.assert_array_equal(tifffile.imread(f), tifffile.imread(proj / f.name))
+        assert tifffile.imread(f).dtype == np.uint16
+
+    # asking for more than exist exports every BF well once; same seed → same pick
+    assert len(export_bf_training_images(wells, cfg, tmp_path / "all", n=50,
+                                         log_fn=lambda m: None)) == 5
+    again = export_bf_training_images(wells, cfg, tmp_path / "again", n=3, seed=1,
+                                      log_fn=lambda m: None)
+    assert [f.name for f in again] == [f.name for f in written]

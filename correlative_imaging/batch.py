@@ -630,6 +630,72 @@ def bf_focus_plane(stack) -> tuple[int, list[float]]:
     return int(np.argmax(scores)), scores
 
 
+def bf_project_for_ilastik(ch_data, z_method: str, z_start: int, z_stop: int,
+                           well_id: str = "", on_substack=None):
+    """One BF channel ((Z, Y, X) or (Y, X)) → the uint16 image Ilastik gets:
+    the Z range selected, projected with *z_method*, then
+    :func:`bf_ilastik_input`. *on_substack* sees the selected sub-stack before
+    projection (used to pick the focal plane). Shared by the batch projection
+    and the training-image export, so a training image is exactly what the
+    pipeline will later hand Ilastik."""
+    import numpy as np
+
+    from correlative_imaging.pipeline.ilastik import select_z_range
+
+    ops = {"min": np.min, "max": np.max, "mean": np.mean, "sum": np.sum}
+    if ch_data.ndim == 3:
+        ch_data = select_z_range(ch_data, z_start, z_stop, axis=0, label=well_id)
+        if on_substack is not None:
+            on_substack(ch_data)
+        ch_data = ops.get(z_method, np.min)(ch_data, axis=0)
+    return bf_ilastik_input(ch_data, well_id)
+
+
+def export_bf_training_images(wells, cfg: dict, out_dir, n: int, seed: int | None = None,
+                              log_fn=print, should_abort=lambda: False) -> list:
+    """Write *n* randomly chosen wells' BF projections — exactly the uint16
+    images the BF pipeline hands Ilastik, same channel / Z range / projection
+    as *cfg* — to *out_dir* for training a model on. *wells* is a list of
+    ``(name, WellInfo)``; *name* becomes the file name (``<name>_proj.tif``).
+    Also writes ``training_images.txt`` recording sources and settings.
+    Returns the paths written."""
+    import random
+
+    import tifffile
+
+    pool = [(name, w) for name, w in wells if w.bf_path is not None]
+    if not pool:
+        log_fn("No wells with a brightfield image.")
+        return []
+    rng = random.Random(seed)
+    chosen = rng.sample(pool, min(n, len(pool)))
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    z_start = int(cfg.get("z_start", 0) or 0)
+    z_stop = int(cfg.get("z_stop", 0) or 0)
+    lines = [f"BF channel {cfg.get('bf_channel', 0)}, projection {cfg.get('z_method', 'min')}, "
+             f"Z range {z_start or 'first'}–{z_stop or 'last'}, raw values as uint16 "
+             f"(identical to the BF pipeline's Ilastik input)", ""]
+    written = []
+    for i, (name, w) in enumerate(chosen, 1):
+        if should_abort():
+            log_fn("Aborted.")
+            break
+        try:
+            img = read_image(w.bf_path)
+            arr = bf_project_for_ilastik(img.data[int(cfg.get("bf_channel", 0))],
+                                         cfg.get("z_method", "min"), z_start, z_stop, name)
+            dest = out_dir / f"{name}_proj.tif"
+            tifffile.imwrite(str(dest), arr)
+            written.append(dest)
+            lines.append(f"{dest.name}\t{w.bf_path}")
+            log_fn(f"  [{i}/{len(chosen)}] {dest.name}  (uint16, {int(arr.min())}–{int(arr.max())})")
+        except Exception as exc:
+            log_fn(f"  [{i}/{len(chosen)}] {name}: failed — {exc}")
+    (out_dir / "training_images.txt").write_text("\n".join(lines) + "\n")
+    return written
+
+
 def bf_ilastik_input(proj, well_id: str = ""):
     """The exact array handed to Ilastik — and saved as ``<well>_proj.tif`` —
     for a BF projection: the raw camera values as uint16.
@@ -714,23 +780,16 @@ def _bf_project_one(task: tuple) -> tuple:
     import numpy as np
     import tifffile
 
-    from correlative_imaging.pipeline.ilastik import select_z_range
-
     (bf_path_str, well_id, bf_channel, z_method, in_dir_str, proj_dir_str,
      z_start, z_stop) = task
     try:
-        ops = {"min": np.min, "max": np.max, "mean": np.mean, "sum": np.sum}
-        proj_fn = ops.get(z_method, np.min)
         bf_path = Path(bf_path_str)
         stem = bf_path.stem
         img = read_image(bf_path)
-        ch_data = img.data[bf_channel]              # (Z,H,W) or (H,W)
-        if ch_data.ndim == 3:
-            ch_data = select_z_range(ch_data, z_start, z_stop, axis=0, label=well_id)
-            if proj_dir_str:
-                _write_bf_focus(ch_data, z_start, well_id, proj_dir_str)
-            ch_data = proj_fn(ch_data, axis=0)      # → (H,W), original dtype
-        ilastik_in = bf_ilastik_input(ch_data, well_id)
+        on_sub = ((lambda sub: _write_bf_focus(sub, z_start, well_id, proj_dir_str))
+                  if proj_dir_str else None)
+        ilastik_in = bf_project_for_ilastik(img.data[bf_channel], z_method, z_start, z_stop,
+                                            well_id, on_substack=on_sub)
         h5_in = Path(in_dir_str) / f"{stem}.h5"
         with h5py.File(h5_in, "w") as f:
             f.create_dataset("data", data=ilastik_in[np.newaxis, np.newaxis, np.newaxis])
