@@ -256,17 +256,25 @@ def results(folder: Path | None) -> None:
 
 @cli.command()
 @click.argument("folder", type=click.Path(exists=True, path_type=Path), required=False)
-def identity(folder: Path | None) -> None:
-    """Open the particle-identity tool (napari): classify particles in the holes,
-    label them, train, and call each cell's channel combination.
+def reconstruct(folder: Path | None) -> None:
+    """Open Cell reconstruction (napari): find the cell in each hole, label
+    particles, train the classifier and call each cell's channels.
 
-    FOLDER (optional) is a results folder of this tool to open directly. More
+    FOLDER (optional) is a results folder of this tool to open directly. Headless
     commands (detect, classify, train, import-labels):
-    ``python -m correlative_imaging.identity --help``.
+    ``python -m correlative_imaging.reconstruction --help``.
     """
-    from correlative_imaging.identity.gui.app import launch
+    from correlative_imaging.reconstruction.gui.app import launch
 
     raise SystemExit(launch(str(folder) if folder else None))
+
+
+@cli.command(name="identity", hidden=True)
+@click.argument("folder", type=click.Path(exists=True, path_type=Path), required=False)
+@click.pass_context
+def identity(ctx: click.Context, folder: Path | None) -> None:
+    """Old name of `ci reconstruct`."""
+    ctx.invoke(reconstruct, folder=folder)
 
 
 if __name__ == "__main__":

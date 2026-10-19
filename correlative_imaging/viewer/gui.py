@@ -4989,6 +4989,20 @@ class _CropSelectionDialog(QDialog):
         return {k for k, cb in self._boxes.items() if cb.isChecked()}
 
 
+def _run_of_dbs(db_paths: str):
+    """(output root, run tag) from the database path(s) a batch reports ("; "-joined for several plates): each plate
+    writes <root>/<plate folder>/<run tag>.db."""
+    import os
+    import re
+    dbs = [Path(p.strip()) for p in (db_paths or "").split(";") if p.strip()]
+    if not dbs:
+        return None
+    m = re.match(r"^(?P<tag>.+_\d{8}_\d{6})(?:\.part\d+)?$", dbs[0].stem)
+    tag = m.group("tag") if m else dbs[0].stem
+    root = Path(os.path.commonpath([str(d.parent.parent) for d in dbs]))
+    return root, tag
+
+
 class RunTab(QWidget):
     def __init__(self, get_setup, get_pipeline_dict, get_bf_config=None,
                  make_well_pipeline_dict_fn=None, napari_viewer=None,
@@ -5286,7 +5300,29 @@ class RunTab(QWidget):
         self._abort_btn = QPushButton("Abort"); self._abort_btn.setEnabled(False)
         self._abort_btn.clicked.connect(self._on_abort)
         ctrl.addWidget(self._run_btn); ctrl.addWidget(self._abort_btn)
+        self._recon_btn = QPushButton("Cell reconstruction …")
+        self._recon_btn.setToolTip("Open Cell reconstruction in its own window: for the run that just finished, "
+                                   "or any earlier run / reconstruction results folder")
+        self._recon_btn.clicked.connect(lambda: self._open_reconstruction(*(self._last_run or (None, None))))
+        ctrl.addWidget(self._recon_btn)
         bl.addLayout(ctrl)
+        # shown when a run finishes: jump straight into the result viewers
+        self._last_run = None
+        self._child_windows = []
+        self._done_bar = QWidget()
+        _db = QHBoxLayout(self._done_bar)
+        _db.setContentsMargins(6, 4, 6, 4)
+        self._done_lbl = QLabel("")
+        _db.addWidget(self._done_lbl, stretch=1)
+        _rx = QPushButton("Results Explorer")
+        _rx.clicked.connect(lambda: self._open_results_explorer(self._last_run[0] if self._last_run else None))
+        _rc = QPushButton("Cell reconstruction")
+        _rc.setStyleSheet("font-weight:bold")
+        _rc.clicked.connect(lambda: self._open_reconstruction(*(self._last_run or (None, None))))
+        _db.addWidget(_rx); _db.addWidget(_rc)
+        self._done_bar.setStyleSheet("QWidget { background: rgba(43,179,163,0.18); border-radius: 4px; }")
+        self._done_bar.setVisible(False)
+        bl.addWidget(self._done_bar)
         self._bar   = QProgressBar()
         self._prog_lbl = QLabel("")
         bl.addWidget(self._bar); bl.addWidget(self._prog_lbl)
@@ -5896,6 +5932,31 @@ class RunTab(QWidget):
         self._log(f"Done ✓   Results → {db_path}" if db_path else "Finished (with errors).")
         self._prog_lbl.setText("Finished." if db_path else "Finished (with errors).")
         self._current_log_path = None
+        run = _run_of_dbs(db_path)
+        if run:
+            self._last_run = run
+            n = len([p for p in db_path.split(";") if p.strip()])
+            self._done_lbl.setText(f"Run finished · {n} plate(s) · {run[1]}")
+            self._done_bar.setVisible(True)
+
+    def _open_reconstruction(self, root=None, run_tag=None) -> None:
+        """Cell reconstruction in a second napari window of this process (napari.run() is already running)."""
+        import napari
+
+        from correlative_imaging.reconstruction.gui.app import launch
+        v = napari.Viewer(title="Cell reconstruction")
+        app = launch(None, viewer=v, run=False)
+        self._child_windows.append(app)          # keep it alive
+        if root and run_tag:
+            app.prefill(str(root), run_tag)
+
+    def _open_results_explorer(self, root=None) -> None:
+        from correlative_imaging.results.explorer import ResultsExplorer
+        win = ResultsExplorer()
+        if root:
+            win.load_folder(Path(root))
+        win.show()
+        self._child_windows.append(win)
 
     def _log(self, msg: str) -> None:
         self._log_edit.append(str(msg))
