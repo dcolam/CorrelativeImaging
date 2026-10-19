@@ -180,7 +180,7 @@ class ParticleMap(QWidget):
     def queue_selected(self):
         if self.sel is None or not len(self.sel):
             return
-        self.app.browser.queue.load_selection(self.sel[["plate_id", "well_id", "oid"]])
+        self.app.batch["particle"].load_selection(self.sel[["plate_id", "well_id", "oid"]])
 
     def _colors(self, d) -> tuple[list, dict]:
         by = self.by.currentText()

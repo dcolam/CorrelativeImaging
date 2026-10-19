@@ -16,7 +16,9 @@ well labels). Tables: ``particle_labels``, ``test_wells`` (the frozen held-out s
 ``particle_cuts`` (hand-drawn lines that split particles; frame coordinates, all channels and levels),
 ``particle_merges`` (two positions whose particles are joined; one channel and level), ``particle_splits``
 (accepted split proposals: the particle at that position is split at its dips), ``particle_watersheds`` (particles
-split on demand; their dividing lines act as cuts), ``cell_labels`` and ``well_verdicts``.
+split on demand; their dividing lines act as cuts), ``cell_labels``, ``unsure_particles`` (marked unsure in the
+batch labeller: never trained on, not shown again) and ``well_verdicts``. A cell marked unsure is a cell label with
+source "unsure" and no verdict or colour.
 
 ``source`` of a particle label: "hand" (clicked in the canvas), "blind" (labelled with every suggestion hidden: the
 test wells always), "accepted" / "corrected" (a suggestion shown in the label queue was kept / changed), "legacy"
@@ -60,6 +62,8 @@ CREATE TABLE IF NOT EXISTS particle_splits (dataset TEXT, plate_id TEXT, well_id
     y REAL, x REAL, labeller TEXT, t TEXT);
 CREATE TABLE IF NOT EXISTS particle_watersheds (dataset TEXT, plate_id TEXT, well_id TEXT, channel TEXT,
     level TEXT, y REAL, x REAL, labeller TEXT, t TEXT);
+CREATE TABLE IF NOT EXISTS unsure_particles (dataset TEXT, plate_id TEXT, well_id TEXT, channel TEXT, level TEXT,
+    y REAL, x REAL, labeller TEXT, t TEXT, PRIMARY KEY (dataset, plate_id, well_id, channel, level, y, x));
 CREATE TABLE IF NOT EXISTS cell_labels (dataset TEXT, plate_id TEXT, well_id TEXT, y REAL, x REAL,
     verdict TEXT, colour TEXT, source TEXT, labeller TEXT, t TEXT, PRIMARY KEY (dataset, plate_id, well_id, y, x));
 CREATE TABLE IF NOT EXISTS well_verdicts (dataset TEXT, plate_id TEXT, well_id TEXT, verdict TEXT, note TEXT,
@@ -221,6 +225,19 @@ class LabelStore:
                 out.setdefault((p, w), new())["watersheds"].append(dict(channel=ch, level=lev, y=y, x=x))
         return out
 
+    # -- unsure (batch labeller: not trained on, not shown again)
+    def mark_unsure(self, dataset, plate_id, well_id, channel, level, y, x):
+        with self._con() as con:
+            con.execute("INSERT OR REPLACE INTO unsure_particles VALUES (?,?,?,?,?,?,?,?,?)",
+                        (dataset, plate_id, well_id, channel, level, round(float(y), 2), round(float(x), 2),
+                         getpass.getuser(), _now()))
+
+    def unsure_frame(self, dataset: str) -> pd.DataFrame:
+        """In the shape of `frame` (label "unsure"), so match_labels can place them."""
+        with self._con() as con:
+            d = pd.read_sql("SELECT * FROM unsure_particles WHERE dataset=?", con, params=(dataset,))
+        return d.assign(label="unsure", orig_label=None, source="unsure")
+
     # -- cell labels
     def set_cell(self, dataset, plate_id, well_id, y, x, verdict=None, colour=None, source="hand"):
         """Store or update the label of the cell at (y, x); None keeps what is stored."""
@@ -337,7 +354,7 @@ def match_cells(cell_labels: pd.DataFrame, res) -> pd.DataFrame:
     for (p, w), g in cell_labels.groupby(["plate_id", "well_id"]):
         if (p, w) not in W.index:
             continue
-        G = load_recon(res.dir, p, w)
+        G = res.recon(p, w)
         if G is None:
             continue
         r0, c0 = int(W.at[(p, w), "off_r"]), int(W.at[(p, w), "off_c"])

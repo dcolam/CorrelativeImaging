@@ -222,6 +222,16 @@ def detect_run(src, cfg: Config, out_dir, wells: list | None = None, workers: in
     dataset = getattr(src, "dataset", "") or out.name
     F.insert(0, "dataset", dataset)
     W.insert(0, "dataset", dataset)
+    # a new Detect invalidates what Classify derived from the old particles (cells, calls, calibration, bodies)
+    stale = [f for f in ("calls.csv", "cells.csv", "identity.json") if (out / f).exists()]
+    for f in stale:
+        (out / f).unlink()
+    if (out / "recon").exists():
+        import shutil
+        shutil.rmtree(out / "recon", ignore_errors=True)
+        stale.append("recon/")
+    if stale:
+        say(len(rows), len(rows), f"removed the previous Classify outputs ({', '.join(stale)}): run Classify again")
     _atomic(out / "wells.csv", lambda t: W.to_csv(t, index=False))
     _atomic(out / "reference.csv", lambda t: ref.to_csv(t, index=False))
     _atomic(out / "particles.parquet", lambda t: F.to_parquet(t, index=False))
@@ -275,7 +285,15 @@ class Results:
         return load_cache(self.dir, plate_id, well_id)
 
     def recon(self, plate_id, well_id):
-        return load_recon(self.dir, plate_id, well_id)
+        """The well's reconstruction, or None when there is none or it no longer fits the well (made before the
+        well was detected again: run Classify)."""
+        G = load_recon(self.dir, plate_id, well_id)
+        if G is None or "win_h" not in self.wells:
+            return G
+        w = self.wells[(self.wells.plate_id == plate_id) & (self.wells.well_id == well_id)]
+        if len(w) and tuple(G.shape) != (int(w.win_h.iloc[0]), int(w.win_w.iloc[0])):
+            return None
+        return G
 
 
 def classify_run(out_dir, cfg: Config | None = None, model=None, workers: int = 8, progress=None,

@@ -536,41 +536,68 @@ class SettingsTab(QWidget):
             self.app.say(f"preset saved: {p}")
 
 
+def _scroll(body: QWidget) -> QScrollArea:
+    sc = QScrollArea()
+    sc.setWidgetResizable(True)
+    sc.setFrameShape(QFrame.NoFrame)
+    sc.setWidget(body)
+    return sc
+
+
+class Collapsible(QWidget):
+    """A section that opens on click (advanced options stay out of the way)."""
+
+    def __init__(self, title: str, body: QWidget, open_: bool = False):
+        super().__init__()
+        v = QVBoxLayout(self)
+        v.setContentsMargins(0, 0, 0, 0)
+        self.btn = QToolButton()
+        self.btn.setText(title)
+        self.btn.setCheckable(True)
+        self.btn.setChecked(open_)
+        self.btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.btn.setArrowType(Qt.DownArrow if open_ else Qt.RightArrow)
+        self.btn.setStyleSheet("QToolButton { border: none; font-weight: bold; }")
+        self.btn.toggled.connect(self._toggle)
+        v.addWidget(self.btn)
+        self.body = body
+        body.setVisible(open_)
+        v.addWidget(body)
+
+    def _toggle(self, on):
+        self.btn.setArrowType(Qt.DownArrow if on else Qt.RightArrow)
+        self.body.setVisible(on)
+
+
 class TrainTab(QWidget):
+    """Holds the widgets of the labelling and model steps; they are shown on three pages:
+    `setup_page` and `canvas_page` (Label tab) and `model_page` (Model tab). Never shown itself."""
+
     def __init__(self, app):
         super().__init__()
         self.app = app
-        outer = QVBoxLayout(self)
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        body = QWidget()
-        v = QVBoxLayout(body)
 
-        v.addWidget(section("Label library"))
+        # ---- Label tab, top: library, test wells, blind -------------------------------------------------------
+        self.setup_page = QWidget()
+        v = QVBoxLayout(self.setup_page)
+        v.setContentsMargins(4, 4, 4, 4)
+        h = QHBoxLayout()
+        h.addWidget(QLabel("label library"))
         self.store_path = QLineEdit()
+        self.store_path.setToolTip("one SQLite file per project; a ci_labels.db next to the results folder is opened "
+                                   "automatically")
         self.store_path.editingFinished.connect(lambda: app.set_store(self.store_path.text()))
-        v.addWidget(path_row(self.store_path, self.browse_store))
-        self.counts = FrameModel()
-        cv = FrameView(self.counts, stretch=True)
-        cv.setMaximumHeight(110)
-        v.addWidget(cv)
-        b = QPushButton("Import a first labelling session (CSV)…")
-        b.setToolTip("CSV with plate_id, well_id, channel (display name), x_px, y_px, particle_label; "
-                     "imported for the dataset of the open results")
-        b.clicked.connect(self.import_csv)
-        v.addWidget(b)
-
-        v.addWidget(section("Test wells and blind labelling"))
-        v.addWidget(hint("A frozen set of held-out wells per dataset, labelled blind and never trained on: the only "
-                         "fair score for any model (the old one included). Freeze it before labelling a new dataset."))
+        h.addWidget(path_row(self.store_path, self.browse_store), 1)
+        v.addLayout(h)
         h = QHBoxLayout()
         self.b_freeze = QPushButton("Freeze test wells")
-        self.b_freeze.setToolTip("20 % of the wells with something in the hole, per plate (only once per dataset)")
+        self.b_freeze.setToolTip("20 % of the wells with something in the hole, per plate, chosen once and before "
+                                 "any labelling: held out, labelled blind, never trained on")
         self.b_freeze.clicked.connect(lambda: app.freeze_test_wells())
         h.addWidget(self.b_freeze)
-        b = QPushButton("…take over from another library")
-        b.setToolTip("use the test wells of an older label library for this dataset, and draw the rest only from wells "
-                     "it never labelled (so a model trained on it can be compared fairly)")
+        b = QPushButton("…take over")
+        b.setToolTip("use the test wells of an older label library of this dataset and draw the rest only from wells "
+                     "it never labelled (a model trained on it can then be compared fairly)")
         b.clicked.connect(self.freeze_from_other)
         h.addWidget(b)
         self.test_info = QLabel("")
@@ -578,37 +605,25 @@ class TrainTab(QWidget):
         h.addWidget(self.test_info, 1)
         v.addLayout(h)
         h = QHBoxLayout()
-        self.blind = QCheckBox("blind labelling")
-        self.blind.setToolTip("hide every class, call, probability, reconstructed cell and preview in the canvas, the "
-                              "plate and the lists")
         self.blind_test = QCheckBox("always blind in test wells")
         self.blind_test.setChecked(True)
-        for cb in (self.blind, self.blind_test):
+        self.blind_test.setToolTip("in test wells, hide every class, call, probability and reconstructed cell "
+                                   "(canvas, plate, lists, particle map)")
+        self.blind = QCheckBox("blind everywhere")
+        self.blind.setToolTip("the same for every well")
+        for cb in (self.blind_test, self.blind):
             cb.toggled.connect(app.blind_changed)
             h.addWidget(cb)
         h.addStretch(1)
         v.addLayout(h)
 
-        v.addWidget(section("Labelling progress"))
-        self.prog_box = QVBoxLayout()
-        v.addLayout(self.prog_box)
-        self.prog_bars = {}
-        self.curve_lbl = hint("Learning curve after training: score on the test wells against the number of training "
-                              "labels.")
-        v.addWidget(self.curve_lbl)
-        try:
-            import pyqtgraph as pg
-            self.curve = pg.PlotWidget(background=None)
-            self.curve.setMinimumHeight(140)
-            self.curve.setMaximumHeight(170)
-            self.curve.setLabel("bottom", "training labels")
-            self.curve.setLabel("left", "macro F1 (test wells)")
-            self.curve.setMenuEnabled(False)
-            v.addWidget(self.curve)
-        except ImportError:
-            self.curve = None
-
-        v.addWidget(section("Label particles"))
+        # ---- Label tab, "In the canvas": click labelling, cell labels, particle edits -------------------------
+        self.canvas_page = QWidget()
+        v = QVBoxLayout(self.canvas_page)
+        v.addWidget(hint("Label any particle where you see it: turn on label mode, click a particle in the canvas "
+                         "(several overlap: pick from the menu), press 1–5 or a button; Del removes the label. "
+                         "Labels are stored by position, so they survive re-detection. Use this for particles the "
+                         "batches did not show you, and to fix segmentation (below)."))
         h = QHBoxLayout()
         self.mode = QPushButton("Label mode  (L)")
         self.mode.setCheckable(True)
@@ -626,7 +641,7 @@ class TrainTab(QWidget):
         h.addWidget(QLabel("show"))
         self.show_whole = QCheckBox("stringent (solid)")
         self.show_hole = QCheckBox("lenient (dashed)")
-        self.show_ctx = QCheckBox("cells around the hole")
+        self.show_ctx = QCheckBox("cells around")
         self.show_noise = QCheckBox("noise")
         self.show_noise.setToolTip("outlines of particles classed as noise (often background speckle at the lenient "
                                    "threshold); hidden by default, their tags stay")
@@ -638,9 +653,6 @@ class TrainTab(QWidget):
         h.addWidget(self.show_noise)
         h.addStretch(1)
         v.addLayout(h)
-        v.addWidget(hint("In label mode, click a particle in the canvas (several overlap: pick from the menu), then "
-                         "press 1–5 or a button. Del removes the label. Labels are stored by position, so they "
-                         "survive reruns with other settings."))
         grid = QGridLayout()
         for i, c in enumerate(CLASSES):
             btn = QPushButton(f"{CLASS_KEYS[c]}  {c}")
@@ -657,11 +669,9 @@ class TrainTab(QWidget):
         self.picked.setTextFormat(Qt.RichText)
         v.addWidget(self.picked)
 
-        v.addWidget(section("Label the cell"))
-        v.addWidget(hint("After Classify: the reconstructed cell under the picked particle. Verdict: one cell, several "
-                         "cells that cannot be split by eye (either could be the patched one), or not a cell; colour: "
-                         "the identity channels it is positive for. The label queue (bottom dock, Cells) does the "
-                         "same from thumbnails."))
+        v.addWidget(section("The cell of the picked particle"))
+        v.addWidget(hint("After Classify: verdict and colour of the reconstructed cell under the picked particle "
+                         "(the same as the Cells batches)."))
         h = QHBoxLayout()
         for vd in ("one cell", "several cells", "not a cell"):
             b = QPushButton(vd)
@@ -674,13 +684,11 @@ class TrainTab(QWidget):
         self.cell_info = hint("")
         v.addWidget(self.cell_info)
 
-        v.addWidget(section("Edit particles"))
+        v.addWidget(section("Fix the segmentation"))
         v.addWidget(hint("Dashed orange lines are splits Detect proposes at signal dips (not applied). Accept one for "
-                         "the picked particle, watershed it on demand, draw your own cut (X, then drag a line across the "
-                         "particle; several lines are fine, then Apply), or merge the picked particle with a touching "
-                         "piece. Cuts and watersheds hold in the reconstruction too: their pieces never re-join into "
-                         "one cell, and a piece cut off outside the hole stays visible as a neighbour. Edits are "
-                         "stored by position in the label library and re-detect this well right away."))
+                         "the picked particle, watershed it in two, draw your own cut (X, drag a line across, then "
+                         "Apply), or merge it with a touching piece. Cuts hold in the reconstruction too; a piece cut "
+                         "off outside the hole stays visible as a neighbour. Each edit re-detects the well."))
         g = QGridLayout()
         self.b_accept = QPushButton("Accept proposed split")
         self.b_accept.clicked.connect(app.accept_split)
@@ -704,72 +712,46 @@ class TrainTab(QWidget):
         for i, b in enumerate([self.b_accept, self.b_ws, self.b_cut, self.b_apply_cut, self.b_merge, self.b_clear_edits]):
             g.addWidget(b, i // 3, i % 3)
         v.addLayout(g)
+        v.addStretch(1)
+        self.canvas_page = _scroll(self.canvas_page)
 
-        v.addWidget(section("Train the classifier"))
-        v.addWidget(hint("Uses every labelled dataset of the results folders listed below, plus all their unlabelled "
-                         "particles (semi-supervised arms). A frozen set of test wells per dataset is never trained "
-                         "on; choose by the grouped cross-validation, read the test row as the honest check."))
-        self.folders = QPlainTextEdit()
-        self.folders.setPlaceholderText("results folders to train on, one per line (the open one is added)")
-        self.folders.setMaximumHeight(60)
-        v.addWidget(self.folders)
-        h = QHBoxLayout()
-        self.arms = {}
-        from ..learn import ARMS
-        for a in ARMS:
-            cb = QCheckBox(a)
-            cb.setChecked(True)
-            self.arms[a] = cb
-            h.addWidget(cb)
-        v.addLayout(h)
-        h = QHBoxLayout()
-        h.addWidget(QLabel("rounds"))
-        self.rounds = QSpinBox()
-        self.rounds.setRange(0, 10)
-        self.rounds.setValue(3)
-        h.addWidget(self.rounds)
-        h.addWidget(QLabel("pseudo-label P ≥"))
-        self.tau = QDoubleSpinBox()
-        self.tau.setRange(0.5, 0.999)
-        self.tau.setSingleStep(0.01)
-        self.tau.setValue(0.9)
-        h.addWidget(self.tau)
-        h.addStretch(1)
-        self.b_train = accent(QPushButton("Train"))
-        self.b_train.clicked.connect(app.train)
-        h.addWidget(self.b_train)
-        v.addLayout(h)
-        v.addWidget(QLabel("grouped cross-validation (by well)"))
-        self.cv = FrameModel(fmt={})
-        cvv = FrameView(self.cv)
-        cvv.setMinimumHeight(130)
-        v.addWidget(cvv)
-        v.addWidget(QLabel("frozen test wells"))
-        self.test = FrameModel()
-        tv = FrameView(self.test)
-        tv.setMinimumHeight(130)
-        v.addWidget(tv)
-        self.notes = hint("")
-        v.addWidget(self.notes)
-        h = QHBoxLayout()
-        self.arm_pick = QComboBox()
-        h.addWidget(QLabel("use arm"))
-        h.addWidget(self.arm_pick, 1)
-        self.b_save = accent(QPushButton("Save model + classify"))
-        self.b_save.setEnabled(False)
-        self.b_save.clicked.connect(app.save_model)
-        h.addWidget(self.b_save)
-        v.addLayout(h)
+        # ---- Model tab ------------------------------------------------------------------------------------------
+        body = QWidget()
+        v = QVBoxLayout(body)
+        v.addWidget(section("Labelling progress"))
+        v.addWidget(hint("Training labels per class (target 30 each), test objects labelled blind, and judged cells "
+                         "per colour. Rare classes (merged, debris) are usually the bottleneck: the particle map "
+                         "(bottom) helps find them."))
+        self.prog_box = QVBoxLayout()
+        v.addLayout(self.prog_box)
+        self.prog_bars = {}
+        v.addWidget(section("Learning curve"))
+        self.curve_lbl = hint("Drawn after each Retrain: the score on the test wells against the number of training "
+                              "labels. Still rising = keep labelling; flat = label rarer classes or cells instead.")
+        v.addWidget(self.curve_lbl)
+        try:
+            import pyqtgraph as pg
+            self.curve = pg.PlotWidget(background=None)
+            self.curve.setMinimumHeight(140)
+            self.curve.setMaximumHeight(170)
+            self.curve.setLabel("bottom", "training labels")
+            self.curve.setLabel("left", "macro F1 (test wells)")
+            self.curve.setMenuEnabled(False)
+            v.addWidget(self.curve)
+        except ImportError:
+            self.curve = None
 
-        v.addWidget(section("Compare models on the test wells"))
-        v.addWidget(hint("Scores any saved model (or the Detect preview) on the blind labels of the frozen test wells "
-                         "of the open results: the fair comparison, also across datasets."))
+        v.addWidget(section("Compare models"))
+        v.addWidget(hint("Scores saved models (and the Detect preview) on the blind labels of the open results' "
+                         "test wells: the fair comparison. Open another dataset's results to compare across datasets."))
         h = QHBoxLayout()
         self.cmp_models = QComboBox()
-        self.cmp_models.setEditable(False)
         h.addWidget(self.cmp_models, 1)
         b = QPushButton("Add")
         b.clicked.connect(self.add_cmp)
+        h.addWidget(b)
+        b = QPushButton("Clear")
+        b.clicked.connect(lambda: self.cmp_list.setText("preview"))
         h.addWidget(b)
         b = accent(QPushButton("Compare"))
         b.clicked.connect(app.compare_models)
@@ -783,17 +765,82 @@ class TrainTab(QWidget):
         cmv.setMinimumHeight(120)
         v.addWidget(cmv)
 
-        v.addWidget(section("Label next"))
-        v.addWidget(hint("Unlabelled particles the model is least sure about (one per well, test wells excluded). "
-                         "Double-click to open."))
+        # advanced: the full training (compares all arms), label counts, CSV import
+        adv = QWidget()
+        a = QVBoxLayout(adv)
+        a.setContentsMargins(0, 0, 0, 0)
+        a.addWidget(hint("Retrain (Label tab) refits one arm quickly. This compares every arm by cross-validation "
+                         "grouped by well and reports the test wells: use it for the final model. It uses every "
+                         "labelled dataset of the results folders listed, plus all their unlabelled particles."))
+        self.folders = QPlainTextEdit()
+        self.folders.setPlaceholderText("results folders to train on, one per line (the open one is added)")
+        self.folders.setMaximumHeight(60)
+        a.addWidget(self.folders)
+        h = QHBoxLayout()
+        self.arms = {}
+        from ..learn import ARMS
+        for arm in ARMS:
+            cb = QCheckBox(arm)
+            cb.setChecked(True)
+            self.arms[arm] = cb
+            h.addWidget(cb)
+        a.addLayout(h)
+        h = QHBoxLayout()
+        h.addWidget(QLabel("rounds"))
+        self.rounds = QSpinBox()
+        self.rounds.setRange(0, 10)
+        self.rounds.setValue(3)
+        h.addWidget(self.rounds)
+        h.addWidget(QLabel("pseudo-label P ≥"))
+        self.tau = QDoubleSpinBox()
+        self.tau.setRange(0.5, 0.999)
+        self.tau.setSingleStep(0.01)
+        self.tau.setValue(0.9)
+        h.addWidget(self.tau)
+        h.addStretch(1)
+        self.b_train = accent(QPushButton("Train (compare arms)"))
+        self.b_train.clicked.connect(app.train)
+        h.addWidget(self.b_train)
+        a.addLayout(h)
+        a.addWidget(QLabel("grouped cross-validation (by well)"))
+        self.cv = FrameModel(fmt={})
+        cvv = FrameView(self.cv)
+        cvv.setMinimumHeight(120)
+        a.addWidget(cvv)
+        a.addWidget(QLabel("frozen test wells"))
+        self.test = FrameModel()
+        tv = FrameView(self.test)
+        tv.setMinimumHeight(120)
+        a.addWidget(tv)
+        self.notes = hint("")
+        a.addWidget(self.notes)
+        h = QHBoxLayout()
+        self.arm_pick = QComboBox()
+        h.addWidget(QLabel("use arm"))
+        h.addWidget(self.arm_pick, 1)
+        self.b_save = accent(QPushButton("Save model + classify"))
+        self.b_save.setEnabled(False)
+        self.b_save.clicked.connect(app.save_model)
+        h.addWidget(self.b_save)
+        a.addLayout(h)
+        a.addWidget(QLabel("labels in this library, per dataset"))
+        self.counts = FrameModel()
+        cv = FrameView(self.counts, stretch=True)
+        cv.setMaximumHeight(110)
+        a.addWidget(cv)
+        b = QPushButton("Import a first labelling session (CSV)…")
+        b.setToolTip("CSV with plate_id, well_id, channel (display name), x_px, y_px, particle_label; "
+                     "imported for the dataset of the open results")
+        b.clicked.connect(self.import_csv)
+        a.addWidget(b)
+        # the old "label next" list (the batches replace it); kept for open_queue_item
         self.queue = FrameModel()
         self.qv = FrameView(self.queue)
-        self.qv.setMinimumHeight(160)
-        self.qv.doubleClicked.connect(lambda _: app.open_queue_item(self.qv.current_row()))
-        v.addWidget(self.qv)
+        self.qv.setVisible(False)
+        a.addWidget(self.qv)
+        v.addWidget(Collapsible("Advanced: full training, label counts, import", adv))
         v.addStretch(1)
-        scroll.setWidget(body)
-        outer.addWidget(scroll)
+        self.model_page = _scroll(body)
 
     def freeze_from_other(self):
         p, _ = QFileDialog.getOpenFileName(self, "Older label library", "", "SQLite (*.db)")
@@ -1035,16 +1082,71 @@ class ResultsTab(QWidget):
         self.ct.set(pd.crosstab(d[col].astype(str), d.call_, margins=True).reset_index())
 
 
+class LabelTab(QWidget):
+    """Setup (library, test wells, blind) on top; sub-tabs Particles / Cells (batch labellers) / In the canvas; the
+    retrain bar at the bottom."""
+
+    def __init__(self, app, train: TrainTab):
+        super().__init__()
+        from .queue import LabelQueue
+        v = QVBoxLayout(self)
+        v.setContentsMargins(2, 2, 2, 2)
+        self.setup = Collapsible("Setup: label library and test wells (once per dataset)", train.setup_page, True)
+        v.addWidget(self.setup)
+        self.sub = QTabWidget()
+        self.particles = LabelQueue(app, "particle")
+        self.cells = LabelQueue(app, "cell")
+        self.sub.addTab(self.particles, "Particles")
+        self.sub.addTab(self.cells, "Cells")
+        self.sub.addTab(train.canvas_page, "In the canvas")
+        v.addWidget(self.sub, 1)
+        bar = QFrame()
+        bar.setProperty("role", "card")
+        h = QHBoxLayout(bar)
+        h.setContentsMargins(8, 4, 8, 4)
+        self.retrain_info = QLabel("")
+        self.retrain_info.setWordWrap(True)
+        self.retrain_info.setTextFormat(Qt.RichText)
+        h.addWidget(self.retrain_info, 1)
+        self.b_retrain = accent(QPushButton("Retrain + classify"))
+        self.b_retrain.setToolTip("train one model on all labels so far (outside the test wells), save it, classify "
+                                  "these results with it; the batches then suggest the model's classes (~1 min)")
+        self.b_retrain.clicked.connect(app.retrain_and_classify)
+        h.addWidget(self.b_retrain)
+        v.addWidget(bar)
+
+
 class Panel(QTabWidget):
     def __init__(self, app):
         super().__init__()
-        self.setMinimumWidth(460)
+        self.setMinimumWidth(520)
         self.run = RunTab(app)
         self.settings = SettingsTab(app)
         self.train = TrainTab(app)
+        self.label = LabelTab(app, self.train)
         self.results = ResultsTab(app)
-        self.addTab(self.run, "Run")
-        self.addTab(self.train, "Train")
+        from .diag_view import DiagnosticsView
+        self.diag = DiagnosticsView(app)
+        self.addTab(self.run, "1 Run")
+        self.addTab(self.label, "2 Label")
+        self.addTab(self.train.model_page, "3 Model")
         self.addTab(self.results, "Results")
+        self.addTab(self.diag, "Diagnostics")
         self.addTab(self.settings, "Settings")
         self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+
+
+class PanelHost(QWidget):
+    """The right dock: a status line (where you are, what to do next) above the tabs."""
+
+    def __init__(self, panel: Panel):
+        super().__init__()
+        v = QVBoxLayout(self)
+        v.setContentsMargins(0, 0, 0, 0)
+        self.status = QLabel("open or detect results (Run tab)")
+        self.status.setWordWrap(True)
+        self.status.setTextFormat(Qt.RichText)
+        self.status.setProperty("role", "card")
+        self.status.setContentsMargins(8, 4, 8, 4)
+        v.addWidget(self.status)
+        v.addWidget(panel, 1)

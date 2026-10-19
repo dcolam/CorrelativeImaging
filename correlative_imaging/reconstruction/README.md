@@ -23,10 +23,45 @@ From `ci gui`, use the Run tab button **"Cell reconstruction …"**, or the bar 
 open the tool in its own window. If the run already has a `reconstruction_<run>` (or older `identity_<run>`) folder,
 it opens that. Otherwise the Run tab is filled in for that run, ready for Detect.
 
-The GUI is napari with two docks.
 
-**Wells (bottom)** has five tabs:
-- **Label queue:** pages of thumbnails to label from the keyboard (see "Labelling loop" below).
+The GUI is laid out in workflow order. A **status line** on top of the right panel says where the project
+stands and what to do next. The right panel runs the full height; the **Wells** dock (bottom) is for navigation only.
+
+**Right panel:**
+1. **Run:**
+   - pick the output folder and run (a preset whose channels match is suggested) and the results folder;
+   - set each channel's **name and colour** (display only) and **role** (identity or marker, or untick it to ignore
+     it). Names and colours from the Results Explorer are used when present;
+   - pick the model (none: Classify uses the Detect preview);
+   - then **Detect** (needs no model), **Classify**, or both.
+2. **Label:**
+   - **Setup** (folds away once done): the label library, **Freeze test wells** (or take them over from an older
+     library), and the blind switches;
+   - **Particles** and **Cells**: the batch labellers (below), each with its two sets, *Test wells (blind)* and
+     *Training*;
+   - **In the canvas**: label mode and click labelling, the cell of the picked particle, and the segmentation fixes
+     (proposed splits, watershed, cuts, merges);
+   - the **Retrain + classify** bar, with the number of new training labels since the last retrain (retrain after
+     every ~50–100).
+3. **Model:** labelling progress per class, the learning curve, the model comparison on the test wells, and under
+   *Advanced* the full training (all arms by grouped cross-validation), label counts and CSV import.
+4. **Results:** counts, calls per plate, per-channel mixture quality, and the plate map (evaluation only).
+5. **Diagnostics:** the plots Detect and Classify write (see "Diagnostics" below).
+6. **Settings** (the defaults work): recommendations from the detected run (applied only on click), safe settings
+   (reconstruction and call), and the locked detection settings that define the features (✓/✗ against the model).
+
+**Batch labeller** (Label → Particles / Cells): pages of thumbnails.
+- Keys (click a tile first): particles 1–5, cells 1–3 (verdict) and Q W E R / 0 (colour), **U unsure**, Enter keep
+  the suggestion, Backspace skip, Space show the well in the canvas, N new page.
+- **Several at once:** Ctrl+click, Shift+click or Ctrl+A select tiles; a key then labels all of them, Enter keeps
+  all their suggestions.
+- **Show** (training): *mixed* (unsure, probable and random; recommended) or *suggested <class>* only, least sure
+  first (e.g. confirm all noise in one go).
+- **This channel only (grey):** the particle's own channel in greyscale, scaled to that channel alone, so other
+  channels' noise doesn't distract.
+- **Unsure** objects are recorded, never trained on, and not shown again.
+
+**Wells (bottom):**
 - **Plate:** a plate view (96 / 384 / 1536, taken from the well ids). Wells are coloured by status, dominant channel
   or P. A white frame means the well is labelled; a dashed amber frame means it is a test well.
 - **List:** a searchable, filterable list of wells.
@@ -39,32 +74,9 @@ The GUI is napari with two docks.
 
   Colour by preview class, model class, hand label, channel, plate or threshold level. Hover for details, click to
   open the well with that particle picked; the current well's particles are ringed. **Shift-drag** a rectangle to
-  select points, then "Queue selected" makes them a label-queue page.
-- **Diagnostics:** the plots Detect and Classify write (see "Diagnostics" below).
+  select points, then "Queue selected" makes them a batch-labeller page.
 
-Before Classify the colours are the Detect preview; afterwards they are the calls. The dock says which. `n` and `p`
-step through the list.
-
-**Cell reconstruction (right)** has four tabs:
-1. **Run:**
-   - pick the output folder and run (a preset whose channels match is suggested) and the results folder;
-   - set each channel's **name and colour** (display only) and **role** (identity or marker, or untick it to ignore
-     it). Names and colours from the Results Explorer are used when present;
-   - pick the model;
-   - then **Detect** (needs no model), **Classify**, or both.
-2. **Train:**
-   - the label library and label mode;
-   - **Random well** (unlabelled, not a test well) and **Next well**;
-   - which outlines to show (stringent, lenient, cells around the hole, noise; noise outlines are hidden by default
-     because background speckle at the lenient threshold covers the whole window);
-   - training with the comparison tables, and "Label next".
-3. **Results:** counts, calls per plate, per-channel mixture quality, and the plate map (evaluation only).
-4. **Settings** (last; the defaults work):
-   - **recommendations** from the detected run, applied only on click. Example: a channel with signal in nearly every
-     hole that holds anything is suggested as a marker;
-   - **safe settings** (reconstruction and call; change them, then Classify again);
-   - **detection settings**, which define the features. They are locked, shown next to the model's values (✓/✗),
-     and can be unlocked.
+Before Classify the colours are the Detect preview; afterwards they are the calls. `n` and `p` step through the list.
 
 **Canvas layers:**
 - **BF:** all planes, raw min–max, hidden by default.
@@ -95,7 +107,7 @@ The aim: a few hundred well-chosen decisions instead of thousands of clicks, and
    wells it never labelled, so a model trained on that library can be scored fairly (`freeze-test-wells --from`).
 3. **Classify without a model.** With no model, Classify uses the Detect preview as the particle classes (inside =
    cell). Cells, calls and the cell pages of the queue then exist from the start. The run says `model: preview`.
-4. **Label in the queue** (bottom dock). Each object in a hole has a suggestion and a tier (`tiers.py`):
+4. **Label in the batch labeller** (Label tab). Each object in a hole has a suggestion and a tier (`tiers.py`):
    - *auto*: almost surely right, never shown or stored (with a model: P ≥ 0.97 and the preview agrees; without one:
      the colour-blind rules of `learn.weak_labels`, which the "+rules" arms already use as weak labels);
    - *confirm*: shown with the suggestion; Enter accepts, a number corrects;
@@ -111,17 +123,17 @@ The aim: a few hundred well-chosen decisions instead of thousands of clicks, and
    - Keys: ←→↑↓ move, Enter accept, Space open the well in the canvas, Backspace skip, N new page.
    - Stored source: `blind`, `accepted` (suggestion kept) or `corrected`. The acceptance rate and any anchoring to the
      suggestions can be measured later.
-5. **Retrain + classify** (queue bar). Trains one arm on all labels so far, without cross-validation (~20 s on ROMK;
+5. **Retrain + classify** (Label tab, bottom bar). Trains one arm on all labels so far, without cross-validation (~20 s on ROMK;
    the Train button still compares all arms). It saves the model as `<dataset>_<arm>_n<labels>_<time>.joblib`,
    classifies the results with it and rebuilds the queue, whose suggestions then come from the model.
-6. **Learning curve** (Train tab, after retraining). Scores the test wells against the number of training labels and
+6. **Learning curve** (Model tab, after retraining). Scores the test wells against the number of training labels and
    says what the last step gained per 50 labels. It needs ≥ 30 test labels; below that the curve is noise.
    **Progress bars** show labels per class against 30, the test objects labelled blind, and judged cells per colour.
-7. **Compare models** (Train tab, or `compare --models preview old.joblib new.joblib`). Scores any saved model, or
+7. **Compare models** (Model tab, or `compare --models preview old.joblib new.joblib`). Scores any saved model, or
    the preview, on the blind labels of the open results' test wells. This works across datasets too: open PNC results,
    compare the ROMK model with a PNC one.
 
-**Blind labelling** (Train tab). "Always blind in test wells" (on by default) hides everything that could anchor a
+**Blind labelling** (Label tab, Setup). "Always blind in test wells" (on by default) hides everything that could anchor a
 label in a test well:
 - the canvas tags (they show "?"), the reconstructed cells and the call in the title;
 - the class probabilities in the picked text and the pick menu;
@@ -144,7 +156,9 @@ Test wells never feed any of this. Only human decisions are stored: Detect's pre
 
 ## Diagnostics (after Detect and Classify)
 
-Written to `<results>/diagnostics/*.png` (plus `diagnostics.json`) and shown in the Diagnostics tab. All are
+Written to `<results>/diagnostics/*.png` (plus `diagnostics.json`) and shown in the Diagnostics tab. A new Detect
+removes the previous Classify outputs (calls, cells, calibration, reconstructions), which no longer match its
+particles: run Classify again. All are
 distributions: ECDFs, step histograms, density hexbins and heatmaps, no bar plots. Before Classify the classes are
 the preview's *provisional* ones.
 

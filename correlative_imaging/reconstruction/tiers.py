@@ -49,8 +49,15 @@ def matched(res, store) -> pd.DataFrame:
 
 
 def _labelled_oids(res, store, m: pd.DataFrame | None = None) -> set:
+    """Objects already labelled, or marked unsure (neither is shown again)."""
+    from .labels import match_labels
     m = matched(res, store) if m is None else m
-    return set(zip(m.plate_id, m.well_id, m.oid)) if len(m) else set()
+    out = set(zip(m.plate_id, m.well_id, m.oid)) if len(m) else set()
+    U = store.unsure_frame(res.dataset)
+    if len(U):
+        u = match_labels(U, res.particles, res.wells)
+        out |= set(zip(u.plate_id, u.well_id, u.oid))
+    return out
 
 
 def particle_tiers(res, model=None) -> pd.DataFrame:
@@ -83,9 +90,11 @@ def particle_tiers(res, model=None) -> pd.DataFrame:
 
 
 def particle_page(res, store, model=None, n: int = 24, mode: str = "train", seed: int | None = None,
-                  done: set | None = None, m: pd.DataFrame | None = None) -> pd.DataFrame:
+                  done: set | None = None, m: pd.DataFrame | None = None, only: str | None = None) -> pd.DataFrame:
     """The next page of objects to label. mode "train": outside the test wells, mixed tiers; "test": the test wells,
-    whole wells in turn, blind. `done`: (plate, well, oid) already shown this session (skipped ones too)."""
+    whole wells in turn, blind. `done`: (plate, well, oid) already shown this session (skipped ones too).
+    only: a class: training objects suggested as that class only (e.g. confirm all "noise" in one go), spread over
+    plates / channels / wells, least sure first."""
     rng = np.random.default_rng(seed)
     T = particle_tiers(res, model)
     test = store.test_wells(res.dataset)
@@ -102,8 +111,14 @@ def particle_page(res, store, model=None, n: int = 24, mode: str = "train", seed
             d = d.assign(_o=[order[(p, w)] for p, w in zip(d.plate_id, d.well_id)]).sort_values(["_o", "ch", "level"])
         return d.head(n).drop(columns="_o", errors="ignore").assign(blind=True)
     d = T[~is_test]
+    if only:
+        d = d[d.suggest == only]
     if not len(d):
         return d.assign(blind=False)
+    if only:
+        d = d.sort_values("conf")
+        d = d.groupby(["plate_id", "well_id"], sort=False).head(2)       # spread over wells, least sure first
+        return d.head(n).assign(blind=False)
     want = {k: int(round(v * n)) for k, v in MIX.items()}
     picked = []
     used_wells: dict = {}

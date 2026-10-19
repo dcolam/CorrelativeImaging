@@ -47,13 +47,6 @@ class WellBrowser(QWidget):
         from .pca import ParticleMap
         self.pca = ParticleMap(app)
         self.tabs.addTab(self.pca, "Particles (map)")
-        from .queue import LabelQueue
-        self.queue = LabelQueue(app)
-        self.tabs.insertTab(0, self.queue, "Label queue")
-        from .diag_view import DiagnosticsView
-        self.diag = DiagnosticsView(app)
-        self.tabs.addTab(self.diag, "Diagnostics")
-        self.tabs.setCurrentWidget(self.plate)
         v = QVBoxLayout(lw)
         v.setContentsMargins(4, 4, 4, 4)
         h = QHBoxLayout()
@@ -134,9 +127,16 @@ class ReconstructionApp:
         self.panel = Panel(self)
         self.browser = WellBrowser(self)
         t = theme(viewer)
-        for w in (self.panel, self.browser):
+        from .panel import PanelHost
+        self.host = PanelHost(self.panel)
+        self.batch = {"particle": self.panel.label.particles, "cell": self.panel.label.cells}
+        for w in (self.host, self.browser):
             w.setStyleSheet(stylesheet(t))
-        viewer.window.add_dock_widget(self.panel, area="right", name="Cell reconstruction")
+        viewer.window.add_dock_widget(self.host, area="right", name="Cell reconstruction")
+        try:                                   # the right panel runs the full height; Wells stays under the canvas
+            viewer.window._qt_window.setCorner(Qt.BottomRightCorner, Qt.RightDockWidgetArea)
+        except Exception:
+            pass
         dw = viewer.window.add_dock_widget(self.browser, area="bottom", name="Wells")
         try:                                   # a 384-well plate fits across the bottom
             dw.parentWidget().resizeDocks([dw], [330], Qt.Vertical)
@@ -260,13 +260,60 @@ class ReconstructionApp:
         self.set_config(cfg)
         self.recommend()
         self.update_pca()
-        self.browser.queue.set_results(self.res)
+        for q in self.batch.values():
+            q.set_results(self.res)
         self.panel.train.set_colour_boxes(self.res.run.get("identity_channels") or self.res.channels)
         from ..config import MODELS
         self.panel.train.cmp_models.clear()
         self.panel.train.cmp_models.addItems(["preview"] + sorted(p.name for p in MODELS.glob("*.joblib")))
         self.show_test_info()
-        self.browser.queue.update_info()
+        self.batch["particle"].update_info()
+
+    def show_batch(self, kind: str):
+        self.panel.setCurrentWidget(self.panel.label)
+        self.panel.label.sub.setCurrentWidget(self.batch[kind])
+
+    def update_status(self, pr: dict | None = None):
+        """The status line above the tabs and the retrain bar: where the project stands, what to do next."""
+        res, st = self.res, self.store
+        lt = self.panel.label
+        if res is None:
+            self.host.status.setText("<b>Start:</b> Run tab → choose the run and Detect, or open existing results")
+            return
+        tw = st.test_wells(res.dataset) if st is not None else set()
+        arm = (res.run.get("model") or {}).get("arm")
+        classified = res.calls is not None
+        model_txt = ("not classified" if not classified else "classified with the Detect preview (no model)"
+                     if arm == "preview" else f"classified with model {self.model_file or arm}")
+        t = (pr or {}).get("test", {})
+        n_test = t.get("labelled", 0)
+        n_train = sum(n for n, _ in (pr or {}).get("classes", {}).values())
+        new = n_train
+        L = st.frame(res.dataset) if st is not None else None
+        fitted = getattr(self.model, "spec", {}).get("fitted") if self.model is not None else None
+        if L is not None and len(L) and fitted:
+            Lt = L[[(p, w) not in tw for p, w in zip(L.plate_id, L.well_id)]]
+            new = int((Lt.t.astype(str) > str(fitted)).sum())
+        if not classified:
+            nxt = "Run tab → <b>Classify</b> (no model needed: the Detect preview stands in)"
+        elif not tw:
+            nxt = "Label tab → <b>Freeze test wells</b> (before any labelling)"
+        elif n_test < 30:
+            nxt = "Label → Particles → <b>Test wells (blind)</b>: label at least 30 objects"
+        elif n_train < 50:
+            nxt = "Label → Particles → <b>Training</b>: a few pages (Cells too, once in a while)"
+        elif new >= 50:
+            nxt = "<b>Retrain + classify</b> (Label tab, bottom)"
+        else:
+            nxt = "keep labelling (Training pages, Cells); Model tab: learning curve and comparison"
+        self.host.status.setText(
+            f"<b>{res.dataset}</b> · {len(res.wells)} wells · {model_txt} · test wells: {len(tw)} "
+            f"({n_test} objects labelled blind) · training labels: {n_train}<br><b>Next:</b> {nxt}")
+        lt.retrain_info.setText(
+            f"<b>{new}</b> new training labels since the last retrain. Retrain after every ~50–100 (2–4 pages): "
+            "the batches then suggest the new model's classes and the learning curve (Model tab) shows whether "
+            "more labels still help." if classified else "Retrain needs Classify and some labels first.")
+        lt.b_retrain.setEnabled(classified and n_train >= 30)
 
     # -- test wells, blind labelling
     def freeze_test_wells(self, other: str | None = None):
@@ -281,6 +328,7 @@ class ReconstructionApp:
         self.say(f"froze {len(pick)} test wells for {self.res.dataset}" + (f" (taken over from {other})" if other else ""))
         self.show_test_info()
         self.refresh()
+        self.batch["particle"].update_info()
         return pick
 
     def show_test_info(self):
@@ -288,6 +336,9 @@ class ReconstructionApp:
             return
         tw = self.store.test_wells(self.res.dataset)
         self.panel.train.test_info.setText(f"{len(tw)} test wells" if tw else "no test wells yet")
+        self.panel.label.setup.btn.setChecked(not tw)      # set up: fold away
+        self.panel.label.setup.btn.setText(
+            "Setup: label library and test wells" + (f"  ✓ {len(tw)} test wells" if tw else "  (freeze test wells first)"))
 
     def is_blind(self, plate_id=None, well_id=None) -> bool:
         t = self.panel.train
@@ -361,7 +412,7 @@ class ReconstructionApp:
         self.store.set_cell(self.res.dataset, row.plate_id, row.well_id, y, x, verdict=verdict, colour=colour,
                             source="blind" if blind else "hand")
         self.panel.train.cell_info.setText(f"cell {cid}: " + ", ".join(x for x in (verdict, colour) if x))
-        self.browser.queue.update_info()
+        self.batch["cell"].update_info()
 
     def train_cell_labels(self):
         """Cell labels of the open dataset outside its test wells (for the colour calibration)."""
@@ -454,7 +505,7 @@ class ReconstructionApp:
         except Exception as e:
             self.say(f"particle map not drawn: {e}")
         try:
-            self.browser.diag.set_results(self.res)
+            self.panel.diag.set_results(self.res)
         except Exception as e:
             self.say(f"diagnostics not shown: {e}")
 
