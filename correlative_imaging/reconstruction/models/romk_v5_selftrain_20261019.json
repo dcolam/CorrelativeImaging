@@ -1,0 +1,201 @@
+{
+  "arm": "self-train",
+  "classes": [
+    "cell",
+    "neighbour",
+    "merged",
+    "debris",
+    "noise"
+  ],
+  "features": [
+    "f_snr",
+    "f_hsnr",
+    "f_rel",
+    "f_relmax",
+    "f_field_pct",
+    "f_rel_ctx",
+    "f_area_in",
+    "f_area_full",
+    "f_area_z",
+    "f_circ",
+    "f_sol",
+    "f_ecc",
+    "f_peaks",
+    "f_share",
+    "f_fill",
+    "f_d_in",
+    "f_d_full",
+    "f_edge",
+    "f_lenient",
+    "f_parent_share",
+    "f_field_d2",
+    "f_density",
+    "f_oth_max",
+    "f_oth_mean",
+    "f_oth_pos",
+    "f_flat",
+    "f_dom"
+  ],
+  "fitted": "2026-10-19T11:18:35",
+  "n_train": 901,
+  "n_test": 248,
+  "n_unlabelled": 2273,
+  "train_counts": {
+    "cell": 506,
+    "noise": 251,
+    "neighbour": 110,
+    "merged": 27,
+    "debris": 7
+  },
+  "datasets": [
+    "romk_v5"
+  ],
+  "cv": {
+    "legacy": {
+      "n": 180.2,
+      "macro_f1": 0.5261,
+      "bal_acc": 0.6564,
+      "auc_cell": 0.8759,
+      "recall_cell": 0.6293,
+      "recall_neighbour": 0.5016,
+      "recall_merged": 0.8,
+      "recall_debris": 0.3333,
+      "recall_noise": 0.8435,
+      "coverage_unlabelled": 0.15,
+      "n_pseudo": 0
+    },
+    "hand": {
+      "n": 180.2,
+      "macro_f1": 0.6006,
+      "bal_acc": 0.6189,
+      "auc_cell": 0.9256,
+      "recall_cell": 0.8177,
+      "recall_neighbour": 0.6659,
+      "recall_merged": 0.3667,
+      "recall_debris": 0.0,
+      "recall_noise": 0.9159,
+      "coverage_unlabelled": 0.8416,
+      "n_pseudo": 0
+    },
+    "spread": {
+      "n": 180.2,
+      "macro_f1": 0.6064,
+      "bal_acc": 0.6216,
+      "auc_cell": 0.9126,
+      "recall_cell": 0.8515,
+      "recall_neighbour": 0.7369,
+      "recall_merged": 0.3417,
+      "recall_debris": 0.0,
+      "recall_noise": 0.8584,
+      "coverage_unlabelled": 0.7651,
+      "n_pseudo": 1586
+    },
+    "self-train": {
+      "n": 180.2,
+      "macro_f1": 0.6407,
+      "bal_acc": 0.6576,
+      "auc_cell": 0.9301,
+      "recall_cell": 0.8404,
+      "recall_neighbour": 0.7237,
+      "recall_merged": 0.4667,
+      "recall_debris": 0.0,
+      "recall_noise": 0.9118,
+      "coverage_unlabelled": 0.9186,
+      "n_pseudo": 1892
+    },
+    "self-train+rules": {
+      "n": 180.2,
+      "macro_f1": 0.6235,
+      "bal_acc": 0.6478,
+      "auc_cell": 0.9312,
+      "recall_cell": 0.8279,
+      "recall_neighbour": 0.7408,
+      "recall_merged": 0.4167,
+      "recall_debris": 0.0,
+      "recall_noise": 0.9074,
+      "coverage_unlabelled": 0.9208,
+      "n_pseudo": 1753
+    }
+  },
+  "test": {
+    "legacy": {
+      "coverage_unlabelled": 0.15,
+      "n_pseudo": 0,
+      "n": 248,
+      "macro_f1": 0.4571,
+      "bal_acc": 0.5179,
+      "auc_cell": 0.7826,
+      "recall_cell": 0.5556,
+      "recall_neighbour": 0.6923,
+      "recall_merged": 0.5,
+      "recall_debris": 0.0,
+      "recall_noise": 0.8418
+    },
+    "hand": {
+      "coverage_unlabelled": 0.8416,
+      "n_pseudo": 0,
+      "n": 248,
+      "macro_f1": 0.5369,
+      "bal_acc": 0.5623,
+      "auc_cell": 0.9057,
+      "recall_cell": 0.8125,
+      "recall_neighbour": 0.8462,
+      "recall_merged": 0.25,
+      "recall_debris": 0.0,
+      "recall_noise": 0.9031
+    },
+    "spread": {
+      "coverage_unlabelled": 0.7651,
+      "n_pseudo": 1586,
+      "n": 248,
+      "macro_f1": 0.5589,
+      "bal_acc": 0.5577,
+      "auc_cell": 0.8928,
+      "recall_cell": 0.8889,
+      "recall_neighbour": 0.8077,
+      "recall_merged": 0.25,
+      "recall_debris": 0.0,
+      "recall_noise": 0.8418
+    },
+    "self-train": {
+      "coverage_unlabelled": 0.9186,
+      "n_pseudo": 1892,
+      "n": 248,
+      "macro_f1": 0.5673,
+      "bal_acc": 0.6062,
+      "auc_cell": 0.8969,
+      "recall_cell": 0.8125,
+      "recall_neighbour": 0.8462,
+      "recall_merged": 0.5,
+      "recall_debris": 0.0,
+      "recall_noise": 0.8724
+    },
+    "self-train+rules": {
+      "coverage_unlabelled": 0.9208,
+      "n_pseudo": 1753,
+      "n": 248,
+      "macro_f1": 0.5345,
+      "bal_acc": 0.5761,
+      "auc_cell": 0.8992,
+      "recall_cell": 0.8194,
+      "recall_neighbour": 0.9231,
+      "recall_merged": 0.25,
+      "recall_debris": 0.0,
+      "recall_noise": 0.8878
+    }
+  },
+  "labels_sha1": "ed861e3af5b8d08722127c4926f0c09468250105",
+  "sklearn": "1.9.1",
+  "notes": [
+    "class 'debris' has only 7 training labels: its recall is not reliable"
+  ],
+  "feature_config": {
+    "work_R": 2.2,
+    "context_R": 2.2,
+    "min_object_px": 50,
+    "min_inside_um2": 0.5,
+    "field_min_um2": 30.0,
+    "smooth_px": 1.0,
+    "peak_h": 3.0
+  }
+}

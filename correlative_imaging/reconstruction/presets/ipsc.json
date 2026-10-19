@@ -1,0 +1,8 @@
+{
+  "_about": "Three reporters, any combination possible (GFAP-BFP, Dlx-GFP, Camk2a-mCherry).",
+  "channels": ["405nm", "488nm", "561nm"],
+  "markers": [],
+  "display": {"405nm": {"name": "GFAP-BFP", "color": "#4f7dff"},
+              "488nm": {"name": "Dlx-GFP", "color": "#3ddc5a"},
+              "561nm": {"name": "Camk2a-mCherry", "color": "#ff4fd8"}}
+}

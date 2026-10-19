@@ -1,0 +1,808 @@
+"""The right-hand dock: Run, Train, Results, Settings. Each tab is a plain QWidget driven by the app controller."""
+from __future__ import annotations
+
+import json
+from dataclasses import fields
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from qtpy.QtCore import Qt
+from qtpy.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QFrame, QGridLayout,
+                            QGroupBox, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit, QProgressBar, QPushButton,
+                            QScrollArea, QSpinBox, QTabWidget, QToolButton, QVBoxLayout, QWidget, QSizePolicy)
+
+from ..config import MODELS, Config, load_config, presets
+from ..labels import CLASSES
+from .tables import FrameModel, FrameView
+from .theme import CLASS_COLORS, CLASS_KEYS, call_color, chip
+
+# plain-language label, explanation (tooltip), group
+SETTINGS = {
+    # safe to change: only Classify has to run again
+    "p_seed": ("P(cell) to start a cell", "a particle needs P(cell) + P(merged) at least this high to seed a cell", "safe"),
+    "split_dips": ("split at signal dips", "split a bright area where the signal dips between two peaks; off = "
+                   "connected bright areas stay one cell", "safe"),
+    "dip_ratio": ("dip that splits (saddle / lower peak)", "lower = only deep dips split; higher = split more "
+                  "readily", "safe"),
+    "cell_gap_um": ("join pieces closer than (µm)", "seeds of different channels closer than this join into one "
+                    "cell (the same cell seen in two channels)", "safe"),
+    "grow_floor": ("growth floor (hole-noise SDs)", "grown pixels must be at least this far above the hole "
+                   "background", "safe"),
+    "grow_frac": ("growth cut (fraction of the seed)", "grown pixels must reach this fraction of the seed's median "
+                  "signal (a dim cell grows by its own standard)", "safe"),
+    "grow_margin_um": ("max growth beyond the hole (µm)", "how far a cell may grow past the hole rim", "safe"),
+    "grow_max_x_hole": ("max cell area (× hole area)", "if larger, the growth cut is raised until the cell fits",
+                        "safe"),
+    "p_call": ("P needed for a call", "P of the best channel combination below this = 'uncertain'", "safe"),
+    "identity_bg": ("background under the cell", "hole = the hole's own background (removes aperture glow); "
+                    "frame = the whole frame outside particles", "safe"),
+    "min_mixture_sep": ("flag channels separating less than", "per-channel positive/negative separation "
+                        "(Ashman's D) below which a channel is flagged", "safe"),
+    # define the features: locked to the model
+    "work_R": ("analysis window (hole radii)", "window around the hole; whole-object features depend on it", "locked"),
+    "context_R": ("context disc (hole radii)", "disc for neighbour density and brightness ranks", "locked"),
+    "min_object_px": ("smallest object (px)", "objects up to this size are removed, as in the pipeline", "locked"),
+    "min_inside_um2": ("min area inside the hole (µm²)", "a particle needs at least this much area in the hole",
+                       "locked"),
+    "field_min_um2": ("typical-cell objects from (µm²)", "whole-image objects this big describe a typical "
+                      "unpatched cell (the brightness unit)", "locked"),
+    "smooth_px": ("smoothing (px)", "light smoothing for peaks and growth (measurements are unsmoothed)", "locked"),
+    "peak_h": ("peak height (hole-noise SDs)", "a peak must rise this far above its surroundings", "locked"),
+    "path_map": ("path map (JSON)", 'stored path prefix -> local prefix, e.g. {"Z:\\\\": "/mnt/z/"}', "local"),
+}
+
+
+def section(text):
+    l = QLabel(text)
+    l.setProperty("role", "section")
+    return l
+
+
+def hint(text):
+    l = QLabel(text)
+    l.setProperty("role", "hint")
+    l.setWordWrap(True)
+    return l
+
+
+def accent(btn: QPushButton) -> QPushButton:
+    btn.setProperty("accent", True)
+    return btn
+
+
+def path_row(edit: QLineEdit, on_browse) -> QWidget:
+    w = QWidget()
+    h = QHBoxLayout(w)
+    h.setContentsMargins(0, 0, 0, 0)
+    h.addWidget(edit, 1)
+    b = QToolButton()
+    b.setText("…")
+    b.clicked.connect(on_browse)
+    h.addWidget(b)
+    return w
+
+
+def card(title: str) -> tuple[QFrame, QLabel]:
+    f = QFrame()
+    f.setProperty("role", "card")
+    v = QVBoxLayout(f)
+    v.setContentsMargins(10, 6, 10, 6)
+    val = QLabel("–")
+    val.setProperty("role", "metric")
+    v.addWidget(val)
+    v.addWidget(hint(title))
+    return f, val
+
+
+# ---------------------------------------------------------------------------------------------------------------
+
+class RunTab(QWidget):
+    def __init__(self, app):
+        super().__init__()
+        self.app = app
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        body = QWidget()
+        v = QVBoxLayout(body)
+        v.addWidget(section("Source"))
+        f = QFormLayout()
+        self.root = QLineEdit()
+        self.root.setPlaceholderText("CorrelativeImaging output folder (holds the plate folders)")
+        self.root.editingFinished.connect(self.find_runs)
+        f.addRow("output folder", path_row(self.root, self.browse_root))
+        self.run = QComboBox()
+        self.run.currentTextChanged.connect(self.default_out)
+        f.addRow("run", self.run)
+        self.preset = QComboBox()
+        self.preset.addItems(["(neutral)"] + presets())
+        self.preset.currentTextChanged.connect(self.load_preset)
+        f.addRow("preset", self.preset)
+        self.out = QLineEdit()
+        f.addRow("results folder", path_row(self.out, self.browse_out))
+        self.wells = QLineEdit()
+        self.wells.setPlaceholderText("optional: 18T39412_N11 18T39383_M13 …")
+        f.addRow("wells", self.wells)
+        v.addLayout(f)
+        v.addWidget(section("Channels"))
+        v.addWidget(hint("Names and colours are display only (decisions use the raw channel). A marker channel is "
+                         "measured but never counts as identity (e.g. a channel on every cell). Untick to ignore a "
+                         "channel."))
+        self.chan_grid = QGridLayout()
+        self.chan_rows = {}
+        v.addLayout(self.chan_grid)
+        f2 = QFormLayout()
+        self.model = QComboBox()
+        self.model.setEditable(True)
+        self.model.setToolTip("trained particle classifier; empty = Detect only (a first look without a model)")
+        f2.addRow("model", self.model)
+        v.addLayout(f2)
+        h = QHBoxLayout()
+        self.b_detect = QPushButton("Detect")
+        self.b_detect.setToolTip("particles, field reference, features and a first look per well: provisional "
+                                 "classes (inside / neighbour / debris / noise) and the dominant channel. No model "
+                                 "needed")
+        self.b_classify = QPushButton("Classify")
+        self.b_classify.setToolTip("classify particles, reconstruct cells, call identity (needs a model)")
+        self.b_all = accent(QPushButton("Detect + classify"))
+        for b in (self.b_detect, self.b_classify, self.b_all):
+            h.addWidget(b)
+        self.b_detect.clicked.connect(lambda: app.run_stage("detect"))
+        self.b_classify.clicked.connect(lambda: app.run_stage("classify"))
+        self.b_all.clicked.connect(lambda: app.run_stage("all"))
+        v.addLayout(h)
+        b = QPushButton("Open existing results…")
+        b.clicked.connect(self.open_results)
+        v.addWidget(b)
+        v.addWidget(section("Current results"))
+        g = QGridLayout()
+        self.cards = {}
+        for i, (k, t) in enumerate([("wells", "wells"), ("pool", "particles in holes"), ("labels", "hand labels"),
+                                    ("model", "model")]):
+            c, val = card(t)
+            self.cards[k] = val
+            g.addWidget(c, i // 2, i % 2)
+        v.addLayout(g)
+        self.info = hint("")
+        v.addWidget(self.info)
+        v.addWidget(section("Progress"))
+        self.progress = QProgressBar()
+        self.progress.setTextVisible(True)
+        v.addWidget(self.progress)
+        self.log = QPlainTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setProperty("role", "log")
+        self.log.setMaximumBlockCount(2000)
+        self.log.setMinimumHeight(160)
+        v.addWidget(self.log, 1)
+        scroll.setWidget(body)
+        outer.addWidget(scroll)
+
+    def browse_root(self):
+        d = QFileDialog.getExistingDirectory(self, "CorrelativeImaging output folder", self.root.text())
+        if d:
+            self.root.setText(d)
+            self.find_runs()
+
+    def browse_out(self):
+        d = QFileDialog.getExistingDirectory(self, "Results folder", self.out.text())
+        if d:
+            self.out.setText(d)
+
+    # -- channels
+    def set_channels(self, channels: list, cfg: Config):
+        from qtpy.QtGui import QColor
+        while self.chan_grid.count():
+            w = self.chan_grid.takeAt(0).widget()
+            if w:
+                w.deleteLater()
+        self.chan_rows = {}
+        for i, t in enumerate(["use", "channel", "name", "colour", "role"]):
+            self.chan_grid.addWidget(hint(t), 0, i)
+        for i, ch in enumerate(channels, start=1):
+            use = QCheckBox()
+            use.setChecked(not cfg.channels or ch in cfg.channels)
+            name = QLineEdit(cfg.display_name(ch))
+            col = QToolButton()
+            col.setFixedWidth(46)
+            col.setProperty("hex", cfg.color(ch))
+            col.setStyleSheet(f"QToolButton {{ background: {cfg.color(ch)}; border-radius: 3px; }}")
+
+            def pick(_=False, b=col, ch=ch):
+                from qtpy.QtWidgets import QColorDialog
+                c = QColorDialog.getColor(QColor(b.property("hex")), self, f"Colour of {ch}")
+                if c.isValid():
+                    b.setProperty("hex", c.name())
+                    b.setStyleSheet(f"QToolButton {{ background: {c.name()}; border-radius: 3px; }}")
+            col.clicked.connect(pick)
+            role = QComboBox()
+            role.addItems(["identity", "marker"])
+            role.setCurrentText("marker" if ch in cfg.markers else "identity")
+            for j, w in enumerate([use, QLabel(ch), name, col, role]):
+                self.chan_grid.addWidget(w, i, j)
+            self.chan_rows[ch] = (use, name, col, role)
+
+    def apply_channels(self, cfg: Config) -> Config:
+        if not self.chan_rows:
+            return cfg
+        used = [ch for ch, (u, *_rest) in self.chan_rows.items() if u.isChecked()]
+        cfg.channels = used if len(used) < len(self.chan_rows) else []
+        cfg.markers = [ch for ch, (u, n, c, r) in self.chan_rows.items() if r.currentText() == "marker"]
+        cfg.display = {ch: {"name": n.text().strip() or ch, "color": c.property("hex")}
+                       for ch, (u, n, c, r) in self.chan_rows.items()}
+        return cfg
+
+    def set_models(self, current: str):
+        self.model.blockSignals(True)
+        self.model.clear()
+        self.model.addItems([""] + sorted(p.name for p in MODELS.glob("*.joblib")))
+        self.model.setCurrentText(current or "")
+        self.model.blockSignals(False)
+
+    def run_channels(self, tag: str) -> list:
+        """Fluorescence channels of a run, from its first plate database."""
+        import sqlite3
+        r = self._runs.get(tag) if hasattr(self, "_runs") else None
+        if r is None or not r.plates:
+            return []
+        con = sqlite3.connect(f"file:{r.plates[0].db_path}?mode=ro", uri=True)
+        try:
+            return [c for (c,) in con.execute("select distinct channel from particle_measurements order by channel")]
+        finally:
+            con.close()
+
+    def explorer_display(self, tag: str) -> dict:
+        """Channel names/colours the Results Explorer stored for this run (ci_labels.db in the output folder)."""
+        import sqlite3
+        db = Path(self.root.text().strip()) / "ci_labels.db"
+        if not db.exists():
+            return {}
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            rows = con.execute("select channel, display_name, color_hex from channel_display where run_tag=?",
+                               (tag,)).fetchall()
+        except sqlite3.Error:
+            rows = []
+        finally:
+            con.close()
+        return {c: {"name": n, "color": h} for c, n, h in rows if n or h}
+
+    def find_runs(self):
+        from .._discovery import discover_runs
+        self.run.clear()
+        root = self.root.text().strip()
+        if not root:
+            return
+        runs = discover_runs(root)
+        self._runs = {r.run_tag: r for r in runs}
+        self.run.addItems([r.run_tag for r in runs])
+        self.app.say(f"{len(runs)} run(s) under {root}")
+        if runs:
+            self.run.setCurrentIndex(len(runs) - 1)
+
+    def default_out(self, tag):
+        if not tag or not self.root.text().strip():
+            return
+        self.out.setText(str(Path(self.root.text().strip()) / f"reconstruction_{tag}"))
+        chans = self.run_channels(tag)
+        if not chans:
+            return
+        # a preset whose channels are exactly this run's channels is suggested
+        from ..config import load_config as _lc
+        if self.preset.currentText() == "(neutral)":
+            for name in presets():
+                if set(_lc(name).channels) == set(chans):
+                    self.app.say(f"preset '{name}' matches the channels of this run")
+                    self.preset.setCurrentText(name)
+                    break
+        cfg = self.app.cfg
+        shown = self.explorer_display(tag)
+        if shown:
+            cfg.display = {**cfg.display, **shown}
+            self.app.say("channel names/colours taken from the Results Explorer")
+        self.set_channels(chans, cfg)
+
+    def load_preset(self, name):
+        cfg = Config() if name == "(neutral)" else load_config(name)
+        cfg.model = cfg.model or self.app.cfg.model
+        cfg.path_map = self.app.cfg.path_map
+        self.app.set_config(cfg)
+
+    def open_results(self):
+        d = QFileDialog.getExistingDirectory(self, "Results folder of this tool", self.out.text())
+        if d:
+            self.app.open_results(d)
+
+    def update(self, res, store, model_spec):
+        self.cards["wells"].setText(str(len(res.wells)) if res else "–")
+        self.cards["pool"].setText(f"{int(res.particles.pool.sum()):,}" if res else "–")
+        n = len(store.frame(res.dataset)) if (res and store) else 0
+        self.cards["labels"].setText(f"{n:,}")
+        self.cards["model"].setText(model_spec.get("arm", "–") if model_spec else "none")
+        if res:
+            src = res.run.get("source") or {}
+            if src.get("kind") == "run" and not self.root.text():
+                self.root.blockSignals(True)
+                self.root.setText(src.get("root", ""))
+                self.root.blockSignals(False)
+                self.find_runs()
+                self.run.setCurrentText(src.get("run_tag", ""))
+                self.out.setText(str(res.dir))
+            self.info.setText(f"dataset <b>{res.dataset}</b> · channels {', '.join(res.channels)} · "
+                              f"{'classified' if res.calls is not None else 'detected, not classified'}")
+
+
+class SettingsTab(QWidget):
+    """Last tab, for fine-tuning. Defaults work; change them only with a reason.
+      safe      reconstruction and call: change, then Classify again
+      locked    detection settings that define the features; a model only fits detections made with the same values,
+                so they are locked to the model (unlock to change, then Detect again and retrain)
+      recommendations from the detected run (applied only on click)"""
+
+    def __init__(self, app):
+        super().__init__()
+        self.app = app
+        outer = QVBoxLayout(self)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        body = QWidget()
+        v = QVBoxLayout(body)
+        v.addWidget(hint("The defaults work. Change a setting only with a reason; hover for what it does."))
+        self.widgets = {}
+        self.model_val = {}
+        box = QGroupBox("Recommendations from this run")
+        self.rec = QVBoxLayout(box)
+        self.rec_none = hint("Detect a run to get recommendations.")
+        self.rec.addWidget(self.rec_none)
+        v.addWidget(box)
+        for grp, title in (("safe", "Reconstruction and call · safe to change, then Classify again"),
+                           ("locked", "Detection · defines the features, locked to the model"),
+                           ("local", "This computer")):
+            box = QGroupBox(title)
+            form = QFormLayout(box)
+            if grp == "locked":
+                self.unlock = QCheckBox("unlock (then Detect again and retrain)")
+                self.unlock.toggled.connect(self._lock)
+                form.addRow(self.unlock)
+            for k, (label, tip, g) in SETTINGS.items():
+                if g != grp:
+                    continue
+                w = self._widget(k)
+                w.setToolTip(tip)
+                lab = QLabel(label)
+                lab.setToolTip(tip)
+                if grp == "locked":
+                    row = QWidget()
+                    h = QHBoxLayout(row)
+                    h.setContentsMargins(0, 0, 0, 0)
+                    h.addWidget(w, 1)
+                    mv = QLabel("")
+                    mv.setProperty("role", "hint")
+                    self.model_val[k] = mv
+                    h.addWidget(mv)
+                    form.addRow(lab, row)
+                else:
+                    d = getattr(Config(), k)
+                    row = QWidget()
+                    h = QHBoxLayout(row)
+                    h.setContentsMargins(0, 0, 0, 0)
+                    h.addWidget(w, 1)
+                    dl = QLabel(f"default {d}" if k != "path_map" else "")
+                    dl.setProperty("role", "hint")
+                    dl.setMinimumWidth(80)
+                    h.addWidget(dl)
+                    form.addRow(lab, row)
+                self.widgets[k] = w
+            v.addWidget(box)
+        v.addStretch(1)
+        scroll.setWidget(body)
+        outer.addWidget(scroll, 1)
+        h = QHBoxLayout()
+        b = accent(QPushButton("Apply"))
+        b.clicked.connect(self.apply)
+        r = QPushButton("Reset to defaults")
+        r.clicked.connect(self.reset)
+        s_ = QPushButton("Save as preset…")
+        s_.clicked.connect(self.save)
+        for x in (b, r, s_):
+            h.addWidget(x)
+        outer.addLayout(h)
+        self._lock(False)
+
+    def _widget(self, k):
+        default = getattr(Config(), k)
+        if k == "identity_bg":
+            w = QComboBox()
+            w.addItems(["hole", "frame"])
+            return w
+        if isinstance(default, bool):
+            return QCheckBox()
+        if isinstance(default, int):
+            w = QSpinBox()
+            w.setRange(0, 100000)
+            return w
+        if isinstance(default, float):
+            w = QDoubleSpinBox()
+            w.setDecimals(3)
+            w.setRange(0, 1000)
+            w.setSingleStep(0.05 if default < 2 else 0.5)
+            return w
+        return QLineEdit()
+
+    def _lock(self, unlocked: bool):
+        for k, (_, _, g) in SETTINGS.items():
+            if g == "locked":
+                self.widgets[k].setEnabled(bool(unlocked))
+
+    def set_config(self, cfg: Config, channels: list | None = None):
+        for k, w in self.widgets.items():
+            v = getattr(cfg, k)
+            if isinstance(w, QCheckBox):
+                w.setChecked(bool(v))
+            elif isinstance(w, (QSpinBox, QDoubleSpinBox)):
+                w.setValue(v)
+            elif isinstance(w, QComboBox):
+                w.setCurrentText(str(v))
+            elif isinstance(v, dict):
+                w.setText(json.dumps(v) if v else "")
+            else:
+                w.setText(str(v))
+        self.show_model_match()
+
+    def show_model_match(self):
+        m = self.app.model
+        fc = (m.spec.get("feature_config") or {}) if m is not None else {}
+        for k, lab in self.model_val.items():
+            if k not in fc:
+                lab.setText("" if m is None else "model: ?")
+                continue
+            cur = getattr(self.app.cfg, k)
+            ok = cur == fc[k]
+            lab.setText(f"model {fc[k]} {'✓' if ok else '✗'}")
+            lab.setStyleSheet("" if ok else "color: #e0a526;")
+
+    def read(self) -> Config:
+        import copy
+        cfg = copy.deepcopy(self.app.cfg)
+        for k, w in self.widgets.items():
+            d = getattr(Config(), k)
+            if isinstance(w, QCheckBox):
+                v = w.isChecked()
+            elif isinstance(w, (QSpinBox, QDoubleSpinBox)):
+                v = type(d)(w.value())
+            elif isinstance(w, QComboBox):
+                v = w.currentText()
+            elif isinstance(d, dict):
+                v = json.loads(w.text()) if w.text().strip() else {}
+            else:
+                v = w.text()
+            setattr(cfg, k, v)
+        return cfg
+
+    def apply(self):
+        try:
+            self.app.set_config(self.read(), from_form=True)
+            self.app.say("settings applied")
+        except Exception as e:
+            self.app.say(f"settings not applied: {e}")
+
+    def reset(self):
+        import copy
+        cfg = copy.deepcopy(self.app.cfg)
+        for k in SETTINGS:
+            if k != "path_map":
+                setattr(cfg, k, getattr(Config(), k))
+        self.app.set_config(cfg)
+
+    def recommend(self, items: list):
+        """items: [(text, callable or None)]"""
+        while self.rec.count():
+            w = self.rec.takeAt(0).widget()
+            if w:
+                w.deleteLater()
+        if not items:
+            self.rec.addWidget(hint("Nothing to recommend: the current settings fit this run."))
+            return
+        for text, fn in items:
+            row = QWidget()
+            h = QHBoxLayout(row)
+            h.setContentsMargins(0, 0, 0, 0)
+            l = QLabel(text)
+            l.setWordWrap(True)
+            h.addWidget(l, 1)
+            if fn is not None:
+                b = QPushButton("Apply")
+                b.clicked.connect(fn)
+                h.addWidget(b)
+            self.rec.addWidget(row)
+
+    def save(self):
+        from ..config import PRESETS
+        p, _ = QFileDialog.getSaveFileName(self, "Save preset", str(PRESETS / "my_dataset.json"), "JSON (*.json)")
+        if p:
+            cfg = self.app.read_config()
+            d = json.loads(cfg.to_json())
+            d.pop("path_map", None)
+            Path(p).write_text(json.dumps(d, indent=2))
+            self.app.say(f"preset saved: {p}")
+
+
+class TrainTab(QWidget):
+    def __init__(self, app):
+        super().__init__()
+        self.app = app
+        outer = QVBoxLayout(self)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        body = QWidget()
+        v = QVBoxLayout(body)
+
+        v.addWidget(section("Label library"))
+        self.store_path = QLineEdit()
+        self.store_path.editingFinished.connect(lambda: app.set_store(self.store_path.text()))
+        v.addWidget(path_row(self.store_path, self.browse_store))
+        self.counts = FrameModel()
+        cv = FrameView(self.counts, stretch=True)
+        cv.setMaximumHeight(110)
+        v.addWidget(cv)
+        b = QPushButton("Import a first labelling session (CSV)…")
+        b.setToolTip("CSV with plate_id, well_id, channel (display name), x_px, y_px, particle_label; "
+                     "imported for the dataset of the open results")
+        b.clicked.connect(self.import_csv)
+        v.addWidget(b)
+
+        v.addWidget(section("Label particles"))
+        h = QHBoxLayout()
+        self.mode = QPushButton("Label mode  (L)")
+        self.mode.setCheckable(True)
+        self.mode.toggled.connect(app.set_label_mode)
+        h.addWidget(self.mode, 2)
+        rnd = QPushButton("Random well")
+        rnd.setToolTip("a random unlabelled well (test wells excluded) from the current well list")
+        rnd.clicked.connect(app.random_well)
+        nxt = QPushButton("Next well  (N)")
+        nxt.clicked.connect(lambda: app.browser.step(1))
+        h.addWidget(rnd, 1)
+        h.addWidget(nxt, 1)
+        v.addLayout(h)
+        h = QHBoxLayout()
+        h.addWidget(QLabel("show"))
+        self.show_whole = QCheckBox("stringent (solid)")
+        self.show_hole = QCheckBox("lenient (dashed)")
+        self.show_ctx = QCheckBox("cells around the hole")
+        for cb in (self.show_whole, self.show_hole, self.show_ctx):
+            cb.setChecked(True)
+            cb.toggled.connect(app.redraw_levels)
+            h.addWidget(cb)
+        h.addStretch(1)
+        v.addLayout(h)
+        v.addWidget(hint("In label mode, click a particle in the canvas (several overlap: pick from the menu), then "
+                         "press 1–5 or a button. Del removes the label. Labels are stored by position, so they "
+                         "survive reruns with other settings."))
+        grid = QGridLayout()
+        for i, c in enumerate(CLASSES):
+            btn = QPushButton(f"{CLASS_KEYS[c]}  {c}")
+            btn.setStyleSheet(f"QPushButton {{ border-left: 6px solid {CLASS_COLORS[c]}; text-align: left; "
+                              f"padding-left: 8px; }}")
+            btn.clicked.connect(lambda _=False, c=c: app.set_label(c))
+            grid.addWidget(btn, i // 3, i % 3)
+        rm = QPushButton("Del  remove")
+        rm.clicked.connect(app.remove_label)
+        grid.addWidget(rm, 1, 2)
+        v.addLayout(grid)
+        self.picked = QLabel("no particle picked")
+        self.picked.setWordWrap(True)
+        self.picked.setTextFormat(Qt.RichText)
+        v.addWidget(self.picked)
+
+        v.addWidget(section("Train the classifier"))
+        v.addWidget(hint("Uses every labelled dataset of the results folders listed below, plus all their unlabelled "
+                         "particles (semi-supervised arms). A frozen set of test wells per dataset is never trained "
+                         "on; choose by the grouped cross-validation, read the test row as the honest check."))
+        self.folders = QPlainTextEdit()
+        self.folders.setPlaceholderText("results folders to train on, one per line (the open one is added)")
+        self.folders.setMaximumHeight(60)
+        v.addWidget(self.folders)
+        h = QHBoxLayout()
+        self.arms = {}
+        from ..learn import ARMS
+        for a in ARMS:
+            cb = QCheckBox(a)
+            cb.setChecked(True)
+            self.arms[a] = cb
+            h.addWidget(cb)
+        v.addLayout(h)
+        h = QHBoxLayout()
+        h.addWidget(QLabel("rounds"))
+        self.rounds = QSpinBox()
+        self.rounds.setRange(0, 10)
+        self.rounds.setValue(3)
+        h.addWidget(self.rounds)
+        h.addWidget(QLabel("pseudo-label P ≥"))
+        self.tau = QDoubleSpinBox()
+        self.tau.setRange(0.5, 0.999)
+        self.tau.setSingleStep(0.01)
+        self.tau.setValue(0.9)
+        h.addWidget(self.tau)
+        h.addStretch(1)
+        self.b_train = accent(QPushButton("Train"))
+        self.b_train.clicked.connect(app.train)
+        h.addWidget(self.b_train)
+        v.addLayout(h)
+        v.addWidget(QLabel("grouped cross-validation (by well)"))
+        self.cv = FrameModel(fmt={})
+        cvv = FrameView(self.cv)
+        cvv.setMinimumHeight(130)
+        v.addWidget(cvv)
+        v.addWidget(QLabel("frozen test wells"))
+        self.test = FrameModel()
+        tv = FrameView(self.test)
+        tv.setMinimumHeight(130)
+        v.addWidget(tv)
+        self.notes = hint("")
+        v.addWidget(self.notes)
+        h = QHBoxLayout()
+        self.arm_pick = QComboBox()
+        h.addWidget(QLabel("use arm"))
+        h.addWidget(self.arm_pick, 1)
+        self.b_save = accent(QPushButton("Save model + classify"))
+        self.b_save.setEnabled(False)
+        self.b_save.clicked.connect(app.save_model)
+        h.addWidget(self.b_save)
+        v.addLayout(h)
+
+        v.addWidget(section("Label next"))
+        v.addWidget(hint("Unlabelled particles the model is least sure about (one per well, test wells excluded). "
+                         "Double-click to open."))
+        self.queue = FrameModel()
+        self.qv = FrameView(self.queue)
+        self.qv.setMinimumHeight(160)
+        self.qv.doubleClicked.connect(lambda _: app.open_queue_item(self.qv.current_row()))
+        v.addWidget(self.qv)
+        v.addStretch(1)
+        scroll.setWidget(body)
+        outer.addWidget(scroll)
+
+    def browse_store(self):
+        p, _ = QFileDialog.getSaveFileName(self, "Label library", self.store_path.text() or "ci_labels.db",
+                                           "SQLite (*.db)", options=QFileDialog.DontConfirmOverwrite)
+        if p:
+            self.store_path.setText(p)
+            self.app.set_store(p)
+
+    def import_csv(self):
+        p, _ = QFileDialog.getOpenFileName(self, "Labels CSV", "", "CSV (*.csv)")
+        if p:
+            self.app.import_labels(p)
+
+    def show_result(self, res):
+        cols = ["arm", "macro_f1", "bal_acc", "auc_cell", "recall_cell", "recall_neighbour", "recall_merged",
+                "recall_debris", "recall_noise", "coverage_unlabelled", "n_pseudo", "n"]
+        self.cv.set(res.cv[[c for c in cols if c in res.cv]].round(3))
+        self.test.set(res.test[[c for c in cols if c in res.test]].round(3))
+        self.notes.setText(" · ".join(res.notes) or "")
+        self.arm_pick.clear()
+        self.arm_pick.addItems(list(res.cv.arm))
+        self.arm_pick.setCurrentText(res.model.spec["arm"])
+        self.b_save.setEnabled(True)
+        self.queue.set(res.queue.head(100).round(3) if len(res.queue) else pd.DataFrame())
+
+
+class ResultsTab(QWidget):
+    def __init__(self, app):
+        super().__init__()
+        self.app = app
+        outer = QVBoxLayout(self)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        body = QWidget()
+        v = QVBoxLayout(body)
+        g = QGridLayout()
+        self.cards = {}
+        for i, (k, t) in enumerate([("one", "one cell"), ("several", "several cells"), ("none", "no cell"),
+                                    ("uncertain", "uncertain call")]):
+            c, val = card(t)
+            self.cards[k] = val
+            g.addWidget(c, 0, i)
+        v.addLayout(g)
+        v.addWidget(section("Calls per plate"))
+        self.per_plate = FrameModel()
+        pv = FrameView(self.per_plate)
+        pv.setMinimumHeight(140)
+        v.addWidget(pv)
+        v.addWidget(section("Identity channels"))
+        v.addWidget(hint("Per channel: a two-component mixture over all cells found in the holes of the run. "
+                         "Ashman's D < 2 = positives and negatives do not separate well."))
+        self.mix = FrameModel()
+        mv = FrameView(self.mix, stretch=True)
+        mv.setMaximumHeight(130)
+        v.addWidget(mv)
+        v.addWidget(section("Plate map (evaluation and display only)"))
+        v.addWidget(hint("Never used for a call. Any CSV with plate_id, well_id and columns of your choice."))
+        h = QHBoxLayout()
+        b = QPushButton("Load plate map…")
+        b.clicked.connect(self.load_map)
+        h.addWidget(b)
+        self.col = QComboBox()
+        self.col.currentTextChanged.connect(self.crosstab)
+        h.addWidget(self.col, 1)
+        v.addLayout(h)
+        self.ct = FrameModel()
+        cv = FrameView(self.ct)
+        cv.setMinimumHeight(160)
+        v.addWidget(cv)
+        h = QHBoxLayout()
+        o = QPushButton("Open results folder")
+        o.clicked.connect(app.open_folder)
+        h.addWidget(o)
+        v.addLayout(h)
+        v.addStretch(1)
+        scroll.setWidget(body)
+        outer.addWidget(scroll)
+        self.map = None
+
+    def update(self, res):
+        if res is None or res.calls is None:
+            for c in self.cards.values():
+                c.setText("–")
+            self.per_plate.set(pd.DataFrame())
+            self.mix.set(pd.DataFrame())
+            return
+        c = res.calls
+        self.cards["one"].setText(str(int((c.status == "one cell").sum())))
+        self.cards["several"].setText(str(int((c.status == "several cells").sum())))
+        self.cards["none"].setText(str(int((c.status == "no cell").sum())))
+        self.cards["uncertain"].setText(str(int((c["call"] == "uncertain").sum())))
+        disp = self.app.cfg.display_name
+        lab = c["call"].map(lambda s: "+".join(disp(x) for x in str(s).split("+")) if s not in
+                            ("none", "uncertain", "no cell") else s)
+        pp = pd.crosstab(c.plate_id, lab).reset_index()
+        self.per_plate.set(pp)
+        info = json.loads((res.dir / "identity.json").read_text()) if (res.dir / "identity.json").exists() else {}
+        rows = []
+        for ch, d in info.items():
+            rows.append(dict(channel=disp(ch), ashman_D=d.get("ashman_d"), n_cells=d.get("n"),
+                             flag="weak separation" if d.get("weak_separation") else (d.get("note") or ""),
+                             means=", ".join(f"{m:.2f}" for m in d.get("means", []))))
+        self.mix.set(pd.DataFrame(rows))
+        self.crosstab()
+
+    def load_map(self):
+        p, _ = QFileDialog.getOpenFileName(self, "Plate map", "", "CSV (*.csv)")
+        if not p:
+            return
+        m = pd.read_csv(p, dtype={"plate_id": str, "well_id": str})
+        m["well_id"] = m.well_id.map(lambda w: w[0] + f"{int(w[1:]):02d}")
+        self.map = m
+        self.col.clear()
+        self.col.addItems([c for c in m.columns if c not in ("plate_id", "well_id")])
+        self.app.set_plate_map(m)
+
+    def crosstab(self, *_):
+        res = self.app.res
+        col = self.col.currentText()
+        if self.map is None or res is None or res.calls is None or not col:
+            self.ct.set(pd.DataFrame())
+            return
+        d = res.calls.merge(self.map, on=["plate_id", "well_id"], how="inner")
+        disp = self.app.cfg.display_name
+        d["call_"] = d["call"].map(lambda s: "+".join(disp(x) for x in str(s).split("+")) if s not in
+                                   ("none", "uncertain", "no cell") else s)
+        self.ct.set(pd.crosstab(d[col].astype(str), d.call_, margins=True).reset_index())
+
+
+class Panel(QTabWidget):
+    def __init__(self, app):
+        super().__init__()
+        self.setMinimumWidth(460)
+        self.run = RunTab(app)
+        self.settings = SettingsTab(app)
+        self.train = TrainTab(app)
+        self.results = ResultsTab(app)
+        self.addTab(self.run, "Run")
+        self.addTab(self.train, "Train")
+        self.addTab(self.results, "Results")
+        self.addTab(self.settings, "Settings")
+        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
