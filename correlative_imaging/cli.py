@@ -254,5 +254,20 @@ def results(folder: Path | None) -> None:
     app.exec_() if hasattr(app, "exec_") else app.exec()
 
 
+@cli.command()
+@click.argument("folder", type=click.Path(exists=True, path_type=Path), required=False)
+def identity(folder: Path | None) -> None:
+    """Open the particle-identity tool (napari): classify particles in the holes,
+    label them, train, and call each cell's channel combination.
+
+    FOLDER (optional) is a results folder of this tool to open directly. More
+    commands (detect, classify, train, import-labels):
+    ``python -m correlative_imaging.identity --help``.
+    """
+    from correlative_imaging.identity.gui.app import launch
+
+    raise SystemExit(launch(str(folder) if folder else None))
+
+
 if __name__ == "__main__":
     cli()

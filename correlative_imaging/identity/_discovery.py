@@ -1,0 +1,172 @@
+"""COPIED from correlative_imaging/results/discovery.py (via downstream/_discovery.py, 2026-10-19), unchanged apart
+from this header, so the identity tool does not import results/. Keep in sync by hand until the two are merged."""
+
+import re
+import sqlite3
+from dataclasses import dataclass, field
+from pathlib import Path
+
+# The three required result tables. A file must contain all of them to count as
+# a pipeline results database (guards against picking up unrelated .db files).
+_REQUIRED_TABLES = {"images", "particle_measurements", "intensity_measurements"}
+
+# Run-tag pattern: "<experiment>_<YYYYMMDD>_<HHMMSS>" (see _run_basename). The
+# timestamp suffix is the stable part; the experiment prefix is free-form.
+_RUN_TAG_RE = re.compile(r"^(?P<tag>.+_\d{8}_\d{6})(?:\.part\d+)?$")
+
+
+@dataclass
+class PlateResult:
+    """One plate's database within a run."""
+    plate: str          # plate identity = the db's parent folder name
+    db_path: Path
+    diagnostics_dir: Path | None = None   # <plate folder>/diagnostics, if it exists
+
+
+@dataclass
+class RunGroup:
+    """All plate databases sharing one run tag."""
+    run_tag: str
+    plates: list[PlateResult] = field(default_factory=list)
+
+    @property
+    def n_plates(self) -> int:
+        return len(self.plates)
+
+
+def _is_results_db(path: Path) -> bool:
+    """True if *path* is a SQLite file with the expected result tables."""
+    try:
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return False
+    try:
+        names = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    except sqlite3.DatabaseError:
+        return False   # not a valid SQLite file
+    finally:
+        con.close()
+    return _REQUIRED_TABLES.issubset(names)
+
+
+def _run_tag_of(db_path: Path) -> str:
+    """Extract the run tag from a database filename, ignoring any ``.partN``
+    sub-database suffix (parallel-batch shards). Falls back to the plain stem
+    when the name doesn't match the timestamped convention."""
+    m = _RUN_TAG_RE.match(db_path.stem)
+    return m.group("tag") if m else db_path.stem
+
+
+def discover_runs(root: str | Path) -> list[RunGroup]:
+    """Find every pipeline results database under *root* and group by run tag.
+
+    Recurses *root* for ``.db`` files, keeps only genuine result databases,
+    skips ``.partN`` sub-databases (they're merged into the main db and would
+    double-count), groups the rest by run tag, and attaches each database's
+    plate identity (its parent folder name) and diagnostics folder.
+
+    Returns runs sorted by tag (so the newest timestamp sorts last); each run's
+    plates are sorted by name. An empty list means nothing was found.
+    """
+    root = Path(root)
+    if not root.is_dir():
+        return []
+
+    groups: dict[str, RunGroup] = {}
+    for db_path in sorted(root.rglob("*.db")):
+        # Skip parallel-batch sub-DBs — the merged main db holds their rows.
+        if re.search(r"\.part\d+$", db_path.stem):
+            continue
+        if not _is_results_db(db_path):
+            continue
+        tag = _run_tag_of(db_path)
+        plate_dir = db_path.parent
+        diag = plate_dir / "diagnostics"
+        pr = PlateResult(
+            plate=plate_dir.name,
+            db_path=db_path,
+            diagnostics_dir=diag if diag.is_dir() else None,
+        )
+        groups.setdefault(tag, RunGroup(run_tag=tag)).plates.append(pr)
+
+    runs = sorted(groups.values(), key=lambda g: g.run_tag)
+    for g in runs:
+        g.plates.sort(key=lambda p: p.plate)
+    return runs
+
+
+def find_diagnostic_images(diagnostics_dir: Path | None, well_id: str) -> dict[str, Path]:
+    """Return the diagnostic images on disk for one well, keyed by kind.
+
+    Keys: ``"whole"`` (whole-image composite) and ``"<roi>_crop"`` for each
+    per-ROI crop (e.g. ``"hole_crop"``, ``"background_crop"``). Prefers ``.jpg``
+    for display, falling back to ``.tif``. Missing files are simply absent from
+    the dict. Empty dict if *diagnostics_dir* is None or nothing matches.
+
+    Filenames follow ``diagnostics._save_well_diagnostics``:
+    ``<well>_whole.<ext>`` and ``<well>_<roi>_crop.<ext>``.
+    """
+    if diagnostics_dir is None or not diagnostics_dir.is_dir():
+        return {}
+    out: dict[str, Path] = {}
+    for f in sorted(diagnostics_dir.glob(f"{well_id}_*")):
+        stem = f.name[len(well_id) + 1:].rsplit(".", 1)[0]  # strip "<well>_" and ext
+        if stem.startswith("particles_"):
+            continue  # particle label maps aren't display composites
+        if stem.endswith("_channels"):
+            continue  # real per-channel stacks are handled by find_channel_stack
+        if stem.endswith("_zstack"):
+            continue  # un-projected Z-stack crops are for Fiji, not the explorer
+        # Prefer .jpg; only take .tif if no .jpg already recorded for this kind.
+        if stem in out and out[stem].suffix.lower() == ".jpg":
+            continue
+        if f.suffix.lower() in (".jpg", ".jpeg", ".tif", ".tiff"):
+            out[stem] = f
+    return out
+
+
+def find_channel_stack(diagnostics_dir: Path | None, well_id: str, kind: str) -> Path | None:
+    """The real per-channel multi-channel TIF for one well+kind, if the run wrote
+    it (opt-in ``multichannel_tif``). Named ``<well>_<kind>_channels.tif`` — e.g.
+    for kind ``"whole"`` → ``<well>_whole_channels.tif``. ``None`` if absent."""
+    if diagnostics_dir is None or not diagnostics_dir.is_dir():
+        return None
+    p = diagnostics_dir / f"{well_id}_{kind}_channels.tif"
+    return p if p.is_file() else None
+
+
+def diagnostic_view_sources(diagnostics_dir: Path | None, well_id: str, kind: str) -> dict[str, Path]:
+    """Available ways to view one well+kind, keyed by a view name:
+
+    * ``"per-channel"`` → the multi-channel stack (raw per-channel data + BF),
+    * ``"composite (jpg)"`` / ``"composite (tiff)"`` → the baked RGB composite in
+      each format that exists (the composite is what carries any stamped ROI
+      outline; the per-channel stack does not).
+
+    Only views whose files exist are included, so the UI can offer a jpg/tiff/
+    per-channel toggle limited to what the run actually wrote."""
+    out: dict[str, Path] = {}
+    if diagnostics_dir is None or not diagnostics_dir.is_dir():
+        return out
+    stack = find_channel_stack(diagnostics_dir, well_id, kind)
+    if stack is not None:
+        out["per-channel"] = stack
+    for name, exts in (("composite (jpg)", (".jpg", ".jpeg")),
+                       ("composite (tiff)", (".tif", ".tiff"))):
+        for ext in exts:
+            p = diagnostics_dir / f"{well_id}_{kind}{ext}"
+            if p.is_file():
+                out[name] = p
+                break
+    return out
+
+
+def find_bf_projection(diagnostics_dir: Path | None, well_id: str) -> Path | None:
+    """The brightfield z-projection for one well, written by the BF pipeline to
+    ``<plate>/bf_pipeline/projections/<well>_proj.tif`` (a sibling of the
+    diagnostics folder). Present even when multi-channel TIFs are not, so BF can
+    still be viewed. ``None`` if absent."""
+    if diagnostics_dir is None:
+        return None
+    p = diagnostics_dir.parent / "bf_pipeline" / "projections" / f"{well_id}_proj.tif"
+    return p if p.is_file() else None
