@@ -8,7 +8,9 @@ Classes (keys 1-5 in the GUI):
   cell       a piece of a cell in the hole (the patched cell, or a cell sitting in an unrecorded hole)
   neighbour  signal of a cell next to the hole that reaches in
   merged     one particle holding two cells (e.g. the patched cell fused with a neighbour)
-  debris     not a cell: plug, crystal, dirt (typically small and bright in several channels)
+  debris     not a cell: crystal, dirt (typically small, dimmer than a cell)
+  plug       not a cell: the bright plug of material over the aperture (very bright, often in every channel; common
+             in wells without a cell, e.g. the "Empty" condition)
   noise      background, halo, haze
 
 The store is a SQLite file (default ``ci_labels.db`` in the run's output folder, next to the Results Explorer's
@@ -39,7 +41,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-CLASSES = ["cell", "neighbour", "merged", "debris", "noise"]
+CLASSES = ["cell", "neighbour", "merged", "debris", "noise", "plug"]   # new classes only ever go at the end
+# (a model stores class indices; a model trained before "plug" existed simply never predicts it)
 VERDICTS = ["one cell", "several cells", "not a cell"]
 SOURCES = ["hand", "blind", "accepted", "corrected", "legacy"]
 # carousel / first labelling session -> classes (None = not used for training)

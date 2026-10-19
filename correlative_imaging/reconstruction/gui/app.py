@@ -137,6 +137,11 @@ class ReconstructionApp:
             viewer.window._qt_window.setCorner(Qt.BottomRightCorner, Qt.RightDockWidgetArea)
         except Exception:
             pass
+        from .channels import ChannelPanel
+        self.channels = ChannelPanel(self)
+        self.channels.setStyleSheet(stylesheet(t))
+        viewer.window.add_dock_widget(self.channels, area="left", name="Channels")
+        self.display.on_well.append(self.channels.refresh)
         dw = viewer.window.add_dock_widget(self.browser, area="bottom", name="Wells")
         try:                                   # a 384-well plate fits across the bottom
             dw.parentWidget().resizeDocks([dw], [330], Qt.Vertical)
@@ -169,6 +174,7 @@ class ReconstructionApp:
         if n:
             self.panel.run.progress.setMaximum(n)
             self.panel.run.progress.setValue(i)
+        self.host.progress(i, n, msg)
         if msg:
             self.say(msg)
 
@@ -477,7 +483,7 @@ class ReconstructionApp:
             self.say(f"trained ({res.model.spec['arm']}, {res.model.spec['n_train']} labels), saved {name}, classified")
             self.open_results(out)
 
-        self._worker(job, done)
+        self._worker(job, done, "retraining and classifying")
 
     def compare_models(self):
         from ..learn import compare_models
@@ -487,10 +493,13 @@ class ReconstructionApp:
         models = self.panel.train.compare_list() or ["preview"]
         store, out = self.store, str(self.res.dir)
 
+        chk, name = self.panel.train.check_wells()
+
         def done(df):
             self.panel.train.cmp.set(df)
-            self.say("models compared on the test wells")
-        self._worker(lambda: compare_models(out, store, models), done)
+            self.say("models compared on the test wells" + (f" and the '{name}' wells" if chk else ""))
+        self._worker(lambda: compare_models(out, store, models, check_wells=chk, check_name=name), done,
+                     "comparing models")
 
     def all_labels(self):
         """Hand labels of the open dataset matched to its particles (for the particle map)."""
@@ -604,6 +613,7 @@ class ReconstructionApp:
 
     def set_plate_map(self, m):
         self.plate_map = m
+        self.panel.train.set_plate_map(m)
         self.refresh()
 
     # -- one well
@@ -688,8 +698,10 @@ class ReconstructionApp:
 
     # -- labelling
     def set_label_mode(self, on: bool):
+        if on:
+            self._show_layer("tags")                       # labelling in the canvas needs the class tags
         self.label_mode = on
-        self.say("label mode on: click a particle, then 1–5" if on else "label mode off")
+        self.say("label mode on: click a particle, then 1–6" if on else "label mode off")
 
     def _on_click(self, viewer, event):
         """napari drag generator: only records press and release. The pick (and its menu, which runs its own event
@@ -734,7 +746,13 @@ class ReconstructionApp:
         y, x = pts[len(pts) // 2]
         return float(y + cur["wd"].offset[0]), float(x + cur["wd"].offset[1])
 
+    def _show_layer(self, role):
+        L = self.display.L.get(role)
+        if L is not None:
+            L.visible = True
+
     def _redetect(self, msg: str):
+        self._show_layer("splits")                         # the edit should be visible
         from qtpy.QtWidgets import QApplication
         from qtpy.QtCore import Qt as _Qt
         from ..pipeline import Results, redetect_well
@@ -803,6 +821,8 @@ class ReconstructionApp:
         self._redetect(f"watershed: {n} pieces")
 
     def draw_cut(self, on: bool):
+        if on:
+            self._show_layer("splits")
         if not self._need_edit_target():
             self.panel.train.b_cut.setChecked(False)
             return
@@ -982,19 +1002,24 @@ class ReconstructionApp:
                 self.panel.train.mode.setChecked(True)
 
     # -- long work
-    def _worker(self, fn, done):
+    def _worker(self, fn, done, what: str = "working"):
         from napari.qt.threading import create_worker
         w = create_worker(fn)
         w.returned.connect(done)
         w.errored.connect(lambda e: self.say(f"error: {e}"))
         w.finished.connect(lambda: self._busy(False))
-        self._busy(True)
+        self._busy(True, what)
         w.start()
         self._w = w
 
-    def _busy(self, on):
-        for b in (self.panel.run.b_detect, self.panel.run.b_classify, self.panel.run.b_all, self.panel.train.b_train):
+    def _busy(self, on, what: str = ""):
+        """Buttons off and the bar under the status line running while a job works in the background."""
+        for b in (self.panel.run.b_detect, self.panel.run.b_classify, self.panel.run.b_all, self.panel.train.b_train,
+                  self.panel.label.b_retrain):
             b.setEnabled(not on)
+        self.host.busy(on, what)
+        if not on:
+            self.update_status()
 
     def run_stage(self, stage: str):
         from ..pipeline import classify_run, detect_run, source_from_spec
@@ -1036,7 +1061,8 @@ class ReconstructionApp:
                 classify_run(out, cfg, self.model, progress=prog, cell_labels=cl())
                 return out
         self.say(f"{stage} → {out}")
-        self._worker(job, lambda d: (self.say("done"), self.open_results(d)))
+        self._worker(job, lambda d: (self.say("done"), self.open_results(d)), {"detect": "detecting",
+                     "classify": "classifying", "all": "detecting and classifying"}.get(stage, stage))
 
     def train(self):
         from ..learn import assemble, train
@@ -1065,7 +1091,7 @@ class ReconstructionApp:
             self.panel.train.show_result(res)
             self.say(f"trained; best by grouped CV: {res.model.spec['arm']}")
 
-        self._worker(job, done)
+        self._worker(job, done, "training (comparing arms)")
 
     def save_model(self):
         import datetime

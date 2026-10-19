@@ -6,8 +6,8 @@ import numpy as np
 
 # class palette (particle classes), chosen to stay apart from typical channel colours
 CLASS_COLORS = {"cell": "#ffd23f", "neighbour": "#9aa5b1", "merged": "#ff8c42", "debris": "#c77dff",
-                "noise": "#5c6670"}
-CLASS_KEYS = {"cell": "1", "neighbour": "2", "merged": "3", "debris": "4", "noise": "5"}
+                "noise": "#5c6670", "plug": "#e05a8a"}
+CLASS_KEYS = {"cell": "1", "neighbour": "2", "merged": "3", "debris": "4", "noise": "5", "plug": "6"}
 
 
 def theme(viewer=None) -> dict:

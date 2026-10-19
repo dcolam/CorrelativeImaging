@@ -1,22 +1,25 @@
 """One well in the napari canvas.
 
-Layers (created once, then their data is swapped per well; visibility stays as you set it, and each channel is
-auto-contrasted (napari's "once") when another well opens; re-detecting the same well keeps your contrast):
-  BF                    brightfield planes (raw min-max), hidden by default; several planes -> slider
-  (images show the detected area: the whole hole crop, or +- `view_R` hole radii of the frame; results detected
-   before that show +- `view_R` read from the run's TIF around their smaller window)
-  <channel>             fluorescence, additive, the run's colour for that channel
-  <channel> outlines    particle edges of that channel in the channel's colour (a pixel image, fast to swap):
-                        stringent threshold solid, lenient (hole) threshold dashed. Shown and hidden together with
-                        the channel's image.
+Layers (created once, then their data is swapped per well). By default only the channels and the hole are shown;
+switch the others on in the Channels dock (or the layer list):
+  BF                    brightfield planes (raw min-max); several planes -> slider
+  <channel>             fluorescence, additive, the run's colour. Auto-contrast on every well change (switch in the
+                        Channels dock): black point = the channel's minimum, white point the 99.9th percentile but at
+                        least minimum + 100 (no stretching of pure noise)
+  <channel> particles   the channel's particles in the hole, filled in its colour: full where both thresholds (whole-
+                        image and hole) agree, half where only one covers the pixel. Which threshold is the larger
+                        one depends on the well, so the overlap is what counts. Noise particles only with "noise"
+  neighbours            grey fill with an "N": cells outside the hole (everything detected that does not reach in),
+                        and particles in the hole classed neighbour (not while blind)
   hole                  hole outline
-  splits                split lines: proposed by Detect (dashed orange, not applied), applied splits (yellow),
-                        hand cuts (white)
-  cells                 reconstructed bodies (after Classify): cells in their call's colour, neighbours grey
-  tags                  one tag per particle in the hole: the model's class (C cell, N neighbour, M merged,
-                        D debris, · noise), or before Classify the provisional class (in, N?, D?, ·?). A hand
-                        label shows as e.g. "[C]" in white.
+  cell                  outline of the reconstructed cell(s) (after Classify) in their call's colour: grown from the
+                        seed particles, split at signal dips, stopped at neighbours
+  edits                 split lines: proposed by Detect (dashed orange), applied splits (yellow), hand cuts (white)
+  tags                  one tag per particle in the hole: the model's class (C cell, N neighbour, M merged, D debris,
+                        P plug, · noise), or before Classify the provisional class (in, N?, D?, ·?); a hand label
+                        shows as e.g. "[C]"
   selection             the picked particle
+(images show the detected area: the whole hole crop, or +- `view_R` hole radii of the frame)
 """
 from __future__ import annotations
 
@@ -26,7 +29,7 @@ from skimage.measure import find_contours
 
 from .theme import CLASS_COLORS, call_color
 
-SHORT = {"cell": "C", "neighbour": "N", "merged": "M", "debris": "D", "noise": "·"}
+SHORT = {"cell": "C", "neighbour": "N", "merged": "M", "debris": "D", "noise": "·", "plug": "P"}
 DSHORT = {"inside": "in", "neighbour": "N?", "debris": "D?", "noise": "·?"}
 DCOLORS = {"inside": "#ffd23f", "neighbour": "#9aa5b1", "debris": "#c77dff", "noise": "#5c6670"}
 
@@ -39,6 +42,20 @@ def _outline(mask: np.ndarray):
         return None
     c = max(cs, key=len) - 1
     return c if len(c) >= 3 else None
+
+
+def _fillmap(hex_color: str, name: str):
+    """Transparent -> the channel's colour (for translucent fills)."""
+    from napari.utils.colormaps import Colormap
+    h = hex_color.lstrip("#")
+    rgb = [int(h[i:i + 2], 16) / 255 for i in (0, 2, 4)]
+    return Colormap([[0, 0, 0, 0], rgb + [1]], name=f"ci_fill_{name}_{h}")
+
+
+def contrast_rule(a: np.ndarray, min_span: float = 100.0) -> tuple:
+    """(minimum, max(99.9th percentile, minimum + min_span))."""
+    lo = float(np.nanmin(a))
+    return lo, max(float(np.nanpercentile(a, 99.9)), lo + min_span)
 
 
 def _colormap(hex_color: str, name: str):
@@ -63,6 +80,8 @@ class WellDisplay:
         self.show_context = True
         self.show_noise = False
         self.blind = False       # hide every class / call / cell (blind labelling, test wells)
+        self.auto_contrast = True  # contrast_rule on every well change
+        self.on_well = []        # callbacks after a well is shown (the Channels dock)
 
     def _name(self, s):
         return self.PREFIX + s
@@ -130,29 +149,35 @@ class WellDisplay:
             L.metadata["channel"] = ch
             self.L[f"img:{ch}"] = L
         for ch in wd.names:
-            O = self.v.add_image(z, name=self._name(f"{cfg.display_name(ch)} outlines"),
-                                 colormap=_colormap(cfg.color(ch), ch + "o"), blending="additive", scale=scale,
-                                 contrast_limits=(0, 1), interpolation2d="nearest")
-            img = self.L[f"img:{ch}"]
-            O.visible = img.visible
-            img.events.visible.connect(lambda e, O=O, img=img: setattr(O, "visible", img.visible))
-            self.L[f"out:{ch}"] = O
+            O = keep(self.v.add_image(z.astype(np.float32), name=self._name(f"{cfg.display_name(ch)} particles"),
+                                      colormap=_fillmap(cfg.color(ch), ch), blending="translucent", scale=scale,
+                                      contrast_limits=(0, 1), opacity=0.55, interpolation2d="nearest"), False)
+            self.L[f"part:{ch}"] = O
+        from napari.utils.colormaps import DirectLabelColormap
+        self.L["neighbours"] = keep(self.v.add_labels(z.astype(np.int32), name=self._name("neighbours"), scale=scale,
+                                                      opacity=0.45), False)
+        self.L["nbtags"] = self.v.add_points(np.zeros((1, 2)), name=self._name("neighbour marks"), scale=scale,
+                                             size=0.1, face_color="transparent", border_width=0,
+                                             features=pd.DataFrame(dict(t=[""])),
+                                             text=dict(string="{t}", color="#e6e9ec", size=12, anchor="center"))
+        nb, nt = self.L["neighbours"], self.L["nbtags"]
+        nt.visible = nb.visible
+        nb.events.visible.connect(lambda e, nb=nb, nt=nt: setattr(nt, "visible", nb.visible))
         self.L["hole"] = keep(self.v.add_image(z, name=self._name("hole"), colormap="gray", blending="additive",
                                                scale=scale, contrast_limits=(0, 1), opacity=0.8,
                                                interpolation2d="nearest"))
-        from napari.utils.colormaps import DirectLabelColormap
-        self.L["splits"] = keep(self.v.add_labels(z.astype(np.int32), name=self._name("splits"), scale=scale,
-                                                  opacity=1.0))
+        self.L["cells"] = keep(self.v.add_labels(z.astype(np.int32), name=self._name("cell"), scale=scale,
+                                                 opacity=1.0), False)
+        self.L["cells"].contour = 2
+        self.L["splits"] = keep(self.v.add_labels(z.astype(np.int32), name=self._name("edits"), scale=scale,
+                                                  opacity=1.0), False)
         self.L["splits"].colormap = DirectLabelColormap(color_dict={None: "transparent", 0: "transparent",
                                                                     1: "#ffd23f", 2: "#ffffff", 3: "#ff9f1c"})
-        self.L["cells"] = keep(self.v.add_labels(z.astype(np.int32), name=self._name("cells"), scale=scale,
-                                                 opacity=0.95))
-        self.L["cells"].contour = 2
         self.L["tags"] = keep(self.v.add_points(np.zeros((1, 2)), name=self._name("tags"), scale=scale, size=0.1,
                                                 face_color="transparent", border_width=0,
                                                 features=pd.DataFrame(dict(t=[""], c=["#ffffff"])),
                                                 text=dict(string="{t}", color={"feature": "c"}, size=11,
-                                                          anchor="center")))
+                                                          anchor="center")), False)
         self.L["selection"] = self.v.add_shapes([], shape_type="polygon", name=self._name("selection"),
                                                 edge_color="#ffffff", face_color="transparent", edge_width=2.0,
                                                 scale=scale)
@@ -193,9 +218,10 @@ class WellDisplay:
             self.L["bf"].contrast_limits = (float(bf.min()), float(bf.max()) or 1.0)
         for k, ch in enumerate(wd.names):
             self.L[f"img:{ch}"].data = fl_v[k]
-            if new_well:
-                self.L[f"img:{ch}"].reset_contrast_limits()      # = the layer's auto-contrast "once" button
-            self.L[f"out:{ch}"].data = self._outline_raster(wd, maps, P, ch)
+            if new_well and self.auto_contrast:
+                self.L[f"img:{ch}"].contrast_limits = contrast_rule(fl_v[k])
+            self.L[f"part:{ch}"].data = self._particle_raster(wd, maps, P, ch)
+        self._neighbours(wd, maps, P)
         from skimage.segmentation import find_boundaries
         self.L["hole"].data = find_boundaries(wd.hole, mode="inner").astype(np.uint8)
         sp = maps.get(("splits", ""))
@@ -210,40 +236,66 @@ class WellDisplay:
             self.L["selection"].data = []
         if first or shape_changed:
             self.v.reset_view()
+        for f in self.on_well:
+            try:
+                f()
+            except Exception:
+                pass
 
-    def _outline_raster(self, wd, maps, P, ch) -> np.ndarray:
-        """One image per channel: stringent particle edges solid, lenient (hole-threshold) edges dashed."""
-        from skimage.segmentation import find_boundaries
-        out = np.zeros(wd.hole.shape, np.uint8)
+    def _particle_raster(self, wd, maps, P, ch) -> np.ndarray:
+        """The channel's particles in the hole: 0.5 per threshold level covering a pixel (1 = both agree)."""
+        from scipy import ndimage as ndi
+        out = np.zeros(wd.hole.shape, np.float32)
         if not len(P):
             return out
-        d = P[P.ch == ch]
-        from scipy import ndimage as ndi
-        yy, xx = np.indices(out.shape)
-        dash = ((yy // 3 + xx // 3) % 2) == 0          # 3-px dashes along straight edges
+        d = P[(P.ch == ch) & P.pool.astype(bool)]
+        if not self.show_noise and not self.blind:
+            cls = d["pclass"] if "pclass" in d else d.get("dclass")
+            if cls is not None:
+                d = d[~cls.isin(["noise"]).to_numpy()]
         for level in ("whole", "hole"):
             if not self.show_levels.get(level, True) or (level, ch) not in maps:
                 continue
             g = d[d.level == level]
-            if not self.show_context:
-                g = g[g.pool | (g.n_parts > 1 if "n_parts" in g else False)]     # cut-off pieces always show
-            if not self.show_noise and not self.blind:
-                cls = g["pclass"] if "pclass" in g else g.get("dclass")
-                if cls is not None:
-                    g = g[~cls.isin(["noise"]).to_numpy()]
             if not len(g):
                 continue
-            L = maps[(level, ch)]
-            sel = np.where(np.isin(L, g.lab.to_numpy()), L, 0)
-            # outer edge only: fill each particle's holes so internal speckle gaps draw no edges
-            filled = np.zeros_like(sel)
-            for i, sl in enumerate(ndi.find_objects(sel), start=1):
-                if sl is not None:
-                    m = ndi.binary_fill_holes(sel[sl] == i)
-                    filled[sl][m] = i
-            edge = find_boundaries(filled, mode="inner")
-            out |= (edge & dash if level == "hole" else edge).astype(np.uint8)
+            m = ndi.binary_fill_holes(np.isin(maps[(level, ch)], g.lab.to_numpy()))
+            out += 0.5 * m
         return out
+
+    def _neighbours(self, wd, maps, P):
+        """Grey fill + "N": everything detected that does not reach into the hole (stringent level), and particles in
+        the hole classed neighbour (not while blind). One mark per connected neighbour."""
+        from napari.utils.colormaps import DirectLabelColormap
+        from skimage.measure import label as _label
+        m = np.zeros(wd.hole.shape, bool)
+        if len(P):
+            out = P[~P.pool.astype(bool) & (P.level == "whole")]
+            cls = P["pclass"] if "pclass" in P else P.get("dclass")
+            inn = P[P.pool.astype(bool) & (cls == "neighbour").to_numpy()] if (cls is not None and not self.blind) \
+                else P.iloc[:0]
+            for g in (out, inn):
+                for (lev, ch), gg in g.groupby(["level", "ch"]):
+                    L = maps.get((lev, ch))
+                    if L is not None:
+                        m |= np.isin(L, gg.lab.to_numpy())
+        lab = _label(m).astype(np.int32)
+        L = self.L["neighbours"]
+        L.data = lab
+        L.colormap = DirectLabelColormap(color_dict={None: "transparent", 0: "transparent",
+                                                     **{int(k): "#8a929c" for k in range(1, int(lab.max()) + 1)}})
+        from scipy import ndimage as ndi
+        n = int(lab.max())
+        pts = np.array(ndi.center_of_mass(m, lab, range(1, n + 1))) if n else np.zeros((0, 2))
+        T = self.L["nbtags"]
+        txt = ["N"] * len(pts)
+        if not len(pts):                                   # napari's text needs at least one point: an empty mark
+            pts, txt = np.zeros((1, 2)), [""]
+        with T.events.blocker_all():
+            T.data = pts.reshape(-1, 2)
+        T.features = pd.DataFrame(dict(t=txt))
+        T.refresh_text()
+        T.refresh()
 
     def _cells(self, G, cells, cfg, shape):
         from napari.utils.colormaps import DirectLabelColormap
@@ -251,13 +303,11 @@ class WellDisplay:
         if G is None or not G.any() or self.blind:
             L.data = np.zeros(shape, np.int32)
             return
-        R = np.where(G > 0, G, np.where(G < 0, 1000 - G, 0)).astype(np.int32)
+        R = np.where(G > 0, G, 0).astype(np.int32)           # neighbours have their own layer
         colors = {None: "transparent", 0: "transparent"}
         calls = {} if cells is None or not len(cells) else dict(zip(cells.cell_id, cells["call"]))
         for k in np.unique(G[G > 0]):
             colors[int(k)] = call_color(calls.get(int(k), "uncertain"), cfg.color)
-        for k in np.unique(G[G < 0]):
-            colors[int(1000 - k)] = "#8a929c"
         L.data = R
         L.colormap = DirectLabelColormap(color_dict=colors)
 

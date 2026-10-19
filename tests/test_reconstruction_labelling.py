@@ -85,3 +85,15 @@ def test_several_cells_verdict_makes_the_well_ambiguous():
     calls = well_calls(c, W, ["c1"])
     r = calls[calls.well_id == "A00"].iloc[0]
     assert r.status == "several cells (by eye)" and r["call"] == "ambiguous"
+
+
+def test_plug_is_a_class_after_the_old_ones():
+    from correlative_imaging.reconstruction.labels import CLASSES
+    assert CLASSES[:5] == ["cell", "neighbour", "merged", "debris", "noise"] and "plug" in CLASSES[5:]
+
+
+def test_store_accepts_plug_and_unsure(tmp_path):
+    st = LabelStore(tmp_path / "l.db")
+    st.set("ds", "P1", "A01", "c1", "any", 10, 10, "plug")
+    st.mark_unsure("ds", "P1", "A02", "c1", "any", 5, 5)
+    assert st.frame("ds").label.tolist() == ["plug"] and len(st.unsure_frame("ds")) == 1

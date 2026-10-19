@@ -621,7 +621,7 @@ class TrainTab(QWidget):
         self.canvas_page = QWidget()
         v = QVBoxLayout(self.canvas_page)
         v.addWidget(hint("Label any particle where you see it: turn on label mode, click a particle in the canvas "
-                         "(several overlap: pick from the menu), press 1–5 or a button; Del removes the label. "
+                         "(several overlap: pick from the menu), press 1–6 or a button; Del removes the label. "
                          "Labels are stored by position, so they survive re-detection. Use this for particles the "
                          "batches did not show you, and to fix segmentation (below)."))
         h = QHBoxLayout()
@@ -638,21 +638,21 @@ class TrainTab(QWidget):
         h.addWidget(nxt, 1)
         v.addLayout(h)
         h = QHBoxLayout()
-        h.addWidget(QLabel("show"))
-        self.show_whole = QCheckBox("stringent (solid)")
-        self.show_hole = QCheckBox("lenient (dashed)")
+        self.show_whole = QCheckBox("stringent")
+        self.show_hole = QCheckBox("lenient")
         self.show_ctx = QCheckBox("cells around")
-        self.show_noise = QCheckBox("noise")
-        self.show_noise.setToolTip("outlines of particles classed as noise (often background speckle at the lenient "
-                                   "threshold); hidden by default, their tags stay")
-        for cb in (self.show_whole, self.show_hole, self.show_ctx):
+        for cb in (self.show_whole, self.show_hole, self.show_ctx):   # kept for the display; both levels always drawn
             cb.setChecked(True)
-            cb.toggled.connect(app.redraw_levels)
-            h.addWidget(cb)
+            cb.setVisible(False)
+        self.show_noise = QCheckBox("include noise particles in the particle layers")
+        self.show_noise.setToolTip("particles classed noise (often background speckle at the lenient threshold) are "
+                                   "left out of the particle fills by default")
         self.show_noise.toggled.connect(app.redraw_levels)
         h.addWidget(self.show_noise)
         h.addStretch(1)
         v.addLayout(h)
+        v.addWidget(hint("Layers (channels, particles, neighbours, cell outline, tags, edits): Channels dock on the "
+                         "left. Tags show each particle's class; turn them on for labelling here."))
         grid = QGridLayout()
         for i, c in enumerate(CLASSES):
             btn = QPushButton(f"{CLASS_KEYS[c]}  {c}")
@@ -662,7 +662,7 @@ class TrainTab(QWidget):
             grid.addWidget(btn, i // 3, i % 3)
         rm = QPushButton("Del  remove")
         rm.clicked.connect(app.remove_label)
-        grid.addWidget(rm, 1, 2)
+        grid.addWidget(rm, (len(CLASSES) + 2) // 3, 0)
         v.addLayout(grid)
         self.picked = QLabel("no particle picked")
         self.picked.setWordWrap(True)
@@ -760,6 +760,18 @@ class TrainTab(QWidget):
         self.cmp_list = QLabel("preview")
         self.cmp_list.setProperty("role", "hint")
         v.addWidget(self.cmp_list)
+        h = QHBoxLayout()
+        h.addWidget(QLabel("no-cell check: wells where"))
+        self.chk_col = QComboBox()
+        self.chk_val = QComboBox()
+        self.chk_col.currentTextChanged.connect(self._fill_chk_values)
+        h.addWidget(self.chk_col, 1)
+        h.addWidget(QLabel("="))
+        h.addWidget(self.chk_val, 1)
+        v.addLayout(h)
+        v.addWidget(hint("Needs a plate map (Results tab). Everything detected in those wells (e.g. the Empty "
+                         "condition) should be debris, plug or noise: the table adds the share each model calls "
+                         "cell-like there, and the share of those wells that would get a cell. No labels needed."))
         self.cmp = FrameModel()
         cmv = FrameView(self.cmp)
         cmv.setMinimumHeight(120)
@@ -864,6 +876,34 @@ class TrainTab(QWidget):
                                                                       if cb.isChecked()) or "none"))
         self.colour_row.addWidget(b)
         self.colour_row.addStretch(1)
+
+    def set_plate_map(self, m):
+        self._map = m
+        self.chk_col.blockSignals(True)
+        self.chk_col.clear()
+        self.chk_col.addItems(["(none)"] + [c for c in m.columns if c not in ("plate_id", "well_id")])
+        self.chk_col.blockSignals(False)
+        cols = [c for c in m.columns if c.lower() == "condition"]
+        self.chk_col.setCurrentText(cols[0] if cols else "(none)")
+        self._fill_chk_values(self.chk_col.currentText())
+
+    def _fill_chk_values(self, col):
+        self.chk_val.clear()
+        m = getattr(self, "_map", None)
+        if m is None or col not in m:
+            return
+        vals = sorted(m[col].dropna().astype(str).unique())
+        self.chk_val.addItems(vals)
+        for v in vals:
+            if v.lower() == "empty":
+                self.chk_val.setCurrentText(v)
+
+    def check_wells(self):
+        m, col, val = getattr(self, "_map", None), self.chk_col.currentText(), self.chk_val.currentText()
+        if m is None or col not in m or not val:
+            return None, "check"
+        d = m[m[col].astype(str) == val]
+        return set(zip(d.plate_id, d.well_id)), val
 
     def add_cmp(self):
         m = self.cmp_models.currentText()
@@ -1149,4 +1189,29 @@ class PanelHost(QWidget):
         self.status.setProperty("role", "card")
         self.status.setContentsMargins(8, 4, 8, 4)
         v.addWidget(self.status)
+        self.bar = QProgressBar()
+        self.bar.setTextVisible(True)
+        self.bar.setFixedHeight(16)
+        self.bar.setVisible(False)
+        v.addWidget(self.bar)
         v.addWidget(panel, 1)
+        self._what = ""
+
+    def busy(self, on: bool, what: str = ""):
+        """Running: an indeterminate bar with the job's name until real progress (i of n) arrives."""
+        self._what = what or self._what
+        self.bar.setVisible(on)
+        if on:
+            self.bar.setRange(0, 0)
+            self.bar.setFormat(f"{self._what}…")
+
+    def progress(self, i, n, msg=""):
+        if not self.bar.isVisible():
+            return
+        if n:
+            self.bar.setRange(0, n)
+            self.bar.setValue(i)
+            self.bar.setFormat(f"{self._what}: {i} / {n}")
+        elif msg:
+            self.bar.setRange(0, 0)
+            self.bar.setFormat(f"{self._what}: {msg[:60]}")

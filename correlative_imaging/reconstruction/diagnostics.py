@@ -31,7 +31,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-CLASS_COLORS = {"inside": "#d4a017", "neighbour": "#6c7a89", "debris": "#9b5de5", "noise": "#b0b7bf",
+CLASS_COLORS = {"plug": "#e05a8a", "inside": "#d4a017", "neighbour": "#6c7a89", "debris": "#9b5de5", "noise": "#b0b7bf",
                 "cell": "#2bb3a3", "merged": "#e05a8a"}
 PLATE_COLORS = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b", "#e377c2", "#7f7f7f",
                 "#bcbd22", "#17becf"]

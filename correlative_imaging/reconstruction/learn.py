@@ -375,17 +375,31 @@ def learning_curve(T: pd.DataFrame, test_groups: set, arm: str = "hand", fracs=(
     return pd.DataFrame(rows)
 
 
-def compare_models(results_dir, store, models: list, tol_um: float = 2.0) -> pd.DataFrame:
+def compare_models(results_dir, store, models: list, tol_um: float = 2.0, check_wells: set | None = None,
+                   check_name: str = "check") -> pd.DataFrame:
     """Every model (a .joblib path / name in models/, or "preview") scored on the labelled particles of the frozen test
-    wells of one results folder (its dataset's test wells in `store`)."""
+    wells of one results folder (its dataset's test wells in `store`). A model that does not know a class (one trained
+    before "plug" existed, or the preview) is scored with that class's labels counted as debris.
+
+    check_wells: wells where no cell is expected (e.g. the "Empty" condition of a plate map). Needs no labels: per
+    model, the share of the objects detected there called debris or plug (expected), noise, or cell / neighbour /
+    merged (wrong), and the share of those wells holding any object called cell or merged."""
     from .config import MODELS
     from .pipeline import Results
     from .preview import PreviewModel
+    from .tiers import objects
     T, tg, _ = assemble([results_dir], store, tol_um)
     g = group_key(T)
     te = T.label.notna().to_numpy() & np.isin(g, list(tg))
-    y = np.array([CLASSES.index(c) for c in T.label[te]])
+    y0 = np.array([CLASSES.index(c) for c in T.label[te]])
     w = T.weight[te].fillna(1).to_numpy(float)
+    O = None
+    if check_wells:
+        R = Results(results_dir)
+        n_check = len(set(zip(R.wells.plate_id, R.wells.well_id)) & set(check_wells))
+        F = R.particles
+        O = objects(F)
+        O = O[[(p, q) in check_wells for p, q in zip(O.plate_id, O.well_id)]]
     rows = []
     for name in models:
         try:
@@ -394,16 +408,41 @@ def compare_models(results_dir, store, models: list, tol_um: float = 2.0) -> pd.
             else:
                 p = Path(name)
                 mdl = ParticleModel.load(p if p.exists() else MODELS / name)
-            miss = [f for f in getattr(mdl, "spec", {}).get("features", []) if f not in T]
+            sp = getattr(mdl, "spec", {}) or {}
+            miss = [f for f in sp.get("features", []) if f not in T]
             if miss:
                 rows.append(dict(model=name, n=int(te.sum()), note=f"results lack {', '.join(miss)}: detect again"))
                 continue
-            M = mdl.predict(T[te])
-            P = M[[f"p_{c}" for c in CLASSES]].to_numpy(float)
-            sp = getattr(mdl, "spec", {})
-            rows.append(dict(model=name, arm=sp.get("arm"), trained_on=",".join(sp.get("datasets", []) or []),
-                             n_train=sp.get("n_train"), **{k: (round(v, 3) if isinstance(v, float) else v)
-                                                           for k, v in metrics(y, P, w).items()}))
+            known = sp.get("classes") or [c for c in CLASSES if c != "plug"]
+            row = dict(model=name, arm=sp.get("arm"), trained_on=",".join(sp.get("datasets", []) or []),
+                       n_train=sp.get("n_train"))
+            if te.any():
+                M = mdl.predict(T[te])
+                P = M[[f"p_{c}" for c in CLASSES]].to_numpy(float).copy()
+                y = y0.copy()
+                note = []
+                for c in CLASSES:                      # classes this model never learned count as debris
+                    if c not in known and c != "debris":
+                        P[:, CLASSES.index("debris")] += P[:, CLASSES.index(c)]
+                        P[:, CLASSES.index(c)] = 0
+                        y[y == CLASSES.index(c)] = CLASSES.index("debris")
+                        note.append(f"{c} scored as debris")
+                row.update({k: (round(v, 3) if isinstance(v, float) else v) for k, v in metrics(y, P, w).items()})
+                if note:
+                    row["note"] = "; ".join(note)
+            else:
+                row.update(n=0, note="no labelled test objects yet")
+            if O is not None and len(O):
+                c = mdl.predict(O).pclass.fillna("")
+                row[f"{check_name}_objects"] = len(O)
+                row[f"{check_name}_debris_or_plug"] = round(float(c.isin(["debris", "plug"]).mean()), 3)
+                row[f"{check_name}_noise"] = round(float((c == "noise").mean()), 3)
+                row[f"{check_name}_cell_like"] = round(float(c.isin(["cell", "neighbour", "merged"]).mean()), 3)
+                bad = O.assign(c=c.to_numpy())[c.isin(["cell", "merged"]).to_numpy()]
+                row[f"{check_name}_wells"] = n_check
+                row[f"{check_name}_wells_with_a_cell"] = round(len(set(zip(bad.plate_id, bad.well_id))) /
+                                                               max(n_check, 1), 3)
+            rows.append(row)
         except Exception as e:
             rows.append(dict(model=name, note=str(e)))
     return pd.DataFrame(rows)

@@ -254,7 +254,7 @@ def reconstruct_from_particles(wd, sm: np.ndarray, P: pd.DataFrame, maps: dict, 
                 seed_rows.append(r)
             elif r.pclass == "neighbour":
                 nb |= m
-            elif r.pclass == "debris":
+            elif r.pclass in ("debris", "plug"):
                 barrier |= m & ~seed
         elif getattr(r, "outer", False) == True:            # noqa: E712 (NaN on old rows)
             continue                                    # cells far out in the crop: beyond the window it works on

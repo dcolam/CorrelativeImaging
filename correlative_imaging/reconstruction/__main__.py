@@ -10,6 +10,7 @@
         --names GFP=488nm mScarlet=561nm ... [--wells-csv wells.csv]
   python -m correlative_imaging.reconstruction freeze-test-wells --out <dir> --labels new.db [--from old.db]
   python -m correlative_imaging.reconstruction compare --out <dir> --labels ci_labels.db --models preview a.joblib ...
+        [--plate-map map.csv --check Condition=Empty]
 
 `--config` takes a JSON file or a preset name (identity/presets/*.json).
 """
@@ -50,6 +51,8 @@ def main(argv=None):
     k = sub.add_parser("compare", help="score models on the labelled particles of the frozen test wells")
     k.add_argument("--out", required=True); k.add_argument("--labels", required=True)
     k.add_argument("--models", nargs="+", default=["preview"])
+    k.add_argument("--plate-map", help="CSV with plate_id, well_id and condition columns (for --check)")
+    k.add_argument("--check", help="COLUMN=VALUE: wells where no cell is expected, e.g. Condition=Empty")
     i = sub.add_parser("import-labels", help="import a first labelling session (CSV)")
     i.add_argument("--csv", required=True); i.add_argument("--labels", required=True)
     i.add_argument("--dataset", required=True); i.add_argument("--names", nargs="+", required=True)
@@ -114,7 +117,14 @@ def main(argv=None):
         from .labels import LabelStore
         from .learn import compare_models
         pd.set_option("display.width", 220)
-        print(compare_models(a.out, LabelStore(a.labels), a.models).to_string(index=False))
+        chk, name = None, "check"
+        if a.plate_map and a.check:
+            col, val = a.check.split("=", 1)
+            m = pd.read_csv(a.plate_map, dtype=str)
+            m["well_id"] = m.well_id.map(lambda w: w[0] + f"{int(w[1:]):02d}")
+            chk, name = set(zip(m.plate_id[m[col] == val], m.well_id[m[col] == val])), val
+        print(compare_models(a.out, LabelStore(a.labels), a.models, check_wells=chk, check_name=name)
+              .to_string(index=False))
     elif a.cmd == "import-labels":
         from .labels import LabelStore
         names = dict(n.split("=", 1) for n in a.names)

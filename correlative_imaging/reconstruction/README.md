@@ -6,7 +6,7 @@ What is in the hole, and what is it positive for? The tool runs on the **output*
 It is a particle classifier first:
 1. every particle at the hole is described by features that mean the same thing for 1, 2, 3 or 4 channels;
 2. a classifier trained on hand labels (and pretrained on all particles) says cell / neighbour / merged / debris /
-   noise;
+   noise / plug;
 3. cells are rebuilt from the cell particles, neighbour-aware: they split where the signal dips and never fuse with
    a neighbour;
 4. each rebuilt cell gets a calibrated call over all channel combinations.
@@ -51,7 +51,7 @@ stands and what to do next. The right panel runs the full height; the **Wells** 
    (reconstruction and call), and the locked detection settings that define the features (✓/✗ against the model).
 
 **Batch labeller** (Label → Particles / Cells): pages of thumbnails.
-- Keys (click a tile first): particles 1–5, cells 1–3 (verdict) and Q W E R / 0 (colour), **U unsure**, Enter keep
+- Keys (click a tile first): particles 1–6, cells 1–3 (verdict) and Q W E R / 0 (colour), **U unsure**, Enter keep
   the suggestion, Backspace skip, Space show the well in the canvas, N new page.
 - **Several at once:** Ctrl+click, Shift+click or Ctrl+A select tiles; a key then labels all of them, Enter keeps
   all their suggestions.
@@ -78,21 +78,24 @@ stands and what to do next. The right panel runs the full height; the **Wells** 
 
 Before Classify the colours are the Detect preview; afterwards they are the calls. `n` and `p` step through the list.
 
-**Canvas layers:**
-- **BF:** all planes, raw min–max, hidden by default.
-- **each channel:** its image (additive, its colour) plus an outline layer in the same colour. Stringent particles
-  are solid, lenient (hole-threshold) particles dashed. The outlines show and hide with their channel.
-- **hole:** the hole outline.
-- **cells:** the reconstructed bodies (after Classify). Cells are coloured by their call (blended channel colours,
-  amber = uncertain); neighbours are grey.
-- **tags:** one per particle in the hole. The model's class: C cell, N neighbour, M merged, D debris, · noise.
-  Before Classify, the provisional class instead: in, N?, D?, ·?. A hand label is white in brackets, e.g. [C].
+**Canvas layers.** By default only the fluorescence channels and the hole outline are shown. The rest are layers you
+switch on in the **Channels** dock (left), which also shows every channel at once, as in the HTML viewer: visibility,
+its histogram (log counts, the shown range shaded), min / max, gamma and "auto".
+- **Contrast:** on every well change (switch at the top of the Channels dock), black point = the channel's minimum,
+  white point = the 99.9th percentile but at least minimum + 100, so pure noise is never stretched over the range.
+- **<channel> particles:** the channel's particles in the hole, filled in its colour. Full where both thresholds agree,
+  half where only one covers the pixel. Which threshold is the larger depends on how much signal the hole holds, so
+  the overlap is what counts. Noise particles are left out unless "include noise particles" (Label → In the canvas).
+- **neighbours:** grey fill with an "N": everything detected that does not reach into the hole, plus particles in the
+  hole classed neighbour (not while blind).
+- **reconstructed cell:** the outline of each reconstructed cell in its call's colour, after Classify. It is grown from
+  the seed particles, split at signal dips and stopped at neighbours (the reconstruction step, `reconstruct.py`).
+- **class tags** (switched on with label mode), **edits / proposed splits** (switched on by any edit), **brightfield**.
 
-The layers are created once and only their data changes from one well to the next (about 0.4 s per well switch, was
-4.5 s), so visibility stays as you set it. Each channel is auto-contrasted (napari's "once") when another well
-opens; re-detecting the same well after an edit keeps your contrast.
+Long jobs (Detect, Classify, Retrain, Compare, Train) show a bar under the status line: the job's name, and i / n
+when the job reports progress.
 
-**Labelling:** turn on label mode (`L`), click a particle and press `1`–`5` (cell, neighbour, merged, debris, noise).
+**Labelling:** turn on label mode (`L`), click a particle and press `1`–`6` (cell, neighbour, merged, debris, noise, plug).
 `Del` removes a label. Where several particles overlap (channels, two thresholds), a menu lists them.
 
 ## Labelling loop (clean slate: no model, no labels)
@@ -131,7 +134,20 @@ The aim: a few hundred well-chosen decisions instead of thousands of clicks, and
    **Progress bars** show labels per class against 30, the test objects labelled blind, and judged cells per colour.
 7. **Compare models** (Model tab, or `compare --models preview old.joblib new.joblib`). Scores any saved model, or
    the preview, on the blind labels of the open results' test wells. This works across datasets too: open PNC results,
-   compare the ROMK model with a PNC one.
+   compare the ROMK model with a PNC one. A model that never learned a class (one from before "plug" existed, or the
+   preview) is scored with that class's labels counted as debris.
+
+   **No-cell check** (needs a plate map, no labels; `--plate-map map.csv --check Condition=Empty`): in wells where no
+   cell is expected, everything detected should be debris, plug or noise. Per model: the share of those objects
+   called debris or plug, noise, or cell-like (cell / neighbour / merged, wrong), and the share of those wells with an
+   object called cell or merged. On ROMK before any plug labels (2026-10-19): 362 objects in 82 Empty wells, none
+   called debris; cell-like 20 % (preview) and 23 % (old model), almost all in the ROMK channel (69 of the old model's
+   83). The Empty wells' colour calls are still "no cell" (80 of 82), because ROMK is a marker channel.
+
+**Classes:** cell, neighbour, merged, debris, noise, **plug** (added 2026-10-19: the very bright plug over the
+aperture, often in every channel and common in wells without a cell; debris is now small dim dirt and crystals).
+New classes always go at the end of the list, so older models keep working (they never predict plug). Plugs are
+barriers in the reconstruction, like debris.
 
 **Blind labelling** (Label tab, Setup). "Always blind in test wells" (on by default) hides everything that could anchor a
 label in a test well:

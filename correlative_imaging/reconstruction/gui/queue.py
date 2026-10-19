@@ -6,7 +6,7 @@ built by tiers.py. Each has two sets:
                       cells: verdict (one cell / several cells that cannot be split by eye / not a cell) and colour
 
 Keys (click the grid first)  ←→↑↓ move · Enter accept the suggestion · Space open the well in the canvas ·
-  Backspace skip.  Particles: 1–5 cell / neighbour / merged / debris / noise.
+  Backspace skip, U unsure.  Particles: 1–6 cell / neighbour / merged / debris / noise / plug.
   Cells: 1 one cell · 2 several cells · 3 not a cell · Q W E R toggle identity channel 1–4 · 0 colour none.
 
 Stored source: "blind" (no suggestion was visible), "accepted" (suggestion kept), "corrected" (changed). Thumbnails
@@ -33,11 +33,12 @@ VERDICT_KEYS = {Qt.Key_1: "one cell", Qt.Key_2: "several cells", Qt.Key_3: "not 
 CH_KEYS = [Qt.Key_Q, Qt.Key_W, Qt.Key_E, Qt.Key_R]
 VERDICT_COLORS = {"one cell": "#2bb3a3", "several cells": "#e0a526", "not a cell": "#8a929c"}
 DESCRIPTION = {
-    "particle": ("<b>What is this particle?</b> 1 cell · 2 neighbour · 3 merged · 4 debris · 5 noise · U unsure",
+    "particle": ("<b>What is this particle?</b> 1 cell · 2 neighbour · 3 merged · 4 debris · 5 noise · 6 plug · U unsure",
                  "One tile per object in a hole; trains the particle classifier.\n"
                  "1 cell: the patched cell or part of it\n2 neighbour: a cell next to the hole reaching in\n"
-                 "3 merged: one particle holding two cells\n4 debris: dirt, plug, crystal\n"
-                 "5 noise: background, haze"),
+                 "3 merged: one particle holding two cells\n4 debris: dirt, crystal (small, dim)\n"
+                 "5 noise: background, haze\n6 plug: the very bright plug over the aperture (often in every "
+                 "channel; typical of wells without a cell)"),
     "cell": ("<b>What is this cell?</b> 1 one cell · 2 several cells · 3 not a cell · U unsure — colour: Q W E R, 0 none",
              "One tile per reconstructed cell (needs Classify; before any model the Detect preview stands in).\n"
              "2 several cells: two or more cells that cannot be split by eye, either could be the patched one.\n"
@@ -685,7 +686,7 @@ class LabelQueue(QWidget):
         elif self.kind == "cell" and k == Qt.Key_0:
             for i in T:
                 self.set_cell(colour="none", i=i)
-        elif self.kind == "particle" and Qt.Key_1 <= k <= Qt.Key_5:
+        elif self.kind == "particle" and Qt.Key_1 <= k <= Qt.Key_6:
             cls = {CLASS_KEYS[c]: c for c in CLASSES}.get(chr(k))
             if cls:
                 for i in T:
