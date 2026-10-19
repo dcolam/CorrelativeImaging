@@ -180,6 +180,8 @@ class ReconstructionApp:
     # -- config / store / results
     def set_config(self, cfg: Config, from_form: bool = False):
         self.cfg = cfg
+        from ..pipeline import set_path_map
+        set_path_map(cfg.path_map)                     # the run's TIFs are read back through it
         self.model = None
         if cfg.model and cfg.model_path() and cfg.model_path().exists():
             from ..learn import ParticleModel
@@ -351,7 +353,11 @@ class ReconstructionApp:
     def show_well(self, plate_id, well_id):
         if self.res is None:
             return
-        got = self.res.well(plate_id, well_id)
+        try:
+            got = self.res.well(plate_id, well_id)
+        except (FileNotFoundError, OSError) as e:
+            self.say(f"{plate_id} {well_id}: {e}")
+            return
         if got is None:
             self.say(f"{plate_id} {well_id}: not in the cache")
             return
@@ -450,7 +456,8 @@ class ReconstructionApp:
         for _, r in hits.iterrows():
             cls = r.get("pclass", "") if isinstance(r.get("pclass", ""), str) else ""
             text = f"{self.cfg.display_name(r.ch)} · {'lenient' if r.level == 'hole' else 'stringent'}" + \
-                   (f" · {cls} {r.get('p_' + cls, np.nan):.2f}" if cls else "") + f" · {r.in_um2:.0f} µm²"
+                   (f" · {cls} {r.get('p_' + cls, np.nan):.2f}" if cls else "") + \
+                   (f" · {r.in_um2:.0f} µm²" if r.pool else " · outside the hole (neighbour)")
             a = menu.addAction(text)
             a.setData(r.name)
         self._menu = menu
@@ -504,6 +511,34 @@ class ReconstructionApp:
         y, x = self._inside_point(row)
         self.store.accept_split(self.res.dataset, row.plate_id, row.well_id, row.ch, row.level, y, x)
         self._redetect("split accepted")
+
+    def watershed(self):
+        """Split the picked particle on demand (at any dip between its peaks, else at a neck in its shape). The
+        dividing lines are stored like a hand cut: every channel and both levels, undone by Clear edits."""
+        row = self.display.picked
+        if not self._need_edit_target() or row is None:
+            self.say("pick the particle to watershed first")
+            return
+        from ..detect import smoothed
+        from ..edits import watershed_pieces
+        from scipy import ndimage as ndi
+        from ..pipeline import well_hbg
+        cur = self.display.current
+        wd, L = cur["wd"], cur["maps"][(row.level, row.ch)]
+        m = L == row.lab
+        sl = tuple(slice(max(a.start - 1, 0), a.stop + 1) for a in
+                   ndi.find_objects(m.astype(np.uint8))[0])
+        w = self.res.wells
+        hbg = well_hbg(w[(w.plate_id == row.plate_id) & (w.well_id == row.well_id)].iloc[0], self.res.channels)
+        sm = smoothed(wd, self.cfg)[wd.names.index(row.ch)] - hbg[row.ch][0]
+        n = int(watershed_pieces(m[sl], sm[sl], self.cfg.peak_h * max(hbg[row.ch][1], 1e-6),
+                                 self.cfg.min_object_px).max())
+        if n < 2:
+            self.say("watershed finds no second peak or neck in this particle; draw a cut instead (X)")
+            return
+        y, x = self._inside_point(row)
+        self.store.add_watershed(self.res.dataset, row.plate_id, row.well_id, row.ch, row.level, y, x)
+        self._redetect(f"watershed: {n} pieces")
 
     def draw_cut(self, on: bool):
         if not self._need_edit_target():
@@ -603,6 +638,13 @@ class ReconstructionApp:
                       if f"p_{c}" in row)
         prop = int(row.get("n_proposed", 1) or 1) if hasattr(row, "get") else 1
         self.panel.train.b_accept.setEnabled(prop > 1)
+        if not bool(row.pool):
+            self.panel.train.picked.setText(
+                f"<b>{self.cfg.display_name(row.ch)}</b> · {'lenient' if row.level == 'hole' else 'stringent'} · "
+                f"outside the hole ({row.full_px * self.res.wells.px_um.iloc[0] ** 2:.0f} µm²): a neighbour by "
+                "its position, not classified" + (" (cut off a particle in the hole: merge it back or clear the "
+                                                  "edits to undo)" if row.get("n_parts", 1) > 1 else "") + ".")
+            return
         self.panel.train.picked.setText(
             (f"<i>Detect proposes splitting this particle into {prop} pieces</i><br>" if prop > 1 else "") +
             f"<b>{self.cfg.display_name(row.ch)}</b> · {'lenient' if row.level == 'hole' else 'stringent'} · "
@@ -613,6 +655,10 @@ class ReconstructionApp:
         row = self.display.picked
         if row is None or self.res is None or self.store is None:
             self.say("pick a particle first (label mode, click)")
+            return None
+        if not bool(row.pool):
+            self.say("this particle does not reach into the hole: it counts as a neighbour by its position and "
+                     "is not classified, so it takes no label (cut, watershed and merge work on it)")
             return None
         w = self.res.wells
         w = w[(w.plate_id == row.plate_id) & (w.well_id == row.well_id)].iloc[0]

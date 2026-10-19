@@ -68,7 +68,8 @@ step through the list.
   Before Classify, the provisional class instead: in, N?, D?, ·?. A hand label is white in brackets, e.g. [C].
 
 The layers are created once and only their data changes from one well to the next (about 0.4 s per well switch, was
-4.5 s), so visibility and contrast stay as you set them.
+4.5 s), so visibility stays as you set it. Each channel is auto-contrasted (napari's "once") when another well
+opens; re-detecting the same well after an edit keeps your contrast.
 
 **Labelling:** turn on label mode (`L`), click a particle and press `1`–`5` (cell, neighbour, merged, debris, noise).
 `Del` removes a label. Where several particles overlap (channels, two thresholds), a menu lists them.
@@ -90,6 +91,11 @@ separated the two better (table below). So splitting is off by default, and you 
 
 **Edits** (Train tab, stored by position in the label library):
 - **Accept proposed split:** for the picked particle.
+- **Watershed picked:** splits the picked particle in two on demand, with or without a proposal. It splits at its
+  deepest dip between significant peaks, or, with a single peak, at the neck of its shape (distance-map watershed).
+  Watershed a piece again to split it further. Pieces under 10 % of the particle join their neighbour. The dividing
+  line is stored and applied like a drawn cut. Splitting at every dip instead gave 4–21 pieces on noisy ROMK
+  particles, which is why it splits only once.
 - **Draw cut** (`X`): drag a line across a particle, then Apply. The cut applies to every channel and both
   thresholds. It is drawn 3 px wide (so a diagonal line also separates), and the cut pixels go back to the nearest
   piece.
@@ -97,6 +103,13 @@ separated the two better (table below). So splitting is off by default, and you 
   either touch or come from one object, so merge mainly undoes a split. Pieces of one cell that don't touch are
   joined by the reconstruction anyway.
 - **Clear edits in this well.**
+
+**Cuts hold in the reconstruction.** The lines of hand cuts, watersheds and applied splits are walls that no cell
+body crosses. Seed pieces of one edited object are never joined into one cell, whether by the no-dip rule or the
+`cell_gap_um` join. Earlier, the two pieces of a cut fused back into one cell. The wall pixels go back to the cell
+beside them. A piece cut off outside the hole stays as a visible, clickable neighbour: it takes no label but can be
+merged back. Before, it was dropped and vanished from the view. Whether each piece seeds a cell is still the model's
+call: a piece classified neighbour or noise starts no cell. Wells without edits are unchanged (639/639 calls on ROMK).
 
 **After each edit** that well is detected again from the cache, which is float32 so the result equals a full Detect.
 If the run was classified, the well is also classified again; its identity uses the stored per-channel calibration,
@@ -134,21 +147,37 @@ Labelling a particle overrides its tag; the classifier learns only from hand lab
 
 ## Which images are read
 
-The analysis window is always ±2.2 hole radii (`work_R`) around the hole:
-- **Hole crop:** the pipeline's hole crop (`<well>_roi_hole_crop_channels.tif`) is used directly, trimmed to the
-  window, when three things hold:
-  - its position in the frame is known (`selections` table);
-  - it covers the whole window;
-  - the database stores thresholds and backgrounds.
-- **Whole frame:** otherwise the window is cut from `<well>_whole_channels.tif`. This is the case for older runs: the
-  older runs have crops but no crop positions and no stored thresholds.
+Detect works on the **whole hole crop** the pipeline wrote (`<well>_roi_hole_crop_channels.tif`, e.g. 511 × 513 px
+on PNC) when three things hold:
+- its position in the frame is known (`selections` table);
+- it covers the analysis window;
+- the database stores thresholds and backgrounds.
 
-Either way the window size stays the same, so the features stay comparable to the trained model.
+Otherwise (older runs: crops but no crop positions and no stored thresholds) it works on ±`view_R` (default 6) hole
+radii of `<well>_whole_channels.tif`.
 
-**What the viewer shows is larger:** ±`view_R` (default 6) hole radii, read when a well is opened from the same TIF
-the window came from (the pipeline's hole crop, e.g. 511 × 513 px on PNC). All overlays sit on the analysis window
-inside it. On PNC the pixels are on the pipeline's 2× binned grid (0.427 µm; the hole is ~44 px across). That is the
-pipeline's `Binning` step, not this tool. Only an unbinned run gives more pixels.
+**The analysis window stays ±2.2 hole radii** (`work_R`) around the hole. Particles in the hole are measured clipped to
+it, the context statistics count only the window's objects, and the reconstruction runs on it. So the model's
+features do not depend on how much of the crop is detected: on ROMK and PNC every hole particle has identical features
+and classes, and all 639 ROMK calls are unchanged.
+
+**Every other cell of the crop is a neighbour by position** (`outer`). It is outlined (stringent threshold, with the
+context toggle), can be clicked, cut, watershed or merged, but is not classified and takes no label: the classifier
+only judges particles that reach into the hole.
+
+**The cache holds no pixels** for wells read from a TIF of the run. It keeps the hole, the particle label maps,
+thresholds, backgrounds and where the pixels are. Opening or re-detecting a well reads its area back from the crop
+TIF (memory-mapped, bit-identical to Detect). On PNC that is ~16 KB per well instead of ~4.5 MB (19 wells: 0.3 MB vs
+83 MB; about 50 MB for the whole run of 3,071 wells). Detect takes 16 s for 19 wells, well switching about 0.6 s and
+an edit plus re-detect about 1.2 s over Z:. The TIFs must be reachable from the computer that opens the results
+(Settings → path map if they sit under another drive letter or mount). Viewer-export crops (the ROMK set) have no TIF
+to go back to and keep their pixels in the cache.
+
+Results detected before keep their small window and show ±`view_R` read from the TIF around it; run Detect again to
+get the whole crop.
+
+On PNC the pixels are on the pipeline's 2× binned grid (0.427 µm; the hole is ~44 px across). That is the pipeline's
+`Binning` step, not this tool. Only an unbinned run gives more pixels.
 
 ## Command line
 

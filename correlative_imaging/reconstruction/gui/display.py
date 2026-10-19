@@ -1,9 +1,10 @@
 """One well in the napari canvas.
 
-Layers (created once, then their data is swapped per well; visibility and contrast stay as you set them):
+Layers (created once, then their data is swapped per well; visibility stays as you set it, and each channel is
+auto-contrasted (napari's "once") when another well opens; re-detecting the same well keeps your contrast):
   BF                    brightfield planes (raw min-max), hidden by default; several planes -> slider
-  (images show +- `view_R` hole radii read from the run's own crop / frame TIF; every overlay below sits on the
-   analysis window (+- `work_R`) inside that view)
+  (images show the detected area: the whole hole crop, or +- `view_R` hole radii of the frame; results detected
+   before that show +- `view_R` read from the run's TIF around their smaller window)
   <channel>             fluorescence, additive, the run's colour for that channel
   <channel> outlines    particle edges of that channel in the channel's colour (a pixel image, fast to swap):
                         stringent threshold solid, lenient (hole) threshold dashed. Shown and hidden together with
@@ -66,11 +67,12 @@ class WellDisplay:
         return self.PREFIX + s
 
     def _read_view(self, wd, cfg):
-        """A larger view around the hole from the run's own TIF (crop or whole frame), if it can be read.
+        """Results detected before the whole crop was detected (a box inside a larger area marks the new ones):
+        a larger view around the hole from the run's own TIF (crop or whole frame), if it can be read.
         Returns (fluorescence list in wd.names order, [(label, BF plane)], (row, col) frame origin) or None."""
         src = wd.view_src or {}
         f = src.get("file")
-        if not f or cfg.view_R <= cfg.work_R:
+        if not f or cfg.view_R <= cfg.work_R or wd.box is not None:
             return None
         from pathlib import Path
         if not Path(f).exists():
@@ -172,6 +174,8 @@ class WellDisplay:
             fl_v, bf_v, delta = list(wd.chans), wd.bf, (0, 0)
         shown = fl_v[0].shape if fl_v else wd.hole.shape
         shape_changed = self.current is None or self.current.get("shown") != shown
+        new_well = self.current is None or (self.current["plate_id"], self.current["well_id"]) != (wd.plate_id,
+                                                                                                    wd.well_id)
         self.current = dict(plate_id=wd.plate_id, well_id=wd.well_id, wd=wd, maps=maps, P=P, scale=scale,
                             delta=delta, shown=shown)
         self.picked = None
@@ -188,6 +192,8 @@ class WellDisplay:
             self.L["bf"].contrast_limits = (float(bf.min()), float(bf.max()) or 1.0)
         for k, ch in enumerate(wd.names):
             self.L[f"img:{ch}"].data = fl_v[k]
+            if new_well:
+                self.L[f"img:{ch}"].reset_contrast_limits()      # = the layer's auto-contrast "once" button
             self.L[f"out:{ch}"].data = self._outline_raster(wd, maps, P, ch)
         from skimage.segmentation import find_boundaries
         self.L["hole"].data = find_boundaries(wd.hole, mode="inner").astype(np.uint8)
@@ -219,7 +225,7 @@ class WellDisplay:
                 continue
             g = d[d.level == level]
             if not self.show_context:
-                g = g[g.pool]
+                g = g[g.pool | (g.n_parts > 1 if "n_parts" in g else False)]     # cut-off pieces always show
             if not self.show_noise:
                 cls = g["pclass"] if "pclass" in g else g.get("dclass")
                 if cls is not None:
@@ -282,7 +288,8 @@ class WellDisplay:
 
     # -- picking
     def particles_at(self, world_pos) -> pd.DataFrame:
-        """Pool particles whose mask contains the clicked pixel (any channel, both thresholds)."""
+        """Particles whose mask contains the clicked pixel (any channel, both thresholds, anywhere in the area);
+        particles in the hole first."""
         if self.current is None:
             return pd.DataFrame()
         s, dl = self.current["scale"], self.current.get("delta", (0, 0))
@@ -295,10 +302,10 @@ class WellDisplay:
         for (lev, ch), L in maps.items():
             v = int(L[y, x])
             if v:
-                m = P[(P.level == lev) & (P.ch == ch) & (P.lab == v) & P.pool]
+                m = P[(P.level == lev) & (P.ch == ch) & (P.lab == v)]
                 if len(m):
                     hits.append(m.index[0])
-        return P.loc[hits]
+        return P.loc[hits].sort_values("pool", ascending=False, kind="stable")
 
     def select(self, row: pd.Series | None):
         self.picked = row

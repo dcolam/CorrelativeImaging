@@ -49,8 +49,9 @@ SETTINGS = {
                       "unpatched cell (the brightness unit)", "locked"),
     "smooth_px": ("smoothing (px)", "light smoothing for peaks and growth (measurements are unsmoothed)", "locked"),
     "peak_h": ("peak height (hole-noise SDs)", "a peak must rise this far above its surroundings", "locked"),
-    "view_R": ("view around the hole (hole radii)", "how much of the run's own crop / frame the viewer shows; display "
-               "only (the analysis window stays fixed)", "local"),
+    "view_R": ("area without a hole crop (hole radii)", "runs whose hole crop cannot be used: how much of the whole "
+               "frame Detect covers and shows (with a crop, all of it). Cells out there are neighbours; the model's "
+               "features stay on the analysis window", "local"),
     "path_map": ("path map (JSON)", 'stored path prefix -> local prefix, e.g. {"Z:\\\\": "/mnt/z/"}', "local"),
 }
 
@@ -610,12 +611,19 @@ class TrainTab(QWidget):
 
         v.addWidget(section("Edit particles"))
         v.addWidget(hint("Dashed orange lines are splits Detect proposes at signal dips (not applied). Accept one for "
-                         "the picked particle, draw your own cut (X, then drag a line across the particle; several "
-                         "lines are fine, then Apply), or merge the picked particle with a touching piece. Edits are "
+                         "the picked particle, watershed it on demand, draw your own cut (X, then drag a line across the "
+                         "particle; several lines are fine, then Apply), or merge the picked particle with a touching "
+                         "piece. Cuts and watersheds hold in the reconstruction too: their pieces never re-join into "
+                         "one cell, and a piece cut off outside the hole stays visible as a neighbour. Edits are "
                          "stored by position in the label library and re-detect this well right away."))
         g = QGridLayout()
         self.b_accept = QPushButton("Accept proposed split")
         self.b_accept.clicked.connect(app.accept_split)
+        self.b_ws = QPushButton("Watershed picked")
+        self.b_ws.setToolTip("split the picked particle in two: at its deepest dip between peaks, or, with one peak, "
+                             "at the neck of its shape. Watershed a piece again to split further. Acts like a drawn "
+                             "cut (every channel, both thresholds)")
+        self.b_ws.clicked.connect(app.watershed)
         self.b_cut = QPushButton("Draw cut  (X)")
         self.b_cut.setCheckable(True)
         self.b_cut.toggled.connect(app.draw_cut)
@@ -628,7 +636,7 @@ class TrainTab(QWidget):
         self.b_merge.toggled.connect(app.merge_mode)
         self.b_clear_edits = QPushButton("Clear edits in this well")
         self.b_clear_edits.clicked.connect(app.clear_edits)
-        for i, b in enumerate([self.b_accept, self.b_cut, self.b_apply_cut, self.b_merge, self.b_clear_edits]):
+        for i, b in enumerate([self.b_accept, self.b_ws, self.b_cut, self.b_apply_cut, self.b_merge, self.b_clear_edits]):
             g.addWidget(b, i // 3, i % 3)
         v.addLayout(g)
 

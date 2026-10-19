@@ -48,21 +48,68 @@ def _key(plate_id, well_id):
 # ---------------------------------------------------------------------------------------------------------------
 # cache
 
+_PATH_MAP: dict = {}
+
+
+def set_path_map(path_map: dict | None):
+    """Stored path prefix -> local prefix (e.g. {"Z:\\": "/mnt/z/"}), for reading the run's TIFs back from the cache."""
+    _PATH_MAP.clear()
+    _PATH_MAP.update(path_map or {})
+
+
+def _local_file(f: str) -> Path:
+    from pathlib import PureWindowsPath
+    if Path(f).exists():
+        return Path(f)
+    for win, loc in _PATH_MAP.items():
+        if f.startswith(win):
+            return Path(loc) / PureWindowsPath(f[len(win):]).as_posix()
+    return Path(f)
+
+
 def save_cache(out: Path, wd: WellData, maps: dict):
+    """Per well: hole, label maps, thresholds, backgrounds and where the pixels are. A well read from a TIF of the
+    run (the hole crop or the whole frame) stores no pixels: they are read back from that TIF (`view_src`), so the
+    cache stays small (~0.01 MB per well instead of ~4.5 MB for a whole PNC crop). Other sources keep their pixels."""
     d = out / "cache"
     d.mkdir(parents=True, exist_ok=True)
-    arrs = dict(chans=wd.chans.astype(np.float32), hole=wd.hole, names=np.array(wd.names),
-                bf=np.stack([a for _, a in wd.bf]).astype(np.float16) if wd.bf else np.zeros((0,) + wd.hole.shape, np.float16),
+    src = wd.view_src or {}
+    from_tif = bool(src.get("file"))
+    arrs = dict(hole=wd.hole, names=np.array(wd.names),
                 bf_labels=np.array([l for l, _ in wd.bf] or [""]), offset=np.array(wd.offset), px_um=wd.px_um,
                 thr=json.dumps({f"{k[0]}|{k[1]}": v for k, v in wd.thr.items()}), bg=json.dumps(wd.bg),
-                view_src=json.dumps(wd.view_src or {}))
+                view_src=json.dumps(src), box=np.array(wd.box if wd.box else [-1]),
+                pixels=np.array("tif" if from_tif else "cache"))
+    if not from_tif:
+        arrs["chans"] = wd.chans.astype(np.float32)
+        arrs["bf"] = np.stack([a for _, a in wd.bf]).astype(np.float16) if wd.bf else \
+            np.zeros((0,) + wd.hole.shape, np.float16)
     for (lev, ch), L in maps.items():
         arrs[f"map|{lev}|{ch}"] = L.astype(np.uint16 if L.max() < 65535 else np.int32)
     np.savez_compressed(d / f"{_key(wd.plate_id, wd.well_id)}.npz", **arrs)
 
 
+def _read_pixels(src: dict, offset: tuple, shape: tuple):
+    """The well's area from the run's TIF: (fluorescence (C, H, W) float32 in channel order, [(label, BF plane)])."""
+    import tifffile
+    f = _local_file(src["file"])
+    if not f.exists():
+        raise FileNotFoundError(f"the run's image is not reachable: {src['file']} (Settings: path map)")
+    y0, x0 = offset[0] - src["r0"], offset[1] - src["c0"]
+    sl = (slice(y0, y0 + shape[0]), slice(x0, x0 + shape[1]))
+    try:
+        arr = tifffile.memmap(str(f), mode="r")
+    except Exception:                                   # compressed / not memory-mappable: read it all
+        arr = tifffile.imread(str(f))
+    arr = arr.reshape((-1,) + arr.shape[-2:])
+    fl = np.stack([np.asarray(arr[k][sl], np.float32) for k in src["fl"]])
+    bf = [(lab, np.asarray(arr[k][sl], np.float32)) for lab, k in zip(src.get("bf_labels", []), src.get("bf", []))]
+    return fl, bf
+
+
 def load_cache(out: Path, plate_id: str, well_id: str):
-    """Returns (WellData, maps) from the cache, or None."""
+    """Returns (WellData, maps) from the cache, or None. Pixels come from the run's TIF when the cache holds none
+    (FileNotFoundError if that TIF cannot be reached)."""
     f = Path(out) / "cache" / f"{_key(plate_id, well_id)}.npz"
     if not f.exists():
         return None
@@ -70,11 +117,18 @@ def load_cache(out: Path, plate_id: str, well_id: str):
     names = [str(n) for n in z["names"]]
     thr = {tuple(k.split("|")): v for k, v in json.loads(str(z["thr"])).items()}
     bg = {k: tuple(v) for k, v in json.loads(str(z["bg"])).items()}
-    bf_labels = [str(l) for l in z["bf_labels"]]
-    bf = [(l, z["bf"][i].astype(np.float32)) for i, l in enumerate(bf_labels) if i < len(z["bf"])]
     view = json.loads(str(z["view_src"])) if "view_src" in z.files else {}
-    wd = WellData(plate_id, well_id, float(z["px_um"]), z["chans"].astype(np.float32), names, z["hole"], thr, bg, bf,
-                  tuple(int(v) for v in z["offset"]), view_src=view or None)
+    box = tuple(int(v) for v in z["box"]) if "box" in z.files and len(z["box"]) == 4 else None
+    offset = tuple(int(v) for v in z["offset"])
+    hole = z["hole"]
+    if "chans" in z.files:
+        bf_labels = [str(l) for l in z["bf_labels"]]
+        bf = [(l, z["bf"][i].astype(np.float32)) for i, l in enumerate(bf_labels) if i < len(z["bf"])]
+        chans = z["chans"].astype(np.float32)
+    else:
+        chans, bf = _read_pixels(view, offset, hole.shape)
+    wd = WellData(plate_id, well_id, float(z["px_um"]), chans, names, hole, thr, bg, bf, offset,
+                  view_src=view or None, box=box)
     maps = {(k.split("|")[1], k.split("|")[2]): z[k].astype(np.int32) for k in z.files if k.startswith("map|")}
     return wd, maps
 
@@ -221,6 +275,7 @@ def classify_run(out_dir, cfg: Config | None = None, model=None, workers: int = 
     res = Results(out_dir)
     out = res.dir
     cfg = cfg or res.config
+    _PATH_MAP.update(cfg.path_map or {})
     t0 = time.time()
     if model is None:
         mp = cfg.model_path()
@@ -242,7 +297,8 @@ def classify_run(out_dir, cfg: Config | None = None, model=None, workers: int = 
     body = identity_ch or names
     groups = {k: g for k, g in F.groupby(["plate_id", "well_id"])}
     Wi = res.wells.set_index(["plate_id", "well_id"])
-    rows = list(res.wells[["plate_id", "well_id"]].itertuples(index=False))
+    # a fixed order (edited wells are appended to the tables): the identity fit must not depend on edit history
+    rows = list(res.wells[["plate_id", "well_id"]].sort_values(["plate_id", "well_id"]).itertuples(index=False))
     (out / "recon").mkdir(exist_ok=True)
 
     def one(pw):
@@ -300,6 +356,7 @@ def redetect_well(out_dir, plate_id: str, well_id: str, edits: dict | None, cfg:
     res = Results(out_dir)
     out = res.dir
     cfg = cfg or res.config
+    _PATH_MAP.update(cfg.path_map or {})
     got = load_cache(out, plate_id, well_id)
     if got is None:
         raise ValueError(f"{plate_id} {well_id}: not in the cache")

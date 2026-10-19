@@ -103,7 +103,8 @@ def build_features(p: pd.DataFrame, wells: pd.DataFrame, ref: pd.DataFrame, chan
     p["fd2"] = field_likeness(lsig_full, larea_full, p.circ, p.solidity, rr)
 
     # parent (whole stringent object behind a lenient piece): its share and its field-likeness
-    by_oid = p.set_index(["plate_id", "well_id", "oid"])
+    outer = p.outer.fillna(False).to_numpy(bool) if "outer" in p else np.zeros(len(p), bool)
+    by_oid = p[~outer].set_index(["plate_id", "well_id", "oid"])     # cells far out in the crop are no parents
     pk = list(zip(p.plate_id, p.well_id, p.parent))
     par = by_oid.reindex(pk)
     p["f_parent_share"] = par.get("share", pd.Series(np.nan, index=par.index)).to_numpy(float)
@@ -111,8 +112,9 @@ def build_features(p: pd.DataFrame, wells: pd.DataFrame, ref: pd.DataFrame, chan
     p["f_field_d2"] = np.log1p(np.where(np.isfinite(pd2), pd2, p.fd2))
 
     # context: brightness relative to the window's objects of that channel, object density
-    whole = p[p.level == "whole"]
-    s_whole = pd.Series(sig_full, index=p.index)[p.level == "whole"]
+    ctx = (p.level == "whole").to_numpy() & ~outer                  # the window's objects, as the model knows them
+    whole = p[ctx]
+    s_whole = pd.Series(sig_full, index=p.index)[ctx]
     med = s_whole.groupby([p.plate_id[s_whole.index], p.well_id[s_whole.index], p.ch[s_whole.index]]).median()
     m = med.reindex(list(zip(p.plate_id, p.well_id, p.ch))).to_numpy(float)
     p["f_rel_ctx"] = np.log10(np.clip((mean_in - bg) / np.where(m > 0, m, np.nan), _EPS, None))

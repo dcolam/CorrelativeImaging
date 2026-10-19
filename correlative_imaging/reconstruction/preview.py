@@ -40,7 +40,7 @@ NOISE_REL = 0.05       # or below 5 % of a typical cell of that channel
 def provisional_classes(F: pd.DataFrame) -> pd.Series:
     """F: build_features output (pool + context). Returns dclass for pool particles (None for context objects)."""
     pool = F.pool.to_numpy(bool)
-    by = F.set_index(["plate_id", "well_id", "oid"])
+    by = (F[~F.outer.fillna(False).astype(bool)] if "outer" in F else F).set_index(["plate_id", "well_id", "oid"])
     par = by.reindex(list(zip(F.plate_id, F.well_id, F.parent)))
     par_rel = par.rel_full.to_numpy(float)
     par_d2 = par.field_d2.to_numpy(float)

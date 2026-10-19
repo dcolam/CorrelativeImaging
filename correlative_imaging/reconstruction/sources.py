@@ -1,7 +1,8 @@
 """Where wells come from. Everything else works on :class:`WellData`, never on files.
 
-RunSource       a finished CorrelativeImaging run (all plate databases sharing one run tag). Per well it reads, in
-                order of preference:
+RunSource       a finished CorrelativeImaging run (all plate databases sharing one run tag). Per well it detects on
+                the whole hole crop the pipeline wrote (or +- `view_R` hole radii of the whole frame); the
+                analysis window (+- `work_R`) inside it is `WellData.box`. It reads, in order of preference:
                   1. ``diagnostics/<well>_whole_channels.tif`` (the last pre-threshold image of the whole frame, + BF):
                      thresholds and background can then be computed exactly as the pipeline does when the database
                      does not store them (older runs);
@@ -49,7 +50,8 @@ class WellData:
     plate_id: str
     well_id: str
     px_um: float
-    chans: np.ndarray                 # (C, H, W) fluorescence of the analysis window, order = names
+    chans: np.ndarray                 # (C, H, W) fluorescence of the detected area (the whole hole crop, or
+                                      # +- view_R hole radii of the frame), order = names
     names: list                       # channel keys (raw names, e.g. "488nm")
     hole: np.ndarray                  # (H, W) bool
     thr: dict                         # ("whole" | "hole", ch) -> threshold
@@ -58,7 +60,15 @@ class WellData:
     offset: tuple = (0, 0)            # window origin in the frame (row, col)
     frame_shape: tuple | None = None  # shape of the full frame, if known
     notes: list = field(default_factory=list)   # how thresholds / background were obtained
-    view_src: dict | None = None      # image file the window came from (display: a larger view around the hole)
+    view_src: dict | None = None      # image file the area came from (older caches: a larger view for display)
+    box: tuple | None = None          # analysis window (r0, r1, c0, c1) inside the area: +- work_R hole radii.
+                                      # Particles in the hole are measured clipped to it (the model's features);
+                                      # None = the whole area
+
+    @property
+    def box_slices(self) -> tuple:
+        r0, r1, c0, c1 = self.box or (0, self.hole.shape[0], 0, self.hole.shape[1])
+        return slice(r0, r1), slice(c0, c1)
 
     @property
     def R_px(self) -> float:
@@ -209,8 +219,8 @@ class RunSource:
         return sorted(self.meta.plate_id.unique())
 
     def load(self, plate_id: str, well_id: str) -> WellData | None:
-        """Prefers the hole crop the pipeline already wrote (``<well>_roi_hole_crop_channels.tif``), trimmed to the
-        analysis window, when its origin is known (``selections``), it covers the whole window and the database
+        """Prefers the hole crop the pipeline already wrote (``<well>_roi_hole_crop_channels.tif``), all of it,
+        when its origin is known (``selections``), it covers the whole window and the database
         stores thresholds and backgrounds. Otherwise the window is cut from ``<well>_whole_channels.tif`` (needed for
         older runs: no crop origin, thresholds/background recomputed on the full frame)."""
         import tifffile
@@ -243,7 +253,7 @@ class RunSource:
             o = (int(r.crop_row0), int(r.crop_col0))
             if o[0] <= w0 and o[1] <= v0 and o[0] + h_ >= w1 and o[1] + w_ >= v1:
                 image, origin, frame_shape = crop, o, fs
-                notes.append("window from the hole crop")
+                notes.append("the whole hole crop")
             else:
                 notes.append("hole crop smaller than the window: window from the whole frame")
         if image is None and whole.exists():
@@ -297,14 +307,20 @@ class RunSource:
                 b = (float(out.mean()), float(out.std()))
                 notes.append(f"{ch}: background computed outside particles{'' if on_frame else ' of the crop'}")
             bg[ch] = (float(b[0]), float(b[1]))
-        r0, r1, c0, c1 = _window(hole_f, cfg.work_R)
+        # detected area: the whole hole crop, or +- view_R of the whole frame; the analysis window inside it
+        if image == whole:
+            r0, r1, c0, c1 = _window(hole_f, max(cfg.view_R, cfg.work_R))
+        else:
+            r0, r1, c0, c1 = 0, H, 0, W
         cut = (slice(r0, r1), slice(c0, c1))
+        b0, b1, d0, d1 = _window(hole_f, cfg.work_R)
+        box = (b0 - r0, b1 - r0, d0 - c0, d1 - c0)
         bf_idx = [k for k in range(stack.shape[0]) if k not in fl and (k >= len(labels) or labels[k] not in r.channels_db)]
         view = dict(file=str(image), r0=int(origin[0]), c0=int(origin[1]), fl=[int(k) for k in fl],
                     bf=[int(k) for k in bf_idx], bf_labels=[labels[k] if k < len(labels) else f"BF {k}" for k in bf_idx])
         return WellData(plate_id, well_id, float(r.px_um), np.ascontiguousarray(fluo[(slice(None),) + cut]), names,
                         hole_f[cut].copy(), thr, bg, [(lab, a[cut].copy()) for lab, a in bf],
-                        (origin[0] + r0, origin[1] + c0), frame_shape, notes, view)
+                        (origin[0] + r0, origin[1] + c0), frame_shape, notes, view, box)
 
     def field_table(self) -> pd.DataFrame:
         return pd.concat([field_from_db(db, pl, self.cfg.field_min_um2) for pl, db in self._db.items()],

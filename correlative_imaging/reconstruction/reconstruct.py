@@ -21,6 +21,10 @@ Signal  S = max over the identity channels of the lightly smoothed image in hole
            `grow_max_x_hole` x the hole: the relative cut is raised in steps of 0.1.
 
 With `split_dips` off, step 2 joins all adjacent basins of the same type (connected bright areas stay whole).
+
+Hand edits are kept: the lines of hand cuts and applied splits (Detect's splits raster, 1 and 2) are walls no basin
+crosses, and seed pieces of one edited object never end up in the same cell (none of the joins above unites them).
+The wall pixels go back to the cell on their side afterwards.
 """
 from __future__ import annotations
 
@@ -35,8 +39,19 @@ from .config import Config
 
 
 class _UF:
-    def __init__(self, n):
+    """Union-find; with `parts` (basin -> set of piece ids) and `conflicts` ({frozenset(id1, id2)}) a union that would
+    put two conflicting pieces into one group is refused."""
+
+    def __init__(self, n, parts: dict | None = None, conflicts: set | None = None):
         self.p = list(range(n))
+        self.parts = {i: set(parts.get(i, ())) for i in range(n)} if parts else None
+        self.conflicts = conflicts or set()
+
+    def can(self, a, b) -> bool:
+        if not self.parts or not self.conflicts:
+            return True
+        pa, pb = self.parts[self.find(a)], self.parts[self.find(b)]
+        return not any(frozenset((x, y)) in self.conflicts for x in pa for y in pb)
 
     def find(self, a):
         while self.p[a] != a:
@@ -44,10 +59,16 @@ class _UF:
             a = self.p[a]
         return a
 
-    def union(self, a, b):
+    def union(self, a, b) -> bool:
         a, b = self.find(a), self.find(b)
-        if a != b:
-            self.p[max(a, b)] = min(a, b)
+        if a == b:
+            return True
+        if not self.can(a, b):
+            return False
+        self.p[max(a, b)] = min(a, b)
+        if self.parts:
+            self.parts[min(a, b)] |= self.parts[max(a, b)]
+        return True
 
 
 def signal_map(sm: np.ndarray, names: list, body: list, hbg: dict) -> np.ndarray:
@@ -90,9 +111,16 @@ def basins(S: np.ndarray, floor: float, h: float, seeds: list[np.ndarray]):
 
 
 def reconstruct_well(S: np.ndarray, hole: np.ndarray, px_um: float, seed_mask: np.ndarray, nb_mask: np.ndarray,
-                     barrier: np.ndarray, cfg: Config):
+                     barrier: np.ndarray, cfg: Config, walls: np.ndarray | None = None, parts: np.ndarray | None = None,
+                     conflicts: set | None = None):
     """Core, on arrays (testable): S signal (noise units), hole, seed / neighbour / barrier masks.
+    walls: hand-edit lines (barriers whose pixels go back to the cell beside them); parts: piece id per seed pixel
+    (0 = none) with `conflicts` {frozenset(id1, id2)}: pieces that must stay in different cells.
     Returns (cells: list of dicts with 'mask', group label image G (cells 1..n, neighbours -1..-m))."""
+    if walls is not None and walls.any():
+        barrier = barrier | walls
+    else:
+        walls = None
     S = np.where(barrier, -np.inf, S).astype(float)
     S_f = np.where(np.isfinite(S), S, cfg.grow_floor - 1)
     seed_comps = [label(seed_mask & ~barrier) == k for k in range(1, label(seed_mask & ~barrier).max() + 1)]
@@ -108,14 +136,21 @@ def reconstruct_well(S: np.ndarray, hole: np.ndarray, px_um: float, seed_mask: n
     typ = np.where((n_seed > 0) & (n_seed >= n_nb), 1, np.where(n_nb > 0, -1, 0))   # 1 cell, -1 neighbour, 0 free
     sad = saddles(B, S_f)
     joined = lambda a, b, s: (not cfg.split_dips) or s / max(min(peak[a - 1], peak[b - 1]), 1e-6) >= cfg.dip_ratio
-    uf = _UF(n + 1)
+    bparts = {}
+    if parts is not None and conflicts:
+        pm = (parts > 0) & (B > 0)
+        if pm.any():
+            cnt = pd.DataFrame(dict(b=B[pm], p=parts[pm])).value_counts()
+            tot = cnt.groupby(level=0).sum()
+            for (b, pid), c in cnt.items():
+                if c >= 0.2 * tot[b]:                       # pieces that make up a real share of the basin's seed
+                    bparts.setdefault(int(b), set()).add(int(pid))
+    uf = _UF(n + 1, bparts, conflicts)
     n_dips = np.zeros(n + 1, int)
     # typed-typed of the same type
-    for (a, b), s in sad.items():
+    for (a, b), s in sorted(sad.items(), key=lambda t: -t[1]):
         if typ[a - 1] == typ[b - 1] != 0:
-            if joined(a, b, s):
-                uf.union(a, b)
-            else:
+            if not (joined(a, b, s) and uf.union(a, b)):          # a dip, or two pieces kept apart by hand
                 n_dips[a] += 1
                 n_dips[b] += 1
     # free basins: to the typed basin with the highest saddle among those reached without a dip, in rounds
@@ -125,13 +160,14 @@ def reconstruct_well(S: np.ndarray, hole: np.ndarray, px_um: float, seed_mask: n
             for f, t in ((a, b), (b, a)):
                 rt = uf.find(t)
                 tt = typ[rt - 1] if typ[t - 1] == 0 else typ[t - 1]
-                if typ[f - 1] == 0 and uf.find(f) == f and tt != 0 and joined(f, t, s):
+                if typ[f - 1] == 0 and uf.find(f) == f and tt != 0 and joined(f, t, s) and uf.can(f, t):
                     if s > best.get(f, (-np.inf, 0))[0]:
                         best[f] = (s, t)
         if not best:
             break
         for f, (s, t) in best.items():
-            uf.union(f, t)
+            if not uf.union(f, t):
+                continue
             typ[f - 1] = typ[uf.find(t) - 1] if typ[uf.find(t) - 1] != 0 else typ[t - 1]
     root = np.array([uf.find(i) for i in range(n + 1)])
     G0 = root[B]
@@ -182,6 +218,18 @@ def reconstruct_well(S: np.ndarray, hole: np.ndarray, px_um: float, seed_mask: n
                           peak_S=float(S_f[m].max())))
     for k, c in enumerate(cells, start=1):
         G[c["mask"]] = k
+    if walls is not None and cells:
+        # wall pixels inside a seed go back to the nearest cell (bodies do not keep a gap where the line was drawn)
+        back = walls & seed_mask & (G == 0)
+        if back.any():
+            _, (iy, ix) = ndi.distance_transform_edt(G <= 0, return_indices=True)
+            near = G[iy, ix]
+            give = back & (near > 0)
+            G[give] = near[give]
+            for k, c in enumerate(cells, start=1):
+                c["mask"] = G == k
+                c["body_px"] = int(c["mask"].sum())
+                c["body_um2"] = float(c["body_px"] * px_um ** 2)
     return cells, G
 
 
@@ -208,9 +256,35 @@ def reconstruct_from_particles(wd, sm: np.ndarray, P: pd.DataFrame, maps: dict, 
                 nb |= m
             elif r.pclass == "debris":
                 barrier |= m & ~seed
-        elif r.level == "whole":
+        elif getattr(r, "outer", False) == True:            # noqa: E712 (NaN on old rows)
+            continue                                    # cells far out in the crop: beyond the window it works on
+        elif r.level == "whole" or getattr(r, "n_parts", 1) > 1:   # context objects and pieces cut off outside
             nb |= m
-    cells, G = reconstruct_well(S, wd.hole, wd.px_um, seed, nb & ~seed, barrier & ~seed, cfg)
+    # hand edits: cut / applied-split lines are walls; pieces of one edited object must stay in different cells
+    sp = maps.get(("splits", ""))
+    walls = None
+    if sp is not None and ((sp == 1) | (sp == 2)).any():
+        walls = (sp == 2) | ndi.binary_dilation(sp == 1)          # split lines are 1 px: widen so 8-neighbours part
+    parts = np.zeros((H, W), np.int32)
+    conflicts = set()
+    if walls is not None:
+        by_origin = {}
+        for i, r in enumerate(seed_rows, start=1):
+            if getattr(r, "n_parts", 1) and getattr(r, "n_parts", 1) > 1 and isinstance(getattr(r, "origin", None), str):
+                parts[(maps[(r.level, r.ch)] == r.lab) & wd.hole & (parts == 0)] = i
+                by_origin.setdefault((r.level, r.ch, r.origin), []).append(i)
+        for ids in by_origin.values():
+            conflicts |= {frozenset((a, b)) for j, a in enumerate(ids) for b in ids[j + 1:]}
+    # on the analysis window (+- work_R), as the model was made for; bodies and G are pasted back into the area
+    b = wd.box_slices if hasattr(wd, "box_slices") else (slice(None), slice(None))
+    cells, Gb = reconstruct_well(S[b], wd.hole[b], wd.px_um, seed[b], (nb & ~seed)[b], (barrier & ~seed)[b], cfg,
+                                 walls=None if walls is None else walls[b], parts=parts[b], conflicts=conflicts)
+    G = np.zeros((H, W), int)
+    G[b] = Gb
+    for c in cells:
+        full = np.zeros((H, W), bool)
+        full[b] = c["mask"]
+        c["mask"] = full
     for k, c in enumerate(cells, start=1):
         mem = []
         for r in seed_rows:

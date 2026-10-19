@@ -62,8 +62,8 @@ class Config:
     min_mixture_sep: float = 2.0  # per-channel mixture separation (Ashman's D) below which the channel is flagged
 
     # --- display ------------------------------------------------------------------------------------------------
-    view_R: float = 6.0           # the viewer shows +- this many hole radii from the run's own crop / frame TIF
-                                  # (display only; the analysis window stays work_R)
+    view_R: float = 6.0           # runs without a usable hole crop: Detect covers +- this many hole radii of the
+                                  # whole frame (with a crop: all of the crop). Features stay on the work_R window.
 
     # --- local --------------------------------------------------------------------------------------------------
     path_map: dict = field(default_factory=dict)   # stored path prefix -> local prefix, e.g. {"Z:\\": "/mnt/z/"}

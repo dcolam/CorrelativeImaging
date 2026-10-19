@@ -1,6 +1,9 @@
 """Changing particles at Detect: automatic splits at signal dips, hand-drawn cuts, and merges.
 
 Order inside detect_well, per label map (channel x threshold level):
+  0 watershed    a particle picked for "Watershed" (one channel and level, by position) is split in two at its
+                 deepest dip (or at the neck of its shape) by :func:`watershed_pieces`; its dividing lines are added to the hand cuts below, so they act like a
+                 drawn cut (every channel, both levels) and are undone the same way.
   1 hand cuts        every cut line (frame coordinates, from the label library) is drawn 3 px wide and removed from
                      the mask, the mask is relabelled, and the cut pixels are given back to the nearest piece (areas do
                      not shrink). A cut applies to every channel and both threshold levels.
@@ -114,6 +117,89 @@ def split_object(mask: np.ndarray, S: np.ndarray, h: float, dip_ratio: float, mi
     for k, r in enumerate(sorted(set(np.unique(G)) - {0}), start=1):
         out[G == r] = k
     return out
+
+
+def watershed_pieces(mask: np.ndarray, S: np.ndarray, h: float, min_px: int) -> np.ndarray:
+    """On-demand split of one object into two, at its deepest dip: watershed basins of S at its significant peaks
+    (h-maxima), small basins (< max(min_px, 10 % of the object)) first join the neighbour they share the highest
+    saddle with, then basins join from the shallowest dip on until two pieces are left. Without two peaks, by shape:
+    watershed of the distance map from its two thickest points (a neck between two round parts). Watershed a piece
+    again to split it further."""
+    pk = h_maxima(np.where(mask, S, S[mask].min() if mask.any() else 0).astype(np.float64), h).astype(bool) & mask
+    markers = label(pk)
+    if markers.max() >= 2:
+        B = watershed(-S, markers, mask=mask)
+        n = int(B.max())
+        peak = np.asarray(ndi.maximum(S, B, np.arange(1, n + 1)), float)
+        sad = _saddles(B, S)
+        parent = list(range(n + 1))
+
+        def find(a):
+            while parent[a] != a:
+                parent[a] = parent[parent[a]]
+                a = parent[a]
+            return a
+
+        def roots():
+            r = np.array([find(i) for i in range(n + 1)])
+            G = r[B] * mask
+            return {int(x): int((G == x).sum()) for x in set(r[1:])}
+        small = max(min_px, int(0.1 * mask.sum()))
+        for _ in range(n):                                       # crumbs join their best neighbour
+            sizes = roots()
+            tiny = [x for x, v in sizes.items() if v < small]
+            if not tiny or len(sizes) < 2:
+                break
+            r = min(tiny, key=lambda x: sizes[x])
+            best = max(((v, b if find(a) == r else a) for (a, b), v in sad.items()
+                        if (find(a) == r) != (find(b) == r)), default=None)
+            if best is None:
+                break
+            parent[r] = find(best[1])
+        # join from the shallowest dip (highest saddle / lower peak) on until two pieces are left
+        for (a, b), v in sorted(sad.items(), key=lambda t: -t[1] / max(min(peak[t[0][0] - 1], peak[t[0][1] - 1]), 1e-6)):
+            if len(roots()) <= 2:
+                break
+            if find(a) != find(b):
+                parent[find(b)] = find(a)
+        sizes = roots()
+        if len(sizes) == 2 and min(sizes.values()) >= small:
+            r = np.array([find(i) for i in range(n + 1)])
+            G = r[B] * mask
+            out = np.zeros(mask.shape, np.int32)
+            for k, x in enumerate(sorted(sizes), start=1):
+                out[G == x] = k
+            return out
+    from skimage.feature import peak_local_max
+    dt = ndi.distance_transform_edt(mask)
+    pk = peak_local_max(dt, min_distance=max(int(dt.max() * 0.5), 2), labels=mask.astype(int), num_peaks=2,
+                        exclude_border=False)
+    if len(pk) < 2:
+        return mask.astype(np.int32)
+    markers = np.zeros(mask.shape, np.int32)
+    for i, (y, x) in enumerate(pk, start=1):
+        markers[y, x] = i
+    out = watershed(-dt, markers, mask=mask).astype(np.int32)
+    sizes = np.bincount(out.ravel())[1:]
+    return out if len(sizes) == 2 and sizes.min() >= max(min_px, int(0.1 * mask.sum())) else mask.astype(np.int32)
+
+
+def watershed_lines(L: np.ndarray, S: np.ndarray, picks: list, h: float, min_px: int) -> tuple[np.ndarray, list]:
+    """picks: (y, x) window positions. Returns (dividing-line mask for the cut list, number of pieces per pick)."""
+    lines = np.zeros(L.shape, bool)
+    n = []
+    for y, x in picks:
+        if not (0 <= y < L.shape[0] and 0 <= x < L.shape[1]) or not L[y, x]:
+            n.append(0)
+            continue
+        sl = ndi.find_objects((L == L[y, x]).astype(np.uint8))[0]
+        m = L[sl] == L[y, x]
+        pieces = watershed_pieces(m, S[sl], h, min_px)
+        n.append(int(pieces.max()))
+        if pieces.max() >= 2:
+            sub = lines[sl]
+            sub |= ndi.binary_dilation(split_lines(pieces, m.astype(np.int32))) & m
+    return lines, n
 
 
 def auto_split(L: np.ndarray, S: np.ndarray, hole: np.ndarray, h: float, dip_ratio: float, min_px: int,
