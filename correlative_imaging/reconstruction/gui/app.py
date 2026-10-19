@@ -115,6 +115,7 @@ class ReconstructionApp:
         self.model = None
         self.model_file = None
         self.trained = None
+        self._merge_from = None
         self.label_mode = False
         self.plate_map = None
         self.bus = _Bus()
@@ -136,6 +137,7 @@ class ReconstructionApp:
             viewer.bind_key(CLASS_KEYS[c], lambda v, c=c: self.set_label(c), overwrite=True)
         viewer.bind_key("Delete", lambda v: self.remove_label(), overwrite=True)
         viewer.bind_key("l", lambda v: self.panel.train.mode.toggle(), overwrite=True)
+        viewer.bind_key("x", lambda v: self.panel.train.b_cut.toggle(), overwrite=True)
         viewer.bind_key("n", lambda v: self.browser.step(1), overwrite=True)
         viewer.bind_key("p", lambda v: self.browser.step(-1), overwrite=True)
         viewer.scale_bar.visible = True
@@ -269,8 +271,10 @@ class ReconstructionApp:
                 items.append((f"{self.cfg.display_name(ch)} has signal in nearly every hole that holds anything: "
                               f"make it a marker (measured, not identity)?", apply))
         if self.model is not None and res is not None:
-            fc = self.model.spec.get("feature_config") or {}
-            diff = [k for k, v in fc.items() if res.config.feature_config().get(k) != v]
+            from ..config import complete_feature_config
+            fc = complete_feature_config(self.model.spec.get("feature_config") or {})
+            diff = [k for k, v in fc.items() if res.config.feature_config().get(k) != v] \
+                if self.model.spec.get("feature_config") else []
             if diff:
                 items.append((f"This run was detected with other feature settings than the model was trained on "
                               f"({', '.join(diff)}). Detect again with the model's settings, or retrain.", None))
@@ -435,7 +439,135 @@ class ReconstructionApp:
         menu.triggered.connect(lambda act: self.pick(hits.loc[act.data()]))
         menu.popup(screen_pos or QCursor.pos())
 
+    # -- particle edits (cuts, accepted splits, merges): stored in the label library, applied by Detect
+    def _inside_point(self, row):
+        """A frame position inside the particle (the centroid can fall outside a concave particle)."""
+        cur = self.display.current
+        pts = np.argwhere(cur["maps"][(row.level, row.ch)] == row.lab)
+        y, x = pts[len(pts) // 2]
+        return float(y + cur["wd"].offset[0]), float(x + cur["wd"].offset[1])
+
+    def _redetect(self, msg: str):
+        from qtpy.QtWidgets import QApplication
+        from qtpy.QtCore import Qt as _Qt
+        from ..pipeline import Results, redetect_well
+        pl, wl = self._current_well
+        edits = self.store.edits(self.res.dataset).get((pl, wl))
+        QApplication.setOverrideCursor(_Qt.WaitCursor)
+        try:
+            redetect_well(self.res.dir, pl, wl, edits, model=self.model)
+            self.res = Results(self.res.dir)
+        except Exception as e:
+            self.say(f"re-detect failed: {e}")
+        finally:
+            QApplication.restoreOverrideCursor()
+        self.refresh()
+        self.show_well(pl, wl)
+        P = self.res.particles
+        n = P[(P.plate_id == pl) & (P.well_id == wl) & P.pool]
+        self.say(f"{msg}: {pl} {wl} re-detected ({len(n)} particles in the hole)" +
+                 ("; calls of this well updated with the stored calibration" if self.res.calls is not None else ""))
+
+    def _need_edit_target(self):
+        if self.res is None or self.store is None or not getattr(self, "_current_well", None):
+            self.say("open results and a well first")
+            return False
+        return True
+
+    def accept_split(self):
+        row = self.display.picked
+        if not self._need_edit_target() or row is None:
+            self.say("pick a particle with a proposed split (dashed orange line) first")
+            return
+        if getattr(row, "n_proposed", 2) < 2:
+            self.say("Detect proposes no split for this particle (no real dip inside it); draw a cut instead")
+            return
+        y, x = self._inside_point(row)
+        self.store.accept_split(self.res.dataset, row.plate_id, row.well_id, row.ch, row.level, y, x)
+        self._redetect("split accepted")
+
+    def draw_cut(self, on: bool):
+        if not self._need_edit_target():
+            self.panel.train.b_cut.setChecked(False)
+            return
+        name = "✂ cut"
+        if on:
+            if name not in self.v.layers:
+                self.v.add_shapes([], shape_type="line", name=name, edge_color="#ffffff", edge_width=1.0,
+                                  scale=self.display.current["scale"])
+            L = self.v.layers[name]
+            self.v.layers.selection.active = L
+            L.mode = "add_line"
+            self.say("draw cut: drag a line across the particle (several are fine), then Apply cuts")
+        else:
+            if name in self.v.layers:
+                self.v.layers[name].mode = "pan_zoom"
+            self._activate_channel()
+
+    def _activate_channel(self):
+        chans = [L for L in self.v.layers if L.name.startswith(self.display.PREFIX) and "channel" in L.metadata]
+        if chans:
+            self.v.layers.selection.active = chans[0]
+
+    def apply_cuts(self):
+        name = "✂ cut"
+        if not self._need_edit_target() or name not in self.v.layers or not len(self.v.layers[name].data):
+            self.say("draw a cut first (Draw cut, then drag across the particle)")
+            return
+        L = self.v.layers[name]
+        oy, ox = self.display.current["wd"].offset
+        pl, wl = self._current_well
+        for line_ in L.data:
+            pts = np.asarray(line_)[:, -2:] + np.array([oy, ox])
+            self.store.add_cut(self.res.dataset, pl, wl, pts.tolist())
+        n = len(L.data)
+        self.v.layers.remove(L)
+        self.panel.train.b_cut.setChecked(False)
+        self._activate_channel()
+        self._redetect(f"{n} cut(s) applied")
+
+    def merge_mode(self, on: bool):
+        if not on:
+            self._merge_from = None
+            return
+        row = self.display.picked
+        if not self._need_edit_target() or row is None:
+            self.say("pick the first particle, then press Merge with…")
+            self.panel.train.b_merge.setChecked(False)
+            return
+        self._merge_from = row
+        if not self.panel.train.mode.isChecked():
+            self.panel.train.mode.setChecked(True)
+        self.say("now click the piece to join it with (same channel and threshold, touching or same object)")
+
+    def _do_merge(self, a, b):
+        self.panel.train.b_merge.setChecked(False)
+        if a.ch != b.ch or a.level != b.level:
+            self.say("merge needs two particles of the same channel and threshold")
+            return
+        if a.origin != b.origin:
+            Lm = self.display.current["maps"][(a.level, a.ch)]
+            from scipy import ndimage as ndi
+            if not (ndi.binary_dilation(Lm == a.lab) & (Lm == b.lab)).any():
+                self.say("these particles neither touch nor come from the same object: not merged "
+                         "(pieces of one cell that do not touch are joined by the reconstruction anyway)")
+                return
+        p1, p2 = self._inside_point(a), self._inside_point(b)
+        self.store.add_merge(self.res.dataset, a.plate_id, a.well_id, a.ch, a.level, p1, p2)
+        self._redetect("merged")
+
+    def clear_edits(self):
+        if not self._need_edit_target():
+            return
+        pl, wl = self._current_well
+        self.store.clear_edits(self.res.dataset, pl, wl)
+        self._redetect("edits cleared")
+
     def pick(self, row):
+        if getattr(self, "_merge_from", None) is not None and row is not None and row.oid != self._merge_from.oid:
+            a, self._merge_from = self._merge_from, None
+            self._do_merge(a, row)
+            return
         self.display.select(row)
         if row is None:
             self.panel.train.picked.setText("no particle picked")
@@ -447,7 +579,10 @@ class ReconstructionApp:
             hand = m.label.iloc[0] if len(m) else ""
         ps = " ".join(chip(f"{c} {row.get('p_' + c, np.nan):.2f}", CLASS_COLORS[c]) for c in CLASSES
                       if f"p_{c}" in row)
+        prop = int(row.get("n_proposed", 1) or 1) if hasattr(row, "get") else 1
+        self.panel.train.b_accept.setEnabled(prop > 1)
         self.panel.train.picked.setText(
+            (f"<i>Detect proposes splitting this particle into {prop} pieces</i><br>" if prop > 1 else "") +
             f"<b>{self.cfg.display_name(row.ch)}</b> · {'lenient' if row.level == 'hole' else 'stringent'} · "
             f"{row.in_um2:.1f} µm² inside · share {row.share:.2f} · SNR {row.snr:.1f}<br>{ps}"
             + (f"<br>hand label: {chip(hand, CLASS_COLORS[hand])}" if hand else ""))
@@ -550,9 +685,12 @@ class ReconstructionApp:
                 return
             spec = dict(kind="run", root=root, run_tag=tag)
 
+            store = self.store
+
             def job():
                 src = source_from_spec(spec, cfg)
-                detect_run(src, cfg, out, wells, progress=prog, source_spec=spec)
+                edits = store.edits(getattr(src, "dataset", "")) if store is not None else None
+                detect_run(src, cfg, out, wells, progress=prog, source_spec=spec, edits=edits)
                 if stage == "all":
                     if self.model is None and not (cfg.model_path() and cfg.model_path().exists()):
                         prog(0, 0, "detected; no model yet: label particles and train, then Classify")

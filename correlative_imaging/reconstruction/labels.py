@@ -12,8 +12,10 @@ Classes (keys 1-5 in the GUI):
   noise      background, halo, haze
 
 The store is a SQLite file (default ``ci_labels.db`` in the run's output folder, next to the Results Explorer's
-well labels). Tables: ``particle_labels``, ``test_wells`` (the frozen held-out set, never trained on) and
-``well_verdicts``.
+well labels). Tables: ``particle_labels``, ``test_wells`` (the frozen held-out set, never trained on),
+``particle_cuts`` (hand-drawn lines that split particles; frame coordinates, all channels and levels),
+``particle_merges`` (two positions whose particles are joined; one channel and level), ``particle_splits``
+(accepted split proposals: the particle at that position is split at its dips) and ``well_verdicts``.
 """
 from __future__ import annotations
 
@@ -38,6 +40,12 @@ CREATE TABLE IF NOT EXISTS particle_labels (
     PRIMARY KEY (dataset, plate_id, well_id, channel, level, y, x));
 CREATE TABLE IF NOT EXISTS test_wells (dataset TEXT, plate_id TEXT, well_id TEXT, t TEXT,
     PRIMARY KEY (dataset, plate_id, well_id));
+CREATE TABLE IF NOT EXISTS particle_cuts (dataset TEXT, plate_id TEXT, well_id TEXT, cut_id INTEGER PRIMARY KEY
+    AUTOINCREMENT, points TEXT, labeller TEXT, t TEXT);
+CREATE TABLE IF NOT EXISTS particle_merges (dataset TEXT, plate_id TEXT, well_id TEXT, channel TEXT, level TEXT,
+    y1 REAL, x1 REAL, y2 REAL, x2 REAL, labeller TEXT, t TEXT);
+CREATE TABLE IF NOT EXISTS particle_splits (dataset TEXT, plate_id TEXT, well_id TEXT, channel TEXT, level TEXT,
+    y REAL, x REAL, labeller TEXT, t TEXT);
 CREATE TABLE IF NOT EXISTS well_verdicts (dataset TEXT, plate_id TEXT, well_id TEXT, verdict TEXT, note TEXT,
     labeller TEXT, t TEXT, PRIMARY KEY (dataset, plate_id, well_id));
 """
@@ -107,6 +115,49 @@ class LabelStore:
         with self._con() as con:
             con.executemany("INSERT OR IGNORE INTO test_wells VALUES (?,?,?,?)", [(dataset, p, w, _now()) for p, w in pick])
         return set(pick)
+
+    # -- particle edits (applied by Detect: edits.py)
+    def add_cut(self, dataset, plate_id, well_id, points):
+        import json
+        with self._con() as con:
+            con.execute("INSERT INTO particle_cuts (dataset, plate_id, well_id, points, labeller, t) VALUES (?,?,?,?,?,?)",
+                        (dataset, plate_id, well_id, json.dumps([[round(float(y), 2), round(float(x), 2)]
+                                                                 for y, x in points]), getpass.getuser(), _now()))
+
+    def add_merge(self, dataset, plate_id, well_id, channel, level, p1, p2):
+        with self._con() as con:
+            con.execute("INSERT INTO particle_merges VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                        (dataset, plate_id, well_id, channel, level, float(p1[0]), float(p1[1]), float(p2[0]),
+                         float(p2[1]), getpass.getuser(), _now()))
+
+    def accept_split(self, dataset, plate_id, well_id, channel, level, y, x):
+        with self._con() as con:
+            con.execute("INSERT INTO particle_splits VALUES (?,?,?,?,?,?,?,?,?)",
+                        (dataset, plate_id, well_id, channel, level, float(y), float(x), getpass.getuser(), _now()))
+
+    def clear_edits(self, dataset, plate_id, well_id):
+        with self._con() as con:
+            for t in ("particle_cuts", "particle_merges", "particle_splits"):
+                con.execute(f"DELETE FROM {t} WHERE dataset=? AND plate_id=? AND well_id=?", (dataset, plate_id, well_id))
+
+    def edits(self, dataset: str) -> dict:
+        """{(plate_id, well_id): {"cuts": [...], "merges": [...], "splits": [...]}} for detect_well."""
+        import json
+        out = {}
+        with self._con() as con:
+            for p, w, pts in con.execute("SELECT plate_id, well_id, points FROM particle_cuts WHERE dataset=?",
+                                         (dataset,)):
+                out.setdefault((p, w), {"cuts": [], "merges": [], "splits": []})["cuts"].append(json.loads(pts))
+            for p, w, ch, lev, y1, x1, y2, x2 in con.execute(
+                    "SELECT plate_id, well_id, channel, level, y1, x1, y2, x2 FROM particle_merges WHERE dataset=?",
+                    (dataset,)):
+                out.setdefault((p, w), {"cuts": [], "merges": [], "splits": []})["merges"].append(
+                    dict(channel=ch, level=lev, y1=y1, x1=x1, y2=y2, x2=x2))
+            for p, w, ch, lev, y, x in con.execute(
+                    "SELECT plate_id, well_id, channel, level, y, x FROM particle_splits WHERE dataset=?", (dataset,)):
+                out.setdefault((p, w), {"cuts": [], "merges": [], "splits": []})["splits"].append(
+                    dict(channel=ch, level=lev, y=y, x=x))
+        return out
 
     # -- well verdicts
     def set_verdict(self, dataset, plate_id, well_id, verdict, note=""):

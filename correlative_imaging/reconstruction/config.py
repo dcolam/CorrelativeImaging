@@ -14,7 +14,8 @@ from pathlib import Path
 
 PRESETS = Path(__file__).parent / "presets"
 # settings that define the particle features: a model is only valid for detections made with the same values
-FEATURE_KEYS = ["work_R", "context_R", "min_object_px", "min_inside_um2", "field_min_um2", "smooth_px", "peak_h"]
+FEATURE_KEYS = ["work_R", "context_R", "min_object_px", "min_inside_um2", "field_min_um2", "smooth_px", "peak_h",
+                "split_particles", "split_dip_ratio", "split_max_x_hole"]
 MODELS = Path(__file__).parent / "models"
 
 
@@ -34,6 +35,12 @@ class Config:
     min_inside_um2: float = 0.5   # a particle must have at least this much area inside the hole
     field_min_um2: float = 30.0   # whole-image objects at least this big describe a typical (unpatched) cell
     smooth_px: float = 1.0        # light smoothing for peaks and growth (not for measurements)
+    split_particles: bool = False # split every particle at signal dips at Detect. Off by default: on ROMK it split
+                                  # ~20 % of hand-labelled cells (vs ~50-70 % of "merged"). Detect always PROPOSES the
+                                  # split lines; accept them per particle (Train tab) or draw cuts
+    split_dip_ratio: float = 0.6  # ... where the saddle between two peaks is below this fraction of the lower peak
+    split_max_x_hole: float = 4.0 # only particles touching the hole and at most this many hole areas are split
+                                  # (a lenient-threshold speckle "particle" spanning the window is left whole)
 
     # --- particle classifier -------------------------------------------------------------------------------------
     model: str = ""               # trained model (.joblib); relative paths resolve in identity/models/
@@ -70,6 +77,7 @@ class Config:
     def feature_config(self) -> dict:
         return {k: getattr(self, k) for k in FEATURE_KEYS}
 
+
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2)
 
@@ -79,6 +87,15 @@ class Config:
         p = Path(self.model)
         return p if p.is_absolute() else MODELS / p
 
+
+# what a run or model saved before a feature setting existed was made with
+LEGACY_FEATURE_VALUES = {"split_particles": False}
+
+
+def complete_feature_config(fc: dict) -> dict:
+    """Fill settings missing from an older run.json / model spec with the value they implicitly had."""
+    d = Config()
+    return {k: fc.get(k, LEGACY_FEATURE_VALUES.get(k, getattr(d, k))) for k in FEATURE_KEYS}
 
 _NAME_COLORS = [   # dye / filter names (display only), checked before the wavelength
     (("cy5", "alexa647", "af647", "far red", "farred"), "#38d9e8"),       # before "red"

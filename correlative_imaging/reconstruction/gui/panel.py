@@ -453,8 +453,10 @@ class SettingsTab(QWidget):
         self.show_model_match()
 
     def show_model_match(self):
+        from ..config import complete_feature_config
         m = self.app.model
-        fc = (m.spec.get("feature_config") or {}) if m is not None else {}
+        fc = complete_feature_config(m.spec.get("feature_config") or {}) \
+            if m is not None and m.spec.get("feature_config") else {}
         for k, lab in self.model_val.items():
             if k not in fc:
                 lab.setText("" if m is None else "model: ?")
@@ -603,6 +605,30 @@ class TrainTab(QWidget):
         self.picked.setWordWrap(True)
         self.picked.setTextFormat(Qt.RichText)
         v.addWidget(self.picked)
+
+        v.addWidget(section("Edit particles"))
+        v.addWidget(hint("Dashed orange lines are splits Detect proposes at signal dips (not applied). Accept one for "
+                         "the picked particle, draw your own cut (X, then drag a line across the particle; several "
+                         "lines are fine, then Apply), or merge the picked particle with a touching piece. Edits are "
+                         "stored by position in the label library and re-detect this well right away."))
+        g = QGridLayout()
+        self.b_accept = QPushButton("Accept proposed split")
+        self.b_accept.clicked.connect(app.accept_split)
+        self.b_cut = QPushButton("Draw cut  (X)")
+        self.b_cut.setCheckable(True)
+        self.b_cut.toggled.connect(app.draw_cut)
+        self.b_apply_cut = QPushButton("Apply cuts")
+        self.b_apply_cut.clicked.connect(app.apply_cuts)
+        self.b_merge = QPushButton("Merge with…")
+        self.b_merge.setCheckable(True)
+        self.b_merge.setToolTip("pick a particle, press this, then click the piece to join it with (same channel and "
+                                "threshold; it must touch or come from the same object)")
+        self.b_merge.toggled.connect(app.merge_mode)
+        self.b_clear_edits = QPushButton("Clear edits in this well")
+        self.b_clear_edits.clicked.connect(app.clear_edits)
+        for i, b in enumerate([self.b_accept, self.b_cut, self.b_apply_cut, self.b_merge, self.b_clear_edits]):
+            g.addWidget(b, i // 3, i % 3)
+        v.addLayout(g)
 
         v.addWidget(section("Train the classifier"))
         v.addWidget(hint("Uses every labelled dataset of the results folders listed below, plus all their unlabelled "

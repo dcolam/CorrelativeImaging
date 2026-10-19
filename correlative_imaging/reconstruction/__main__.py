@@ -31,6 +31,7 @@ def main(argv=None):
     d.add_argument("--spec", help="JSON source spec instead of --root/--run-tag (e.g. a viewer-crop source)")
     d.add_argument("--out", required=True); d.add_argument("--config"); d.add_argument("--wells", nargs="*")
     d.add_argument("--workers", type=int, default=8)
+    d.add_argument("--labels", help="label library: apply its hand cuts / merges for this dataset")
     c = sub.add_parser("classify", help="stage 2: classify, reconstruct, identity call")
     c.add_argument("--out", required=True); c.add_argument("--model"); c.add_argument("--config")
     c.add_argument("--workers", type=int, default=8)
@@ -52,7 +53,13 @@ def main(argv=None):
         from .pipeline import detect_run, source_from_spec
         cfg = load_config(a.config)
         spec = json.loads(Path(a.spec).read_text()) if a.spec else dict(kind="run", root=a.root, run_tag=a.run_tag)
-        r = detect_run(source_from_spec(spec, cfg), cfg, a.out, a.wells, a.workers, source_spec=spec)
+        src = source_from_spec(spec, cfg)
+        edits = None
+        if a.labels:
+            from .labels import LabelStore
+            edits = LabelStore(a.labels).edits(getattr(src, "dataset", ""))
+            print(f"{len(edits)} well(s) with hand edits")
+        r = detect_run(src, cfg, a.out, a.wells, a.workers, source_spec=spec, edits=edits)
         print(f"{len(r['wells'])} wells, {int(r['particles'].pool.sum())} particles in the holes -> {a.out}")
     elif a.cmd == "classify":
         from .learn import ParticleModel

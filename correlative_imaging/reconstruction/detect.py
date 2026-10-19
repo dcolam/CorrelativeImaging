@@ -72,8 +72,63 @@ def peak_maps(sm: np.ndarray, names: list, hbg: dict, cfg: Config) -> dict:
     return out
 
 
-def detect_well(wd: WellData, cfg: Config):
-    """Returns (particles, maps, well_row). particles: one row per object (see module doc)."""
+def edit_maps(wd: WellData, maps: dict, sm: np.ndarray, hbg: dict, cfg: Config, edits: dict | None):
+    """Hand cuts, splits at dips and merges (edits.py), in place on `maps`. Returns the origin maps (labels before
+    any change) and adds maps[("splits", "")]: 1 = applied split between pieces of one object, 2 = hand cut,
+    3 = proposed split (Detect found a dip; not applied unless `split_particles` or accepted for that particle)."""
+    from .edits import apply_cuts, apply_merges, auto_split, cut_mask, split_lines
+    edits = edits or {}
+    S = wd.hole.shape
+    origin = {k: L.copy() for k, L in maps.items()}
+    proposals = {}
+    cut = cut_mask(S, edits.get("cuts", []), wd.offset) if edits.get("cuts") else None
+    lines = np.zeros(S, np.uint8)
+    max_px = int(cfg.split_max_x_hole * wd.hole.sum())
+    oy, ox = wd.offset
+    for (lev, ch), L in list(maps.items()):
+        if cut is not None:
+            L = apply_cuts(L, cut)
+        k = wd.names.index(ch)
+        prop = auto_split(L, sm[k] - hbg[ch][0], wd.hole, cfg.peak_h * max(hbg[ch][1], 1e-6), cfg.split_dip_ratio,
+                          cfg.min_object_px, max_px)
+        proposals[(lev, ch)] = prop
+        if cfg.split_particles:
+            L = prop
+        else:
+            acc = [(int(round(a["y"] - oy)), int(round(a["x"] - ox))) for a in edits.get("splits", [])
+                   if a["channel"] == ch and a["level"] == lev]
+            labs = {int(L[y, x]) for y, x in acc if 0 <= y < S[0] and 0 <= x < S[1] and L[y, x]}
+            if labs:
+                L = L.copy()
+                nxt = int(L.max()) + 1
+                for lb in labs:
+                    m = L == lb
+                    for i, pl in enumerate(sorted(set(np.unique(prop[m])) - {0})):
+                        if i:                                   # first piece keeps the old label
+                            L[m & (prop == pl)] = nxt
+                            nxt += 1
+            proposed = split_lines(prop, L)
+            lines[proposed] = 3
+        mg = [((m["y1"] - oy, m["x1"] - ox), (m["y2"] - oy, m["x2"] - ox)) for m in edits.get("merges", [])
+              if m["channel"] == ch and m["level"] == lev]
+        if mg:
+            L, _ = apply_merges(L, origin[(lev, ch)], mg)
+        maps[(lev, ch)] = L
+        lines[split_lines(L, origin[(lev, ch)])] = 1
+    if cut is not None:
+        anyfg = np.zeros(S, bool)
+        for L in origin.values():
+            anyfg |= L > 0
+        lines[cut & anyfg] = 2
+    maps[("splits", "")] = lines
+    origin["_proposals"] = proposals
+    return origin
+
+
+def detect_well(wd: WellData, cfg: Config, edits: dict | None = None):
+    """Returns (particles, maps, well_row). particles: one row per object (see module doc).
+    edits: {"cuts": [polyline, ...], "merges": [{channel, level, y1, x1, y2, x2}, ...],
+            "splits": [{channel, level, y, x}, ...]} in frame coordinates (splits = accepted proposals)."""
     S = wd.hole.shape
     hole_px = int(wd.hole.sum())
     hy, hx = np.nonzero(wd.hole)
@@ -83,10 +138,18 @@ def detect_well(wd: WellData, cfg: Config):
     maps = label_maps(wd, cfg)
     hbg = hole_background(wd, maps)
     sm = smoothed(wd, cfg)
+    origin = edit_maps(wd, maps, sm, hbg, cfg, edits)
+    proposals = origin.pop("_proposals")
     peaks = peak_maps(sm, wd.names, hbg, cfg)
     stack = np.moveaxis(wd.chans, 0, -1)            # (H, W, C) for regionprops
     objs = []
     for (lev, ch), L in maps.items():
+        if lev == "splits":
+            continue
+        O = origin[(lev, ch)]
+        fg = (L > 0) & (O > 0)
+        pairs = np.unique(np.c_[O[fg], L[fg]], axis=0) if fg.any() else np.zeros((0, 2), int)
+        parts_of = pd.Series(pairs[:, 1]).groupby(pairs[:, 0]).nunique().to_dict() if len(pairs) else {}
         k = wd.names.index(ch)
         touching = set(np.unique(L[wd.hole])) - {0}
         L_in = np.where(wd.hole, L, 0)
@@ -111,6 +174,13 @@ def detect_well(wd: WellData, cfg: Config):
                      **{f"full_{c2}": float(p.intensity_mean[j]) for j, c2 in enumerate(wd.names)})
             m = L[r0:r1, c0:c1] == lb
             o["n_peaks"] = int(len(set(np.unique(peaks[ch][r0:r1, c0:c1][m])) - {0}))
+            ol = O[r0:r1, c0:c1][m]
+            ol = ol[ol > 0]
+            o_lab = int(np.bincount(ol).argmax()) if len(ol) else 0
+            o["origin"] = f"{lev[0]}{ch}_o{o_lab}"
+            o["n_parts"] = int(parts_of.get(o_lab, 1))          # pieces of the original object (incl. outside)
+            pr = proposals[(lev, ch)][r0:r1, c0:c1][m]
+            o["n_proposed"] = int(len(set(np.unique(pr)) - {0}))       # pieces a split at dips would give
             if touch:
                 q = inside[lb]
                 o.update(in_px=int(q.area), share=q.area / p.area, fill=q.area / hole_px,

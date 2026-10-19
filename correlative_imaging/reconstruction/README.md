@@ -43,7 +43,8 @@ step through the list.
 2. **Train:**
    - the label library and label mode;
    - **Random well** (unlabelled, not a test well) and **Next well**;
-   - which outline levels to show;
+   - which outlines to show (stringent, lenient, cells around the hole, noise; noise outlines are hidden by default
+     because background speckle at the lenient threshold covers the whole window);
    - training with the comparison tables, and "Label next".
 3. **Results:** counts, calls per plate, per-channel mixture quality, and the plate map (evaluation only).
 4. **Settings** (last; the defaults work):
@@ -63,10 +64,44 @@ step through the list.
 - **tags:** one per particle in the hole. The model's class: C cell, N neighbour, M merged, D debris, · noise.
   Before Classify, the provisional class instead: in, N?, D?, ·?. A hand label is white in brackets, e.g. [C].
 
-Layer visibility and contrast are kept from one well to the next.
+The layers are created once and only their data changes from one well to the next (about 0.4 s per well switch, was
+4.5 s), so visibility and contrast stay as you set them.
 
 **Labelling:** turn on label mode (`L`), click a particle and press `1`–`5` (cell, neighbour, merged, debris, noise).
 `Del` removes a label. Where several particles overlap (channels, two thresholds), a menu lists them.
+
+## Splitting and editing particles
+
+**Proposed splits.** Detect finds, for every particle in the hole (up to 4 hole areas), where it would split at a
+real dip between two significant peaks. The split lines are drawn dashed orange, and `n_proposed` counts the pieces.
+They are only proposals: applied to every particle (`split_particles`), the split cut about 20 % of the
+hand-labelled cells on ROMK, while catching only 50–70 % of the "merged" particles. No peak height or dip depth
+separated the two better (table below). So splitting is off by default, and you accept proposals per particle.
+
+| peak height (hole-noise SDs) | dip (saddle / lower peak) | cells split | merged split | neighbours split |
+|---|---|---|---|---|
+| 3 | 0.6 | 22 % | 52 % | 29 % |
+| 3 | 0.45 | 11 % | 19 % | 14 % |
+| 3 | 0.3 | 5 % | 3 % | 5 % |
+| 12 | 0.6 | 20 % | 71 % | 29 % |
+
+**Edits** (Train tab, stored by position in the label library):
+- **Accept proposed split:** for the picked particle.
+- **Draw cut** (`X`): drag a line across a particle, then Apply. The cut applies to every channel and both
+  thresholds. It is drawn 3 px wide (so a diagonal line also separates), and the cut pixels go back to the nearest
+  piece.
+- **Merge with…:** joins the picked particle with another one. They must have the same channel and threshold and
+  either touch or come from one object, so merge mainly undoes a split. Pieces of one cell that don't touch are
+  joined by the reconstruction anyway.
+- **Clear edits in this well.**
+
+**After each edit** that well is detected again from the cache, which is float32 so the result equals a full Detect.
+If the run was classified, the well is also classified again; its identity uses the stored per-channel calibration,
+so no other well's call changes (tested: 638/638 unchanged). The run lists the edited wells until the next full
+Classify, and a full Detect applies all stored edits (`detect --labels`).
+
+**Labels on split objects.** Particles keep `origin` (the object before edits) and `n_parts`. A legacy "merged"
+label on an object that now splits is left out of training, and the training report counts these.
 
 ## Detect gives a first look (no model)
 

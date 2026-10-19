@@ -339,3 +339,37 @@ class ParticleModel:
                 emb.med, emb.mu, emb.sd, emb.pca = d["emb"]["med"], d["emb"]["mu"], d["emb"]["sd"], d["emb"]["pca"]
             return cls(ArmModel(d["arm"], d["est"], emb, d.get("n_pseudo", 0)), d["spec"])
         return cls(d["model"], d["spec"])
+
+
+def assemble(results_dirs: list, store, tol_um: float = 2.0, test_frac: float = 0.2):
+    """Training frame over several output folders: their pool particles, the labels of their datasets matched to
+    particles, and the frozen test wells per dataset (frozen on first use). Returns (T, test_groups, report);
+    report.attrs carries the detection feature settings (and whether the folders differ in them)."""
+    from .labels import match_labels
+    from .pipeline import Results
+    frames, tg, rep, fcs = [], set(), [], []
+    for d in results_dirs:
+        r = Results(d)
+        F = r.particles
+        L = store.frame(r.dataset)
+        m = match_labels(L, F, r.wells, tol_um)
+        n_dropped = 0
+        if len(m) and "n_parts" in F:
+            # a "merged" label made on an object that Detect now splits no longer describes one particle
+            parts = F.set_index(["plate_id", "well_id", "oid"]).n_parts
+            np_ = parts.reindex(list(zip(m.plate_id, m.well_id, m.oid))).to_numpy(float)
+            drop = (m.label == "merged").to_numpy() & (np.nan_to_num(np_, nan=1) > 1)
+            n_dropped = int(drop.sum())
+            m = m[~drop]
+        frames.append(training_frame(F, m))
+        fcs.append(r.config.feature_config())
+        tw = store.freeze_test_wells(r.dataset, test_frac)
+        tg |= {f"{r.dataset}|{p}|{w}" for p, w in tw}
+        u = m.drop_duplicates(["plate_id", "well_id", "ly", "lx"]) if len(m) else m
+        rep.append(dict(dataset=r.dataset, folder=str(d), labels=len(L), matched=len(u), test_wells=len(tw),
+                        pool=int(F.pool.sum()), merged_on_split_dropped=n_dropped))
+    T = pd.concat(frames, ignore_index=True)
+    rep = pd.DataFrame(rep)
+    rep.attrs["feature_config"] = fcs[0] if fcs else {}
+    rep.attrs["feature_config_differs"] = any(f != fcs[0] for f in fcs)
+    return T, tg, rep

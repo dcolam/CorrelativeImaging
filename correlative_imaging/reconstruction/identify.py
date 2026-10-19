@@ -51,9 +51,11 @@ def combos(channels: list) -> list[tuple]:
     return out
 
 
-def identify(cells: pd.DataFrame, wells: pd.DataFrame, ref: pd.DataFrame, identity: list, cfg: Config):
+def identify(cells: pd.DataFrame, wells: pd.DataFrame, ref: pd.DataFrame, identity: list, cfg: Config,
+             stored: dict | None = None):
     """cells: reconstructed cells (plate_id, well_id, body_mean_<ch>). Returns (cells + n_<ch>, p_<ch>, call,
-    p_call_best, dominant), info per channel."""
+    p_call_best, dominant), info per channel. With `stored` (a previous run's info) the per-channel mixtures are
+    not refitted but applied as stored, so changing a few cells does not shift any other call."""
     c = cells.copy()
     info = {}
     if not len(c):
@@ -68,7 +70,16 @@ def identify(cells: pd.DataFrame, wells: pd.DataFrame, ref: pd.DataFrame, identi
         rm = np.array([Rf.get((p, ch), np.nan) for p in c.plate_id], float)
         c[f"n_{ch}"] = (c[f"body_mean_{ch}"] - bg) / rm
         x = np.arcsinh(c[f"n_{ch}"].to_numpy(float) / S0)
-        mx = _mixture(x)
+        st = (stored or {}).get(ch)
+        if stored is not None and st and st.get("means"):
+            from scipy.stats import norm
+            mu, sd, w = np.asarray(st["means"]), np.asarray(st["sds"]), np.asarray(st["weights"])
+            hi = int(np.argmax(mu))
+            dens = np.vstack([w[j] * norm.pdf(x, mu[j], sd[j]) for j in range(len(mu))])
+            c[f"p_{ch}"] = dens[hi] / np.where(dens.sum(0) > 0, dens.sum(0), np.nan)
+            info[ch] = st
+            continue
+        mx = None if stored is not None else _mixture(x)
         if mx is None:
             hm = np.array([W.at[k, f"hbg_med_{ch}"] for k in key], float)
             hs = np.array([W.at[k, f"hbg_sd_{ch}"] for k in key], float)
@@ -95,6 +106,11 @@ def identify(cells: pd.DataFrame, wells: pd.DataFrame, ref: pd.DataFrame, identi
     c["dominant"] = [identity[i] if np.isfinite(r).any() else "" for i, r in
                      zip(np.nanargmax(np.where(np.isfinite(N), N, -np.inf), axis=1), N)]
     return c, info
+
+
+def apply_identity(cells, wells, ref, identity, cfg, stored: dict) -> pd.DataFrame:
+    """Identity of a few cells with the run's stored calibration (no refit)."""
+    return identify(cells, wells, ref, identity, cfg, stored=stored or {})[0]
 
 
 def well_calls(cells: pd.DataFrame, wells: pd.DataFrame, identity: list) -> pd.DataFrame:

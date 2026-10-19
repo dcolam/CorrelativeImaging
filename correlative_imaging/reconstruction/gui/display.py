@@ -7,6 +7,8 @@ Layers (created once, then their data is swapped per well; visibility and contra
                         stringent threshold solid, lenient (hole) threshold dashed. Shown and hidden together with
                         the channel's image.
   hole                  hole outline
+  splits                split lines: proposed by Detect (dashed orange, not applied), applied splits (yellow),
+                        hand cuts (white)
   cells                 reconstructed bodies (after Classify): cells in their call's colour, neighbours grey
   tags                  one tag per particle in the hole: the model's class (C cell, N neighbour, M merged,
                         D debris, · noise), or before Classify the provisional class (in, N?, D?, ·?). A hand
@@ -101,6 +103,11 @@ class WellDisplay:
         self.L["hole"] = keep(self.v.add_image(z, name=self._name("hole"), colormap="gray", blending="additive",
                                                scale=scale, contrast_limits=(0, 1), opacity=0.8,
                                                interpolation2d="nearest"))
+        from napari.utils.colormaps import DirectLabelColormap
+        self.L["splits"] = keep(self.v.add_labels(z.astype(np.int32), name=self._name("splits"), scale=scale,
+                                                  opacity=1.0))
+        self.L["splits"].colormap = DirectLabelColormap(color_dict={None: "transparent", 0: "transparent",
+                                                                    1: "#ffd23f", 2: "#ffffff", 3: "#ff9f1c"})
         self.L["cells"] = keep(self.v.add_labels(z.astype(np.int32), name=self._name("cells"), scale=scale,
                                                  opacity=0.95))
         self.L["cells"].contour = 2
@@ -138,6 +145,12 @@ class WellDisplay:
             self.L[f"out:{ch}"].data = self._outline_raster(wd, maps, P, ch)
         from skimage.segmentation import find_boundaries
         self.L["hole"].data = find_boundaries(wd.hole, mode="inner").astype(np.uint8)
+        sp = maps.get(("splits", ""))
+        if sp is None:
+            sp = np.zeros(wd.hole.shape, np.uint8)
+        yy, xx = np.indices(sp.shape)
+        dash = ((yy // 2 + xx // 2) % 2) == 0
+        self.L["splits"].data = np.where((sp == 3) & ~dash, 0, sp).astype(np.int32)   # proposals dashed
         self._cells(G, cells, cfg, wd.hole.shape)
         self._tags(P, labels)
         if self.L["selection"].nshapes:
