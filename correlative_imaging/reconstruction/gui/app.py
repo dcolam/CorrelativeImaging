@@ -389,6 +389,7 @@ class ReconstructionApp:
         t = self.panel.train
         self.display.show_levels = {"whole": t.show_whole.isChecked(), "hole": t.show_hole.isChecked()}
         self.display.show_context = t.show_ctx.isChecked()
+        self.display.show_noise = t.show_noise.isChecked()
         if getattr(self, "_current_well", None):
             picked = self.display.picked
             self.show_well(*self._current_well)

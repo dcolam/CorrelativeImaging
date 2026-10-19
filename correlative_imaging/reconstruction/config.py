@@ -80,10 +80,22 @@ class Config:
         return p if p.is_absolute() else MODELS / p
 
 
+_NAME_COLORS = [   # dye / filter names (display only), checked before the wavelength
+    (("cy5", "alexa647", "af647", "far red", "farred"), "#38d9e8"),       # before "red"
+    (("dapi", "hoechst", "bfp", "blue"), "#4f7dff"),
+    (("fitc", "gfp", "alexa488", "af488", "green"), "#3ddc5a"),
+    (("tx red", "texas", "tritc", "mcherry", "mscarlet", "cy3", "rfp", "tdtomato", "red"), "#ff4fd8"),
+]
+
+
 def default_color(ch: str) -> str:
-    """Colour by excitation wavelength (display only)."""
+    """Colour by dye/filter name or excitation wavelength (display only)."""
     import re
-    m = re.search(r"(\d{3})", str(ch))
+    low = str(ch).lower()
+    for keys, col in _NAME_COLORS:
+        if any(k in low for k in keys):
+            return col
+    m = re.search(r"(\d{3})", low)
     if not m:
         return "#bfbfbf"
     nm = int(m.group(1))

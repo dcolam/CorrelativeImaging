@@ -31,6 +31,15 @@ import pandas as pd
 from .config import Config
 
 
+def _given(v) -> bool:
+    """True for a real value (not None / NaN / empty): table columns of wells without a row come back as NaN."""
+    if v is None:
+        return False
+    if isinstance(v, float):
+        return v == v
+    return v != ""
+
+
 def pad_well(w: str) -> str:
     return w[0] + f"{int(w[1:]):02d}"
 
@@ -130,7 +139,7 @@ class RunSource:
 
     # -- paths
     def _local(self, p: str | None) -> Path | None:
-        if not p:
+        if not _given(p):
             return None
         if Path(p).exists():
             return Path(p)
@@ -214,15 +223,16 @@ class RunSource:
             return None
         whole = Path(r.diag) / f"{r.well_raw}_whole_channels.tif"
         crop = None
-        if r.crop_files:
+        if _given(r.crop_files):
             crop = next((Path(r.diag) / f for f in json.loads(r.crop_files) if f.endswith("_channels.tif")), None)
         crop = crop or Path(r.diag) / f"{r.well_raw}_roi_hole_crop_channels.tif"
         stored = all(np.isfinite(r.thr.get(("whole", ch), np.nan)) for ch in r.channels_db) and \
             all(ch in r.bg and np.isfinite(r.bg[ch][0]) for ch in r.channels_db)
-        scale = float(r.raw_px) / r.px_um if (r.raw_px and np.isfinite(r.px_um)) else 1.0
+        scale = float(r.raw_px) / r.px_um if (_given(r.raw_px) and np.isfinite(r.px_um)) else 1.0
         fs = (int(round(r.raw_shape[0] * scale)), int(round(r.raw_shape[1] * scale))) if r.raw_shape[0] else None
         notes, origin, image, frame_shape = [], (0, 0), None, None
-        if crop.exists() and r.crop_row0 is not None and stored and fs is not None:
+        has_origin = _given(r.crop_row0) and _given(r.crop_col0)
+        if crop.exists() and has_origin and stored and fs is not None:
             hole_f = _rasterise_roi(roi, fs, scale)
             if not hole_f.any():
                 return None
@@ -237,7 +247,7 @@ class RunSource:
                 notes.append("hole crop smaller than the window: window from the whole frame")
         if image is None and whole.exists():
             image, origin = whole, (0, 0)
-        if image is None and crop.exists() and r.crop_row0 is not None:
+        if image is None and crop.exists() and has_origin:
             image, origin = crop, (int(r.crop_row0), int(r.crop_col0))
             notes.append("no whole-frame TIF: window clipped to the hole crop")
         if image is None:

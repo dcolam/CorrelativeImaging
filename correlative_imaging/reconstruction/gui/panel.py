@@ -197,6 +197,7 @@ class RunTab(QWidget):
         while self.chan_grid.count():
             w = self.chan_grid.takeAt(0).widget()
             if w:
+                w.setParent(None)
                 w.deleteLater()
         self.chan_rows = {}
         for i, t in enumerate(["use", "channel", "name", "colour", "role"]):
@@ -501,6 +502,7 @@ class SettingsTab(QWidget):
         while self.rec.count():
             w = self.rec.takeAt(0).widget()
             if w:
+                w.setParent(None)
                 w.deleteLater()
         if not items:
             self.rec.addWidget(hint("Nothing to recommend: the current settings fit this run."))
@@ -572,10 +574,15 @@ class TrainTab(QWidget):
         self.show_whole = QCheckBox("stringent (solid)")
         self.show_hole = QCheckBox("lenient (dashed)")
         self.show_ctx = QCheckBox("cells around the hole")
+        self.show_noise = QCheckBox("noise")
+        self.show_noise.setToolTip("outlines of particles classed as noise (often background speckle at the lenient "
+                                   "threshold); hidden by default, their tags stay")
         for cb in (self.show_whole, self.show_hole, self.show_ctx):
             cb.setChecked(True)
             cb.toggled.connect(app.redraw_levels)
             h.addWidget(cb)
+        self.show_noise.toggled.connect(app.redraw_levels)
+        h.addWidget(self.show_noise)
         h.addStretch(1)
         v.addLayout(h)
         v.addWidget(hint("In label mode, click a particle in the canvas (several overlap: pick from the menu), then "

@@ -71,6 +71,7 @@ class PlateView(QWidget):
         v.addWidget(self.legend)
         self.df = pd.DataFrame()
         self.current = None
+        self.btns, self.recs = {}, {}
 
     def set(self, df: pd.DataFrame, stage: str):
         self.df = df
@@ -86,11 +87,24 @@ class PlateView(QWidget):
         self.draw()
 
     def mark(self, plate_id, well_id):
-        self.current = (plate_id, well_id)
+        prev, self.current = self.current, (plate_id, well_id)
         if self.plate.currentText() != plate_id:
-            self.plate.setCurrentText(plate_id)
-        else:
-            self.draw()
+            self.plate.setCurrentText(plate_id)          # redraws the plate
+            return
+        for key in (prev, self.current):                 # same plate: restyle just the two buttons
+            if key and key[0] == plate_id and key[1] in self.btns:
+                self._style(key[1])
+
+    def _style(self, well):
+        r, b = self.recs[well], self.btns[well]
+        border = "1px solid #20232a"
+        if r.get("test") == "✓":
+            border = "2px dashed #e0a526"
+        if (r.get("labels") or 0) > 0:
+            border = "2px solid #ffffff"
+        if self.current == (self.plate.currentText(), well):
+            border = "2px solid #4fc3f7"
+        b.setStyleSheet(f"QToolButton {{ background: {self._color(r)}; border: {border}; border-radius: 3px; }}")
 
     def _color(self, r) -> str:
         mode = self.mode.currentText()
@@ -104,6 +118,7 @@ class PlateView(QWidget):
         return _gradient(r.get("P", np.nan))
 
     def draw(self, *_):
+        self.btns, self.recs = {}, {}
         while self.grid.count():
             w = self.grid.takeAt(0).widget()
             if w:
@@ -139,15 +154,8 @@ class PlateView(QWidget):
                     b.setStyleSheet("QToolButton { background: transparent; border: 1px solid #2a2e35; }")
                     self.grid.addWidget(b, i + 1, j + 1)
                     continue
-                col = self._color(r)
-                border = "1px solid #20232a"
-                if r.get("test") == "✓":
-                    border = "2px dashed #e0a526"
-                if (r.get("labels") or 0) > 0:
-                    border = "2px solid #ffffff"
-                if self.current == (pl, well):
-                    border = "2px solid #4fc3f7"
-                b.setStyleSheet(f"QToolButton {{ background: {col}; border: {border}; border-radius: 3px; }}")
+                self.btns[well], self.recs[well] = b, r
+                self._style(well)
                 tip = [f"{pl} {well}", f"status: {r.get('status_shown', '')}"]
                 if r.get("dominant_shown"):
                     tip.append("dominant: " + "+".join(self.display_name(c) for c in str(r["dominant_shown"]).split("+")))

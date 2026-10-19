@@ -136,6 +136,9 @@ def detect_run(src, cfg: Config, out_dir, wells: list | None = None, workers: in
             say(i + 1, len(rows), "")
     if not res:
         raise ValueError("no well could be loaded (missing diagnostics TIFs or hole ROIs?)")
+    skipped = len(rows) - len(res)
+    if skipped:
+        say(len(rows), len(rows), f"{skipped} of {len(rows)} wells skipped: no hole ROI or no diagnostics image")
     W = plate_hole_background(pd.DataFrame([r[1] for r in res]), names)
     P = pd.concat([r[0] for r in res], ignore_index=True)
     say(len(rows), len(rows), "field reference + features")
@@ -153,7 +156,7 @@ def detect_run(src, cfg: Config, out_dir, wells: list | None = None, workers: in
     F.to_parquet(out / "particles.parquet", index=False)
     run = dict(dataset=dataset, channels=names, source=source_spec or {}, config=json.loads(cfg.to_json()),
                detected=_now(), detect_s=round(time.time() - t0, 1), n_wells=len(W), n_particles=len(F),
-               n_pool=int(F.pool.sum()))
+               n_pool=int(F.pool.sum()), n_skipped=skipped)
     (out / "run.json").write_text(json.dumps(run, indent=2))
     return dict(wells=W, particles=F, reference=ref)
 
