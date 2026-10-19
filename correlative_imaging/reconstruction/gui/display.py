@@ -53,9 +53,13 @@ def _fillmap(hex_color: str, name: str):
 
 
 def _set_points(layer, pts: np.ndarray, features: pd.DataFrame):
-    """Swap a text-points layer's points and labels. Never with events blocked: napari would keep the previous
-    number of points in view and index past the new labels."""
+    """Swap a text-points layer's points and labels. Never with events blocked, and re-sliced explicitly: napari
+    does not re-slice hidden layers, kept the previous number of points in view and indexed past the new labels."""
     layer.data = pts
+    try:                     # a hidden layer is never re-sliced by napari: do it, so the points in view are the new ones
+        layer.set_view_slice()
+    except Exception:
+        pass
     layer.features = features
     layer.refresh_text()
 

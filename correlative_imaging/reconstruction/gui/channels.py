@@ -14,7 +14,7 @@ import numpy as np
 from qtpy.QtCore import Qt
 from qtpy.QtGui import QImage, QPixmap
 from qtpy.QtWidgets import (QButtonGroup, QCheckBox, QGridLayout, QHBoxLayout, QLabel, QPushButton, QRadioButton,
-                            QScrollArea, QFrame, QSlider, QVBoxLayout, QWidget)
+                            QScrollArea, QFrame, QSizePolicy, QSlider, QVBoxLayout, QWidget)
 
 from .display import contrast_rule
 
@@ -78,6 +78,9 @@ class ControlView(QWidget):
         self.hist = QLabel()
         self.hist.setMinimumHeight(HH)
         self.hist.setMaximumHeight(HH)
+        # never sized by its own picture (that grew the panel on every redraw): the panel decides its width
+        self.hist.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        self.hist.setMinimumWidth(10)
         v.addWidget(self.hist)
         g = QGridLayout()
         self.smin, self.smax, self.sgam = (QSlider(Qt.Horizontal) for _ in range(3))
@@ -91,6 +94,8 @@ class ControlView(QWidget):
             g.addWidget(w, r, 1)
         self.rng = QLabel("")
         self.rng.setProperty("role", "hint")
+        self.rng.setWordWrap(True)
+        self.rng.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         g.addWidget(self.rng, 3, 0, 1, 2)
         b = QPushButton("auto")
         b.setToolTip("minimum → 99.9th percentile, at least minimum + 100")
@@ -255,7 +260,7 @@ class ControlView(QWidget):
             L.gamma = 1.0
 
     def _draw_hist(self, lo, hi):
-        W = max(self.hist.width(), 120)
+        W = max(self.width() - 24, 120)                     # the panel's width, not the label's
         a = getattr(self, "_sample", np.zeros(0))
         pos = np.clip(((a - self.lo) / (self.hi - self.lo) * (W - 1)).astype(int), 0, W - 1) if a.size else \
             np.zeros(0, int)

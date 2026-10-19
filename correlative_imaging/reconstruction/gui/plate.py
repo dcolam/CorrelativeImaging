@@ -59,6 +59,10 @@ class PlateView(QWidget):
         v.addWidget(self.stage)
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        from qtpy.QtWidgets import QFrame
+        self.scroll.setFrameShape(QFrame.NoFrame)
         self.grid_w = QWidget()
         self.grid = QGridLayout(self.grid_w)
         self.grid.setSpacing(1)
@@ -118,12 +122,12 @@ class PlateView(QWidget):
         return _gradient(r.get("P", np.nan))
 
     def _size(self) -> int:
-        """Well button size: fits the available width (a narrow side panel too), 9 to 22 px."""
+        """Well button size: the plate fills the available width (9 to 30 px per well)."""
         C = getattr(self, "_C", 12)
-        w = self.scroll.viewport().width() if self.scroll.viewport().width() > 120 else 0
+        w = self.width() if self.width() > 120 else 0
         if not w:
             return 11 if C > 24 else 15 if C > 12 else 22
-        return int(max(9, min(22, (w - 24) // (C + 1) - 1)))
+        return int(max(9, min(30, (w - 34) // (C + 1) - 1)))
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
@@ -135,7 +139,9 @@ class PlateView(QWidget):
             if b.width() != s:
                 b.setFixedSize(s, s)
         if getattr(self, "_R", None):
-            self.scroll.setMinimumHeight(min((self._R + 1) * (s + 1) + 24, 520))
+            h = (self._R + 1) * (max(s, 12) + 2) + 14     # rows are at least as tall as their labels
+            self.scroll.setMinimumHeight(h)               # the whole plate, no inner scrolling
+            self.scroll.setMaximumHeight(h)
 
     def draw(self, *_):
         self.btns, self.recs = {}, {}
@@ -167,7 +173,7 @@ class PlateView(QWidget):
             self.grid.addWidget(lab, i + 1, 0)
         self._C, self._R = C, R
         size = self._size()
-        self.scroll.setMinimumHeight(min((R + 1) * (size + 1) + 24, 520))    # the whole plate, no scrolling
+        self.scroll.setMinimumHeight((R + 1) * (max(size, 12) + 2) + 14)     # the whole plate, no scrolling
         by = {w: r for w, r in zip(d.well_id, d.to_dict("records"))}
         for i in range(R):
             for j in range(C):
