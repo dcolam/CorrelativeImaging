@@ -983,6 +983,9 @@ class ResultsTab(QWidget):
         scroll.setWidgetResizable(True)
         body = QWidget()
         v = QVBoxLayout(body)
+        v.addWidget(section("Wells"))
+        self.wells_box = QVBoxLayout()
+        v.addLayout(self.wells_box)
         v.addWidget(section("Detect preview (no model)"))
         v.addWidget(hint("A first look straight after Detect: provisional particle classes (inside / neighbour / "
                          "debris / noise) and per well the status and the dominant channel. On ROMK it agrees with "
@@ -1027,6 +1030,10 @@ class ResultsTab(QWidget):
         mv = FrameView(self.mix, stretch=True)
         mv.setMaximumHeight(130)
         v.addWidget(mv)
+        self.advice = QLabel("")
+        self.advice.setWordWrap(True)
+        self.advice.setTextFormat(Qt.RichText)
+        v.addWidget(self.advice)
         v.addWidget(section("Plate map (evaluation and display only)"))
         v.addWidget(hint("Never used for a call. Any CSV with plate_id, well_id and columns of your choice."))
         h = QHBoxLayout()
@@ -1050,6 +1057,10 @@ class ResultsTab(QWidget):
         scroll.setWidget(body)
         outer.addWidget(scroll)
         self.map = None
+
+    def set_well_list(self, w):
+        w.setMinimumHeight(260)
+        self.wells_box.addWidget(w)
 
     def update_preview(self, res):
         disp = self.app.cfg.display_name
@@ -1078,6 +1089,7 @@ class ResultsTab(QWidget):
                 c.setText("–")
             self.per_plate.set(pd.DataFrame())
             self.mix.set(pd.DataFrame())
+            self.advice.setText("")
             return
         c = res.calls
         self.cards["one"].setText(str(int((c.status == "one cell").sum())))
@@ -1096,6 +1108,10 @@ class ResultsTab(QWidget):
                              flag="weak separation" if d.get("weak_separation") else (d.get("note") or ""),
                              means=", ".join(f"{m:.2f}" for m in d.get("means", []))))
         self.mix.set(pd.DataFrame(rows))
+        from ..identify import advice
+        adv = advice(info, res.cells, res.calls, self.app.cfg)
+        self.advice.setText("<br>".join(f"<b>{disp(ch) if ch != '_all' else 'all channels'}</b>: " + "; ".join(t)
+                                        for ch, t in adv.items()))
         self.crosstab()
 
     def load_map(self):
@@ -1136,9 +1152,9 @@ class LabelTab(QWidget):
         self.sub = QTabWidget()
         self.particles = LabelQueue(app, "particle")
         self.cells = LabelQueue(app, "cell")
-        self.sub.addTab(self.particles, "Particles")
-        self.sub.addTab(self.cells, "Cells")
-        self.sub.addTab(train.canvas_page, "In the canvas")
+        self.sub.addTab(self.particles, "Bulk: particles")
+        self.sub.addTab(self.cells, "Bulk: cells")
+        self.sub.addTab(train.canvas_page, "Detailed view")
         v.addWidget(self.sub, 1)
         bar = QFrame()
         bar.setProperty("role", "card")
@@ -1154,6 +1170,13 @@ class LabelTab(QWidget):
         self.b_retrain.clicked.connect(app.retrain_and_classify)
         h.addWidget(self.b_retrain)
         v.addWidget(bar)
+
+
+def _add_map(self, w):
+    self.sub.addTab(w, "Particle map")
+
+
+LabelTab.add_map = _add_map
 
 
 class Panel(QTabWidget):
@@ -1177,18 +1200,12 @@ class Panel(QTabWidget):
 
 
 class PanelHost(QWidget):
-    """The right dock: a status line (where you are, what to do next) above the tabs."""
+    """The right dock: the tabs, with a progress bar on top while a job runs."""
 
     def __init__(self, panel: Panel):
         super().__init__()
         v = QVBoxLayout(self)
         v.setContentsMargins(0, 0, 0, 0)
-        self.status = QLabel("open or detect results (Run tab)")
-        self.status.setWordWrap(True)
-        self.status.setTextFormat(Qt.RichText)
-        self.status.setProperty("role", "card")
-        self.status.setContentsMargins(8, 4, 8, 4)
-        v.addWidget(self.status)
         self.bar = QProgressBar()
         self.bar.setTextVisible(True)
         self.bar.setFixedHeight(16)

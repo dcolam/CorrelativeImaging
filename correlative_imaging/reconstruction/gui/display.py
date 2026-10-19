@@ -52,6 +52,14 @@ def _fillmap(hex_color: str, name: str):
     return Colormap([[0, 0, 0, 0], rgb + [1]], name=f"ci_fill_{name}_{h}")
 
 
+def _set_points(layer, pts: np.ndarray, features: pd.DataFrame):
+    """Swap a text-points layer's points and labels. Never with events blocked: napari would keep the previous
+    number of points in view and index past the new labels."""
+    layer.data = pts
+    layer.features = features
+    layer.refresh_text()
+
+
 def contrast_rule(a: np.ndarray, min_span: float = 100.0) -> tuple:
     """(minimum, max(99.9th percentile, minimum + min_span))."""
     lo = float(np.nanmin(a))
@@ -291,9 +299,7 @@ class WellDisplay:
         txt = ["N"] * len(pts)
         if not len(pts):                                   # napari's text needs at least one point: an empty mark
             pts, txt = np.zeros((1, 2)), [""]
-        with T.events.blocker_all():
-            T.data = pts.reshape(-1, 2)
-        T.features = pd.DataFrame(dict(t=txt))
+        _set_points(T, pts.reshape(-1, 2), pd.DataFrame(dict(t=txt)))
         T.refresh_text()
         T.refresh()
 
@@ -333,9 +339,9 @@ class WellDisplay:
                 dc = getattr(r, "dclass", None) or "inside"
                 txt.append(DSHORT.get(dc, "")); col.append(DCOLORS.get(dc, "#d0d0d0"))
         pts = np.c_[pool.iy.to_numpy(float), pool.ix.to_numpy(float)] if len(pool) else np.zeros((0, 2))
-        with L.events.blocker_all():
-            L.data = pts
-        L.features = pd.DataFrame(dict(t=txt, c=col))
+        if not len(pts):                                   # napari's text needs at least one point: an empty tag
+            pts, txt, col = np.zeros((1, 2)), [""], ["#ffffff"]
+        _set_points(L, pts, pd.DataFrame(dict(t=txt, c=col)))
         L.refresh_text()
         L.refresh()
 

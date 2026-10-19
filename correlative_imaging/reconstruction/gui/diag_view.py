@@ -28,7 +28,11 @@ class DiagnosticsView(QWidget):
         b.setToolTip("draw the plots again from the results (e.g. after renaming channels or re-detecting wells)")
         b.clicked.connect(self.redraw)
         h.addWidget(b)
-        b = QPushButton("Open folder")
+        b = QPushButton("Open large")
+        b.setToolTip("the plots in their own window, at full size (resizable, keeps the choice in sync)")
+        b.clicked.connect(self.open_large)
+        h.addWidget(b)
+        b = QPushButton("Folder")
         b.clicked.connect(self.open_folder)
         h.addWidget(b)
         v.addLayout(h)
@@ -44,6 +48,38 @@ class DiagnosticsView(QWidget):
         v.addWidget(self.scroll, 1)
         self.files = []
         self._pix = None
+
+    def open_large(self):
+        """A separate window: the same plot list, the plot at full size (scroll for more)."""
+        from qtpy.QtWidgets import QDialog
+        if getattr(self, "_big", None) is None:
+            dlg = QDialog(self)
+            dlg.setWindowTitle("Diagnostics")
+            dlg.setWindowFlag(Qt.WindowMaximizeButtonHint, True)
+            lv = QVBoxLayout(dlg)
+            self._big_combo = QComboBox()
+            self._big_combo.currentIndexChanged.connect(self._show_big)
+            lv.addWidget(self._big_combo)
+            sc = QScrollArea()
+            sc.setWidgetResizable(True)
+            self._big_img = QLabel()
+            self._big_img.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+            sc.setWidget(self._big_img)
+            lv.addWidget(sc, 1)
+            dlg.resize(1400, 900)
+            self._big = dlg
+        self._big_combo.blockSignals(True)
+        self._big_combo.clear()
+        self._big_combo.addItems([TITLES.get(f.stem, f.stem) for f in self.files])
+        self._big_combo.setCurrentIndex(max(self.list.currentIndex(), 0))
+        self._big_combo.blockSignals(False)
+        self._show_big(self._big_combo.currentIndex())
+        self._big.show()
+        self._big.raise_()
+
+    def _show_big(self, i):
+        if 0 <= i < len(self.files):
+            self._big_img.setPixmap(QPixmap(str(self.files[i])))
 
     def open_folder(self):
         import os

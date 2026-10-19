@@ -37,16 +37,13 @@ class WellBrowser(QWidget):
         self.app = app
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
-        self.tabs = QTabWidget()
-        outer.addWidget(self.tabs)
+        # no own dock: the plate goes to the Control view, the list to Results, the map to the Label tab
         self.plate = PlateView(lambda c: app.cfg.color(c), lambda c: app.cfg.display_name(c))
         self.plate.well_clicked.connect(app.show_well)
-        self.tabs.addTab(self.plate, "Plate")
         lw = QWidget()
-        self.tabs.addTab(lw, "List")
+        self.list_widget = lw
         from .pca import ParticleMap
         self.pca = ParticleMap(app)
-        self.tabs.addTab(self.pca, "Particles (map)")
         v = QVBoxLayout(lw)
         v.setContentsMargins(4, 4, 4, 4)
         h = QHBoxLayout()
@@ -132,19 +129,29 @@ class ReconstructionApp:
         self.batch = {"particle": self.panel.label.particles, "cell": self.panel.label.cells}
         for w in (self.host, self.browser):
             w.setStyleSheet(stylesheet(t))
-        viewer.window.add_dock_widget(self.host, area="right", name="Cell reconstruction")
-        try:                                   # the right panel runs the full height; Wells stays under the canvas
-            viewer.window._qt_window.setCorner(Qt.BottomRightCorner, Qt.RightDockWidgetArea)
-        except Exception:
-            pass
-        from .channels import ChannelPanel
-        self.channels = ChannelPanel(self)
+        rdw = viewer.window.add_dock_widget(self.host, area="right", name="Cell reconstruction")
+        from .channels import ControlView
+        self.channels = ControlView(self)
+        self.channels.set_plate(self.browser.plate)
+        self.panel.results.set_well_list(self.browser.list_widget)
+        self.panel.label.add_map(self.browser.pca)
         self.channels.setStyleSheet(stylesheet(t))
-        viewer.window.add_dock_widget(self.channels, area="left", name="Channels")
+        cdw = viewer.window.add_dock_widget(self.channels, area="left", name="Control view")
         self.display.on_well.append(self.channels.refresh)
-        dw = viewer.window.add_dock_widget(self.browser, area="bottom", name="Wells")
-        try:                                   # a 384-well plate fits across the bottom
-            dw.parentWidget().resizeDocks([dw], [330], Qt.Vertical)
+        try:                                   # one tabbed column on the left: Control view first
+            mw, qv = viewer.window._qt_window, viewer.window._qt_viewer
+            for d, title in ((qv.dockLayerList, "Layers"), (qv.dockLayerControls, "Layer controls")):
+                d.setWindowTitle(title)
+                if hasattr(d, "title") and hasattr(d.title, "title_label"):
+                    d.title.title_label.setText(title)
+                mw.tabifyDockWidget(cdw, d)
+
+            def _settle():                     # after Qt has laid the docks out: Control view on top, sane widths
+                cdw.raise_()
+                mw.resizeDocks([cdw, rdw], [340, 600], Qt.Horizontal)
+            from qtpy.QtCore import QTimer as _T
+            _T.singleShot(0, _settle)
+            _T.singleShot(300, _settle)
         except Exception:
             pass
         viewer.mouse_drag_callbacks.append(self._on_click)
@@ -275,16 +282,21 @@ class ReconstructionApp:
         self.show_test_info()
         self.batch["particle"].update_info()
 
+    def label_this_well(self):
+        if self.res is None or self.store is None or not getattr(self, "_current_well", None):
+            self.say("open a well first")
+            return
+        self.batch["particle"].load_well(*self._current_well)
+
     def show_batch(self, kind: str):
         self.panel.setCurrentWidget(self.panel.label)
         self.panel.label.sub.setCurrentWidget(self.batch[kind])
 
     def update_status(self, pr: dict | None = None):
-        """The status line above the tabs and the retrain bar: where the project stands, what to do next."""
+        """The retrain bar: new training labels since the last retrain."""
         res, st = self.res, self.store
         lt = self.panel.label
         if res is None:
-            self.host.status.setText("<b>Start:</b> Run tab → choose the run and Detect, or open existing results")
             return
         tw = st.test_wells(res.dataset) if st is not None else set()
         arm = (res.run.get("model") or {}).get("arm")
@@ -300,25 +312,9 @@ class ReconstructionApp:
         if L is not None and len(L) and fitted:
             Lt = L[[(p, w) not in tw for p, w in zip(L.plate_id, L.well_id)]]
             new = int((Lt.t.astype(str) > str(fitted)).sum())
-        if not classified:
-            nxt = "Run tab → <b>Classify</b> (no model needed: the Detect preview stands in)"
-        elif not tw:
-            nxt = "Label tab → <b>Freeze test wells</b> (before any labelling)"
-        elif n_test < 30:
-            nxt = "Label → Particles → <b>Test wells (blind)</b>: label at least 30 objects"
-        elif n_train < 50:
-            nxt = "Label → Particles → <b>Training</b>: a few pages (Cells too, once in a while)"
-        elif new >= 50:
-            nxt = "<b>Retrain + classify</b> (Label tab, bottom)"
-        else:
-            nxt = "keep labelling (Training pages, Cells); Model tab: learning curve and comparison"
-        self.host.status.setText(
-            f"<b>{res.dataset}</b> · {len(res.wells)} wells · {model_txt} · test wells: {len(tw)} "
-            f"({n_test} objects labelled blind) · training labels: {n_train}<br><b>Next:</b> {nxt}")
         lt.retrain_info.setText(
-            f"<b>{new}</b> new training labels since the last retrain. Retrain after every ~50–100 (2–4 pages): "
-            "the batches then suggest the new model's classes and the learning curve (Model tab) shows whether "
-            "more labels still help." if classified else "Retrain needs Classify and some labels first.")
+            f"<b>{new}</b> new training labels since the last retrain (retrain every ~50–100)" if classified
+            else "Retrain needs Classify and some labels first.")
         lt.b_retrain.setEnabled(classified and n_train >= 30)
 
     # -- test wells, blind labelling

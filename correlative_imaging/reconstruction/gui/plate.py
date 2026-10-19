@@ -117,8 +117,29 @@ class PlateView(QWidget):
             return blend([self.color_of(c) for c in dom.split("+")])
         return _gradient(r.get("P", np.nan))
 
+    def _size(self) -> int:
+        """Well button size: fits the available width (a narrow side panel too), 9 to 22 px."""
+        C = getattr(self, "_C", 12)
+        w = self.scroll.viewport().width() if self.scroll.viewport().width() > 120 else 0
+        if not w:
+            return 11 if C > 24 else 15 if C > 12 else 22
+        return int(max(9, min(22, (w - 24) // (C + 1) - 1)))
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._fit()
+
+    def _fit(self):
+        s = self._size()
+        for b in getattr(self, "_all", []):
+            if b.width() != s:
+                b.setFixedSize(s, s)
+        if getattr(self, "_R", None):
+            self.scroll.setMinimumHeight(min((self._R + 1) * (s + 1) + 24, 520))
+
     def draw(self, *_):
         self.btns, self.recs = {}, {}
+        self._all = []
         while self.grid.count():
             w = self.grid.takeAt(0).widget()
             if w:
@@ -131,16 +152,22 @@ class PlateView(QWidget):
         rc = [_rc(w) for w in d.well_id]
         nr, nc = max(r for r, _ in rc) + 1, max(c for _, c in rc) + 1
         R, C = next(((a, b) for a, b in FORMATS if nr <= a and nc <= b), (nr, nc))
+        small = C > 12
         for j in range(C):
-            lab = QLabel(str(j + 1))
+            lab = QLabel(str(j + 1) if not small or j % 2 == 0 else "")   # every other number on big plates
             lab.setAlignment(Qt.AlignCenter)
             lab.setProperty("role", "hint")
+            lab.setStyleSheet("font-size: 8px;" if small else "")
+            lab.setMinimumWidth(0)
             self.grid.addWidget(lab, 0, j + 1)
         for i in range(R):
             lab = QLabel(_row_name(i))
             lab.setProperty("role", "hint")
+            lab.setStyleSheet("font-size: 8px;" if small else "")
             self.grid.addWidget(lab, i + 1, 0)
-        size = 11 if C > 24 else 15 if C > 12 else 22
+        self._C, self._R = C, R
+        size = self._size()
+        self.scroll.setMinimumHeight(min((R + 1) * (size + 1) + 24, 520))    # the whole plate, no scrolling
         by = {w: r for w, r in zip(d.well_id, d.to_dict("records"))}
         for i in range(R):
             for j in range(C):
@@ -148,6 +175,7 @@ class PlateView(QWidget):
                 r = by.get(well)
                 b = QToolButton()
                 b.setFixedSize(size, size)
+                self._all.append(b)
                 b.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
                 if r is None:
                     b.setEnabled(False)
@@ -166,6 +194,8 @@ class PlateView(QWidget):
                 b.setToolTip("\n".join(t for t in tip if t))
                 b.clicked.connect(lambda _=False, w=well: self.well_clicked.emit(pl, w))
                 self.grid.addWidget(b, i + 1, j + 1)
+        from qtpy.QtCore import QTimer
+        QTimer.singleShot(0, self._fit)                    # once the panel has its width
         mode = self.mode.currentText()
         if mode == "status":
             keys = sorted(set(d.get("status_shown", pd.Series(dtype=str)).dropna()))

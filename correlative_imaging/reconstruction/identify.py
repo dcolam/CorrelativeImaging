@@ -173,3 +173,45 @@ def well_calls(cells: pd.DataFrame, wells: pd.DataFrame, identity: list) -> pd.D
         out.loc[notc, "call"] = "no cell"
     out.insert(0, "well_plate", out.well_id + "." + out.plate_id)
     return out
+
+
+def advice(info: dict, cells: pd.DataFrame | None, calls: pd.DataFrame | None, cfg: Config) -> dict:
+    """Plain-language hints per identity channel: why the call may be weak and what would help."""
+    out = {}
+    for ch, d in (info or {}).items():
+        tips = []
+        if not d.get("means"):
+            tips.append(f"fewer than {MIN_CELLS} cells: no mixture, the call uses the body's SNR. Classify more wells, "
+                        "or judge cell colours (Bulk: cells) to calibrate it")
+            out[ch] = tips
+            continue
+        mu, w = np.asarray(d["means"]), np.asarray(d["weights"])
+        w_pos = float(w[int(np.argmax(mu))])
+        D = d.get("ashman_d", np.nan)
+        if d.get("user"):
+            u = d["user"]
+            tips.append(f"your colour labels set the cut ({u['n_pos']} positive / {u['n_neg']} negative cells)")
+        if w_pos > 0.85:
+            tips.append(f"{w_pos:.0%} of the cells come out positive: if this channel is on (nearly) every cell, e.g. "
+                        "a stain or a co-expressed marker, make it a marker (Run tab), or the hole background may be "
+                        "under-estimated (Settings: identity background)")
+        elif w_pos < 0.05:
+            tips.append(f"only {w_pos:.0%} of the cells come out positive: a dim fluorophore or a channel that is "
+                        "rarely expressed; check the Identity calibration plot (Diagnostics)")
+        if np.isfinite(D) and D < cfg.min_mixture_sep:
+            tips.append(f"positives and negatives overlap (Ashman's D {D:.1f} < {cfg.min_mixture_sep:g}): dim positives "
+                        "blur into background. Judge the colour of ~10 positive and ~10 negative cells (Bulk: cells): "
+                        "with ≥ 5 of each your answers set the cut")
+        ag = d.get("user_agreement_before")
+        if ag is not None and ag < 0.85:
+            tips.append(f"the unsupervised mixture agreed with your colour labels on only {ag:.0%} of the cells you "
+                        "judged: more colour labels make the calibration take over")
+        if not tips:
+            tips.append(f"separates well (D {D:.1f}, {w_pos:.0%} positive)")
+        out[ch] = tips
+    if calls is not None and len(calls):
+        unc = float((calls["call"] == "uncertain").mean())
+        if unc > 0.1:
+            out["_all"] = [f"{unc:.0%} of the wells are 'uncertain' (no combination reaches P {cfg.p_call:g}): "
+                           "usually one channel above separates badly; fix that one first"]
+    return out

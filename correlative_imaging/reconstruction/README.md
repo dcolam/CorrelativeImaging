@@ -24,33 +24,32 @@ open the tool in its own window. If the run already has a `reconstruction_<run>`
 it opens that. Otherwise the Run tab is filled in for that run, ready for Detect.
 
 
-The GUI is laid out in workflow order. A **status line** on top of the right panel says where the project
-stands and what to do next. The right panel runs the full height; the **Wells** dock (bottom) is for navigation only.
+The GUI is laid out in workflow order: the **Control view** on the left (tabbed with napari's Layers and Layer
+controls) steers the canvas; the right panel holds the steps. A bar on top of the right panel runs while a job works.
+
+**Control view (left):**
+- **Plate** (plate and colouring dropdowns; click a well) and **Label this well**: every object of the well on screen
+  onto a bulk-labeller page, labelled ones too (a key overwrites their label).
+- **Channels:** one row per channel (show it, its contrast range, pick it to adjust) and **one** histogram (log
+  counts, the shown range shaded) with min / max / gamma / auto for the picked channel. Auto-contrast on well change.
+- **Particles in the hole** and **Overlays** (neighbours, cell outline, class tags, edits, brightfield): switches.
 
 **Right panel:**
-1. **Run:**
-   - pick the output folder and run (a preset whose channels match is suggested) and the results folder;
-   - set each channel's **name and colour** (display only) and **role** (identity or marker, or untick it to ignore
-     it). Names and colours from the Results Explorer are used when present;
-   - pick the model (none: Classify uses the Detect preview);
-   - then **Detect** (needs no model), **Classify**, or both.
-2. **Label:**
-   - **Setup** (folds away once done): the label library, **Freeze test wells** (or take them over from an older
-     library), and the blind switches;
-   - **Particles** and **Cells**: the batch labellers (below), each with its two sets, *Test wells (blind)* and
-     *Training*;
-   - **In the canvas**: label mode and click labelling, the cell of the picked particle, and the segmentation fixes
-     (proposed splits, watershed, cuts, merges);
-   - the **Retrain + classify** bar, with the number of new training labels since the last retrain (retrain after
-     every ~50–100).
-3. **Model:** labelling progress per class, the learning curve, the model comparison on the test wells, and under
-   *Advanced* the full training (all arms by grouped cross-validation), label counts and CSV import.
-4. **Results:** counts, calls per plate, per-channel mixture quality, and the plate map (evaluation only).
-5. **Diagnostics:** the plots Detect and Classify write (see "Diagnostics" below).
-6. **Settings** (the defaults work): recommendations from the detected run (applied only on click), safe settings
-   (reconstruction and call), and the locked detection settings that define the features (✓/✗ against the model).
+1. **Run:** output folder and run, results folder; each channel's name, colour and role (identity / marker / off);
+   the model (none: Classify uses the Detect preview); Detect, Classify.
+2. **Label:** Setup (label library, test wells, blind switches; folds away once done); sub-tabs **Bulk: particles**,
+   **Bulk: cells** (the bulk labellers), **Detailed view** (click labelling in the canvas, the cell of the picked
+   particle, segmentation fixes) and **Particle map**; the **Retrain + classify** bar with the new training labels
+   since the last retrain (retrain every ~50–100).
+3. **Model:** labelling progress, learning curve, model comparison (with the no-cell check), and under *Advanced*
+   the full training, label counts and CSV import.
+4. **Results:** the searchable **well list**, the Detect preview, the calls per plate, the identity channels with
+   **advice** per channel (e.g. nearly every cell positive → probably a marker; positives and negatives overlap →
+   judge ~10 + 10 cell colours to calibrate the cut), and the plate map.
+5. **Diagnostics:** the plots; **Open large** shows them full size in their own window.
+6. **Settings.**
 
-**Batch labeller** (Label → Particles / Cells): pages of thumbnails.
+**Bulk labeller** (Label → Bulk: particles / Bulk: cells): pages of thumbnails.
 - Keys (click a tile first): particles 1–6, cells 1–3 (verdict) and Q W E R / 0 (colour), **U unsure**, Enter keep
   the suggestion, Backspace skip, Space show the well in the canvas, N new page.
 - **Several at once:** Ctrl+click, Shift+click or Ctrl+A select tiles; a key then labels all of them, Enter keeps
@@ -61,22 +60,19 @@ stands and what to do next. The right panel runs the full height; the **Wells** 
   channels' noise doesn't distract.
 - **Unsure** objects are recorded, never trained on, and not shown again.
 
-**Wells (bottom):**
-- **Plate:** a plate view (96 / 384 / 1536, taken from the well ids). Wells are coloured by status, dominant channel
-  or P. A white frame means the well is labelled; a dashed amber frame means it is a test well.
-- **List:** a searchable, filterable list of wells.
-- **Particles (map):** every particle in the holes, in one of two spaces:
-  - **features (PCA):** a PCA of the 28 features the classifier sees. The classes overlap here: on ROMK, PC1 (35 %)
-    is brightness and PC2 (16 %) geometry, and the hand classes barely separate (silhouette 0.04). The classifier's
-    rules are non-linear, which a linear map cannot show.
-  - **model probabilities:** each class is a corner of a pentagon, and a particle sits at the probability-weighted
-    mean of the corners. Sure particles sit at a corner, unsure ones between corners.
+**Particle map** (Label → Particle map):
+- **features (PCA):** a PCA of the 28 features the classifier sees. The classes overlap here: on ROMK, PC1 (35 %)
+  is brightness and PC2 (16 %) geometry, and the hand classes barely separate (silhouette 0.04). The classifier's
+  rules are non-linear, which a linear map cannot show.
+- **model probabilities:** each class is a corner, and a particle sits at the probability-weighted mean of the
+  corners. Sure particles sit at a corner, unsure ones between corners.
 
-  Colour by preview class, model class, hand label, channel, plate or threshold level. Hover for details, click to
-  open the well with that particle picked; the current well's particles are ringed. **Shift-drag** a rectangle to
-  select points, then "Queue selected" makes them a batch-labeller page.
+Colour by preview class, model class, hand label, channel, plate or threshold level. Hover for details, click to open
+the well with that particle picked. **Shift-drag** a rectangle to select points, then "Queue selected" makes them a
+bulk-labeller page.
 
-Before Classify the colours are the Detect preview; afterwards they are the calls. `n` and `p` step through the list.
+Before Classify the plate colours are the Detect preview; afterwards they are the calls. `n` and `p` step through
+the well list.
 
 **Canvas layers.** By default only the fluorescence channels and the hole outline are shown. The rest are layers you
 switch on in the **Channels** dock (left), which also shows every channel at once, as in the HTML viewer: visibility,

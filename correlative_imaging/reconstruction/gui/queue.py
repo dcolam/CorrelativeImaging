@@ -165,7 +165,9 @@ class Tile(QFrame):
         self.state.setTextFormat(Qt.RichText)
         self.state.setFixedWidth(TILE)
         v.addWidget(self.state)
-        self.setFixedSize(TILE + 12, TILE + 64)          # rows never squeezed: the page scrolls instead
+        self.cap.setFixedHeight(34)
+        self.state.setFixedHeight(18)
+        self.setFixedSize(TILE + 12, TILE + 70)          # rows never squeezed: the page scrolls instead
         self.set_focus(False)
 
     def set_focus(self, on, selected=False):
@@ -257,6 +259,7 @@ class LabelQueue(QWidget):
         self.grid_host.keyPressEvent = self.key
         self.grid = QGridLayout(self.grid_host)
         self.grid.setSpacing(6)
+        self.grid.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         sc = QScrollArea()
         sc.setWidgetResizable(True)
         sc.setWidget(self.grid_host)
@@ -352,6 +355,39 @@ class LabelQueue(QWidget):
             for r in nxt.drop_duplicates(["plate_id", "well_id"]).itertuples(index=False):
                 wells.get(r.plate_id, r.well_id)
         self.pool.submit(job)
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        app = self.app
+        if not self.tiles and app.res is not None and app.store is not None:
+            from qtpy.QtCore import QTimer as _T
+            _T.singleShot(0, self.new_page)               # the first page as soon as the tab is shown
+
+    def load_well(self, plate_id, well_id):
+        """Every object of one well on a page, labelled ones too (shown with their label; a key overwrites it).
+        Blind if it is a test well (and test wells are blind)."""
+        app = self.app
+        from .. import tiers
+        T = tiers.particle_tiers(app.res, app.model)
+        T = T[(T.plate_id == plate_id) & (T.well_id == well_id)].sort_values(["ch", "level"])
+        if not len(T):
+            self.info.setText(f"{plate_id} {well_id}: no particles in the hole")
+            return
+        blind = app.is_blind(plate_id, well_id)
+        self.rows = T.assign(blind=blind).reset_index(drop=True)
+        self.state, self.cur, self.sel = {}, 0, set()
+        m = tiers.matched(app.res, app.store)
+        have = {o: l for o, l in zip(m.oid, m.label)} if len(m) else {}
+        m = m[(m.plate_id == plate_id) & (m.well_id == well_id)] if len(m) else m
+        have = dict(zip(m.oid, m.label)) if len(m) else {}
+        self._build()
+        for i, r in enumerate(self.rows.itertuples(index=False)):
+            if r.oid in have:
+                self.state[i] = {"label": have[r.oid]}
+                self._draw_state(i)
+        self.state = {}                                    # shown, but the page still counts as to do
+        self.info.setText(f"{plate_id} {well_id}: {len(self.rows)} objects ({len(have)} labelled; a key overwrites)")
+        app.show_batch("particle")
 
     def load_selection(self, keys: pd.DataFrame):
         """A page of hand-picked particles (from the particle map); test wells are left out (blind elsewhere)."""
@@ -474,11 +510,14 @@ class LabelQueue(QWidget):
                 break
             blind = self._is_blind(r)
             if self.kind == "cell":
-                head = f"{r.plate_id} {r.well_id} · cell {r.cell_id}"
+                head = f"{r.well_id} · cell {r.cell_id}"
+                self.tiles[i].setToolTip(f"{r.plate_id} {r.well_id} · cell {r.cell_id}")
                 sug = "" if blind else (f"call: <b>{'+'.join(disp(c) for c in self._suggest(r).split('+'))}</b>"
                                         if self._suggest(r) else f"call: {getattr(r, 'call', '')}")
             else:
-                head = f"{r.plate_id} {r.well_id} · {disp(r.ch)} {'lenient' if r.level == 'hole' else 'stringent'}"
+                head = f"{r.well_id} · {disp(r.ch)} · {'len.' if r.level == 'hole' else 'str.'}"
+                self.tiles[i].setToolTip(f"{r.plate_id} {r.well_id} · {disp(r.ch)} · "
+                                         f"{'lenient (hole) threshold' if r.level == 'hole' else 'stringent (whole-image) threshold'}")
                 s = self._suggest(r)
                 sug = "" if blind or not s else (f"<span style='color:{CLASS_COLORS.get(s, '#ccc')}'>■</span> "
                                                  f"{s} <span style='color:#8a929c'>({r.tier}, "
