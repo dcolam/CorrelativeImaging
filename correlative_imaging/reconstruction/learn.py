@@ -216,7 +216,8 @@ def training_frame(F: pd.DataFrame, matched: pd.DataFrame) -> pd.DataFrame:
 
 
 def train(T: pd.DataFrame, test_groups: set, arms=ARMS, folds: int = 5, rounds: int = 3, tau: float = 0.9,
-          final_arm: str | None = None, progress=None, feature_config: dict | None = None) -> TrainResult:
+          final_arm: str | None = None, progress=None, feature_config: dict | None = None,
+          cv: bool = True) -> TrainResult:
     """T: training_frame (all pool particles of the loaded datasets, labelled or not). test_groups: group keys
     (dataset|plate|well) of the frozen test wells. Returns the final model (fitted on all non-test labels with the
     chosen arm) + the reports."""
@@ -244,7 +245,7 @@ def train(T: pd.DataFrame, test_groups: set, arms=ARMS, folds: int = 5, rounds: 
     nf = min(folds, len(set(gtr)))
     splits = list(GroupKFold(nf).split(X_all[tr], y_all[tr], gtr))
     idx_tr = np.flatnonzero(tr)
-    for arm in arms:
+    for arm in (arms if cv else []):                    # cv=False: the labelling loop's quick refit, no comparison
         say(f"cross-validating '{arm}'")
         fold_m = []
         for k, (a, b) in enumerate(splits):
@@ -256,7 +257,9 @@ def train(T: pd.DataFrame, test_groups: set, arms=ARMS, folds: int = 5, rounds: 
             fold_m.append(metrics(y_all[val_i], m.predict_proba(X_all[val_i]), w_all[val_i]))
         cvm = pd.DataFrame(fold_m).mean(numeric_only=True)
         rows.append(dict(arm=arm, **cvm.to_dict()))
-    cv = pd.DataFrame(rows)
+    cv = pd.DataFrame(rows, columns=["arm", "macro_f1"]) if not rows else pd.DataFrame(rows)
+    if not len(cv):
+        cv = pd.DataFrame(dict(arm=list(arms), macro_f1=np.nan))
 
     # final fits on all training labels; the frozen test wells only reported
     unl = (~lab) & ~is_test
@@ -272,7 +275,8 @@ def train(T: pd.DataFrame, test_groups: set, arms=ARMS, folds: int = 5, rounds: 
         test_rows.append(dict(arm=arm, coverage_unlabelled=cov, n_pseudo=m.n_pseudo, **tm))
     test = pd.DataFrame(test_rows)
     cv = cv.merge(test[["arm", "coverage_unlabelled", "n_pseudo"]], on="arm")
-    best = final_arm or cv.sort_values("macro_f1", ascending=False).arm.iloc[0]
+    best = final_arm or (cv.sort_values("macro_f1", ascending=False).arm.iloc[0] if cv.macro_f1.notna().any()
+                         else list(arms)[0])
     chosen = models[best]
 
     # what to label next: the most uncertain unlabelled particles, one per well, test wells excluded
@@ -341,6 +345,70 @@ class ParticleModel:
         return cls(d["model"], d["spec"])
 
 
+def learning_curve(T: pd.DataFrame, test_groups: set, arm: str = "hand", fracs=(0.25, 0.5, 0.75, 1.0), seed: int = 0,
+                   min_test: int = 30) -> pd.DataFrame | None:
+    """Score on the test wells against the number of training labels (random subsets of the training wells). None
+    when the test wells hold fewer than `min_test` labels (the curve would be noise)."""
+    rng = np.random.default_rng(seed)
+    g = group_key(T)
+    is_test = np.isin(g, list(test_groups))
+    lab = T.label.notna().to_numpy()
+    te = lab & is_test
+    if te.sum() < min_test:
+        return None
+    X = T[FEATURES].to_numpy(float)
+    y = np.array([CLASSES.index(c) if isinstance(c, str) else -1 for c in T.label])
+    w = T.weight.fillna(0).to_numpy(float)
+    tr_wells = np.array(sorted(set(g[lab & ~is_test])))
+    unl = (~lab) & ~is_test
+    weak = np.array([CLASSES.index(c) if isinstance(c, str) else -1 for c in weak_labels(T)])
+    rows = []
+    for f in fracs:
+        pick = set(rng.choice(tr_wells, max(1, int(round(f * len(tr_wells)))), replace=False))
+        tr = lab & ~is_test & np.isin(g, list(pick))
+        if tr.sum() < 20 or len(set(y[tr])) < 2:
+            continue
+        m = fit_arm(arm, X[tr], y[tr], w[tr], X[unl], rounds=1, weak=weak[unl])
+        mt = metrics(y[te], m.predict_proba(X[te]), w[te])
+        mt["n_test"] = mt.pop("n")
+        rows.append(dict(n=int(tr.sum()), **mt))
+    return pd.DataFrame(rows)
+
+
+def compare_models(results_dir, store, models: list, tol_um: float = 2.0) -> pd.DataFrame:
+    """Every model (a .joblib path / name in models/, or "preview") scored on the labelled particles of the frozen test
+    wells of one results folder (its dataset's test wells in `store`)."""
+    from .config import MODELS
+    from .pipeline import Results
+    from .preview import PreviewModel
+    T, tg, _ = assemble([results_dir], store, tol_um)
+    g = group_key(T)
+    te = T.label.notna().to_numpy() & np.isin(g, list(tg))
+    y = np.array([CLASSES.index(c) for c in T.label[te]])
+    w = T.weight[te].fillna(1).to_numpy(float)
+    rows = []
+    for name in models:
+        try:
+            if name == "preview":
+                mdl = PreviewModel()
+            else:
+                p = Path(name)
+                mdl = ParticleModel.load(p if p.exists() else MODELS / name)
+            miss = [f for f in getattr(mdl, "spec", {}).get("features", []) if f not in T]
+            if miss:
+                rows.append(dict(model=name, n=int(te.sum()), note=f"results lack {', '.join(miss)}: detect again"))
+                continue
+            M = mdl.predict(T[te])
+            P = M[[f"p_{c}" for c in CLASSES]].to_numpy(float)
+            sp = getattr(mdl, "spec", {})
+            rows.append(dict(model=name, arm=sp.get("arm"), trained_on=",".join(sp.get("datasets", []) or []),
+                             n_train=sp.get("n_train"), **{k: (round(v, 3) if isinstance(v, float) else v)
+                                                           for k, v in metrics(y, P, w).items()}))
+        except Exception as e:
+            rows.append(dict(model=name, note=str(e)))
+    return pd.DataFrame(rows)
+
+
 def assemble(results_dirs: list, store, tol_um: float = 2.0, test_frac: float = 0.2):
     """Training frame over several output folders: their pool particles, the labels of their datasets matched to
     particles, and the frozen test wells per dataset (frozen on first use). Returns (T, test_groups, report);
@@ -361,13 +429,36 @@ def assemble(results_dirs: list, store, tol_um: float = 2.0, test_frac: float = 
             drop = (m.label == "merged").to_numpy() & (np.nan_to_num(np_, nan=1) > 1)
             n_dropped = int(drop.sum())
             m = m[~drop]
+        # cell labels (outside the test wells) lend weak labels to their seed particles: "one cell" -> cell,
+        # "several cells" -> merged (weight 0.5; a particle's own label wins)
+        from .labels import match_cells
+        tw_ = store.test_wells(r.dataset)
+        cm = match_cells(store.cell_frame(r.dataset), r)
+        n_cell_weak = 0
+        if len(cm) and "members" in cm:
+            cm = cm[[(p, w) not in tw_ for p, w in zip(cm.plate_id, cm.well_id)]]
+            add = []
+            for c in cm.itertuples():
+                lab = {"one cell": "cell", "several cells": "merged"}.get(c.verdict)
+                if not lab or not isinstance(c.members, str):
+                    continue
+                for o in c.members.split(";"):
+                    if o:
+                        add.append(dict(dataset=r.dataset, plate_id=c.plate_id, well_id=c.well_id, oid=o, label=lab,
+                                        source="cell label", weight=0.5))
+            if add:
+                A = pd.DataFrame(add)
+                have = set(zip(m.plate_id, m.well_id, m.oid)) if len(m) else set()
+                A = A[[k not in have for k in zip(A.plate_id, A.well_id, A.oid)]]
+                n_cell_weak = len(A)
+                m = pd.concat([m, A], ignore_index=True) if len(m) else A
         frames.append(training_frame(F, m))
         fcs.append(r.config.feature_config())
         tw = store.freeze_test_wells(r.dataset, test_frac)
         tg |= {f"{r.dataset}|{p}|{w}" for p, w in tw}
         u = m.drop_duplicates(["plate_id", "well_id", "ly", "lx"]) if len(m) else m
         rep.append(dict(dataset=r.dataset, folder=str(d), labels=len(L), matched=len(u), test_wells=len(tw),
-                        pool=int(F.pool.sum()), merged_on_split_dropped=n_dropped))
+                        pool=int(F.pool.sum()), merged_on_split_dropped=n_dropped, from_cell_labels=n_cell_weak))
     T = pd.concat(frames, ignore_index=True)
     rep = pd.DataFrame(rep)
     rep.attrs["feature_config"] = fcs[0] if fcs else {}

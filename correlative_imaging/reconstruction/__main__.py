@@ -8,6 +8,8 @@
         [--arm self-train] [--rounds 3]
   python -m correlative_imaging.reconstruction import-labels --csv labels.csv --labels ci_labels.db --dataset <name>
         --names GFP=488nm mScarlet=561nm ... [--wells-csv wells.csv]
+  python -m correlative_imaging.reconstruction freeze-test-wells --out <dir> --labels new.db [--from old.db]
+  python -m correlative_imaging.reconstruction compare --out <dir> --labels ci_labels.db --models preview a.joblib ...
 
 `--config` takes a JSON file or a preset name (identity/presets/*.json).
 """
@@ -39,6 +41,15 @@ def main(argv=None):
     t.add_argument("--results", nargs="+", required=True); t.add_argument("--labels", required=True)
     t.add_argument("--model", required=True); t.add_argument("--arm"); t.add_argument("--rounds", type=int, default=3)
     t.add_argument("--arms", nargs="+", help="arms to compare (default: all)")
+    c.add_argument("--labels", help="label library: use its cell labels (colour calibration, verdicts)")
+    f = sub.add_parser("freeze-test-wells", help="pick the held-out wells before labelling (clean slate)")
+    f.add_argument("--out", required=True); f.add_argument("--labels", required=True)
+    f.add_argument("--from", dest="other", help="older label library: take over its test wells, draw the rest from "
+                                                "wells it never labelled")
+    f.add_argument("--frac", type=float, default=0.2)
+    k = sub.add_parser("compare", help="score models on the labelled particles of the frozen test wells")
+    k.add_argument("--out", required=True); k.add_argument("--labels", required=True)
+    k.add_argument("--models", nargs="+", default=["preview"])
     i = sub.add_parser("import-labels", help="import a first labelling session (CSV)")
     i.add_argument("--csv", required=True); i.add_argument("--labels", required=True)
     i.add_argument("--dataset", required=True); i.add_argument("--names", nargs="+", required=True)
@@ -66,7 +77,13 @@ def main(argv=None):
         from .pipeline import Results, classify_run
         cfg = load_config(a.config) if a.config else Results(a.out).config
         model = ParticleModel.load(a.model) if a.model else None
-        r = classify_run(a.out, cfg, model, a.workers)
+        cl = None
+        if a.labels:
+            from .labels import LabelStore
+            st, ds = LabelStore(a.labels), Results(a.out).dataset
+            C, tw = st.cell_frame(ds), st.test_wells(ds)
+            cl = C[[(p, w) not in tw for p, w in zip(C.plate_id, C.well_id)]] if len(C) else None
+        r = classify_run(a.out, cfg, model, a.workers, cell_labels=cl)
         print(r["calls"].call.value_counts().to_string())
     elif a.cmd == "train":
         from .labels import LabelStore
@@ -87,6 +104,17 @@ def main(argv=None):
         path = path if path.suffix else MODELS / f"{a.model}.joblib"
         res.model.save(path)
         print(f"saved {res.model.spec['arm']} -> {path}")
+    elif a.cmd == "freeze-test-wells":
+        from .labels import LabelStore
+        from .pipeline import Results
+        r = Results(a.out)
+        pick = LabelStore(a.labels).freeze_test_wells_from(r.dataset, r.wells, a.frac, other=a.other)
+        print(f"{len(pick)} test wells for dataset {r.dataset}")
+    elif a.cmd == "compare":
+        from .labels import LabelStore
+        from .learn import compare_models
+        pd.set_option("display.width", 220)
+        print(compare_models(a.out, LabelStore(a.labels), a.models).to_string(index=False))
     elif a.cmd == "import-labels":
         from .labels import LabelStore
         names = dict(n.split("=", 1) for n in a.names)

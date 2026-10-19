@@ -560,6 +560,54 @@ class TrainTab(QWidget):
         b.clicked.connect(self.import_csv)
         v.addWidget(b)
 
+        v.addWidget(section("Test wells and blind labelling"))
+        v.addWidget(hint("A frozen set of held-out wells per dataset, labelled blind and never trained on: the only "
+                         "fair score for any model (the old one included). Freeze it before labelling a new dataset."))
+        h = QHBoxLayout()
+        self.b_freeze = QPushButton("Freeze test wells")
+        self.b_freeze.setToolTip("20 % of the wells with something in the hole, per plate (only once per dataset)")
+        self.b_freeze.clicked.connect(lambda: app.freeze_test_wells())
+        h.addWidget(self.b_freeze)
+        b = QPushButton("…take over from another library")
+        b.setToolTip("use the test wells of an older label library for this dataset, and draw the rest only from wells "
+                     "it never labelled (so a model trained on it can be compared fairly)")
+        b.clicked.connect(self.freeze_from_other)
+        h.addWidget(b)
+        self.test_info = QLabel("")
+        self.test_info.setProperty("role", "hint")
+        h.addWidget(self.test_info, 1)
+        v.addLayout(h)
+        h = QHBoxLayout()
+        self.blind = QCheckBox("blind labelling")
+        self.blind.setToolTip("hide every class, call, probability, reconstructed cell and preview in the canvas, the "
+                              "plate and the lists")
+        self.blind_test = QCheckBox("always blind in test wells")
+        self.blind_test.setChecked(True)
+        for cb in (self.blind, self.blind_test):
+            cb.toggled.connect(app.blind_changed)
+            h.addWidget(cb)
+        h.addStretch(1)
+        v.addLayout(h)
+
+        v.addWidget(section("Labelling progress"))
+        self.prog_box = QVBoxLayout()
+        v.addLayout(self.prog_box)
+        self.prog_bars = {}
+        self.curve_lbl = hint("Learning curve after training: score on the test wells against the number of training "
+                              "labels.")
+        v.addWidget(self.curve_lbl)
+        try:
+            import pyqtgraph as pg
+            self.curve = pg.PlotWidget(background=None)
+            self.curve.setMinimumHeight(140)
+            self.curve.setMaximumHeight(170)
+            self.curve.setLabel("bottom", "training labels")
+            self.curve.setLabel("left", "macro F1 (test wells)")
+            self.curve.setMenuEnabled(False)
+            v.addWidget(self.curve)
+        except ImportError:
+            self.curve = None
+
         v.addWidget(section("Label particles"))
         h = QHBoxLayout()
         self.mode = QPushButton("Label mode  (L)")
@@ -608,6 +656,23 @@ class TrainTab(QWidget):
         self.picked.setWordWrap(True)
         self.picked.setTextFormat(Qt.RichText)
         v.addWidget(self.picked)
+
+        v.addWidget(section("Label the cell"))
+        v.addWidget(hint("After Classify: the reconstructed cell under the picked particle. Verdict: one cell, several "
+                         "cells that cannot be split by eye (either could be the patched one), or not a cell; colour: "
+                         "the identity channels it is positive for. The label queue (bottom dock, Cells) does the "
+                         "same from thumbnails."))
+        h = QHBoxLayout()
+        for vd in ("one cell", "several cells", "not a cell"):
+            b = QPushButton(vd)
+            b.clicked.connect(lambda _=False, vd=vd: app.label_cell(verdict=vd))
+            h.addWidget(b)
+        v.addLayout(h)
+        self.colour_row = QHBoxLayout()
+        v.addLayout(self.colour_row)
+        self.colour_boxes = {}
+        self.cell_info = hint("")
+        v.addWidget(self.cell_info)
 
         v.addWidget(section("Edit particles"))
         v.addWidget(hint("Dashed orange lines are splits Detect proposes at signal dips (not applied). Accept one for "
@@ -696,6 +761,28 @@ class TrainTab(QWidget):
         h.addWidget(self.b_save)
         v.addLayout(h)
 
+        v.addWidget(section("Compare models on the test wells"))
+        v.addWidget(hint("Scores any saved model (or the Detect preview) on the blind labels of the frozen test wells "
+                         "of the open results: the fair comparison, also across datasets."))
+        h = QHBoxLayout()
+        self.cmp_models = QComboBox()
+        self.cmp_models.setEditable(False)
+        h.addWidget(self.cmp_models, 1)
+        b = QPushButton("Add")
+        b.clicked.connect(self.add_cmp)
+        h.addWidget(b)
+        b = accent(QPushButton("Compare"))
+        b.clicked.connect(app.compare_models)
+        h.addWidget(b)
+        v.addLayout(h)
+        self.cmp_list = QLabel("preview")
+        self.cmp_list.setProperty("role", "hint")
+        v.addWidget(self.cmp_list)
+        self.cmp = FrameModel()
+        cmv = FrameView(self.cmp)
+        cmv.setMinimumHeight(120)
+        v.addWidget(cmv)
+
         v.addWidget(section("Label next"))
         v.addWidget(hint("Unlabelled particles the model is least sure about (one per well, test wells excluded). "
                          "Double-click to open."))
@@ -707,6 +794,73 @@ class TrainTab(QWidget):
         v.addStretch(1)
         scroll.setWidget(body)
         outer.addWidget(scroll)
+
+    def freeze_from_other(self):
+        p, _ = QFileDialog.getOpenFileName(self, "Older label library", "", "SQLite (*.db)")
+        if p:
+            self.app.freeze_test_wells(other=p)
+
+    def set_colour_boxes(self, chans: list):
+        while self.colour_row.count():
+            w = self.colour_row.takeAt(0).widget()
+            if w is not None:
+                w.setParent(None)
+        self.colour_boxes = {}
+        self.colour_row.addWidget(QLabel("positive for"))
+        for ch in chans:
+            cb = QCheckBox(self.app.cfg.display_name(ch))
+            cb.setStyleSheet(f"QCheckBox {{ color: {self.app.cfg.color(ch)}; }}")
+            self.colour_boxes[ch] = cb
+            self.colour_row.addWidget(cb)
+        b = QPushButton("set colour")
+        b.clicked.connect(lambda: self.app.label_cell(colour="+".join(c for c, cb in self.colour_boxes.items()
+                                                                      if cb.isChecked()) or "none"))
+        self.colour_row.addWidget(b)
+        self.colour_row.addStretch(1)
+
+    def add_cmp(self):
+        m = self.cmp_models.currentText()
+        cur = [x for x in self.cmp_list.text().split(" · ") if x]
+        if m and m not in cur:
+            self.cmp_list.setText(" · ".join(cur + [m]))
+
+    def compare_list(self) -> list:
+        return [x for x in self.cmp_list.text().split(" · ") if x]
+
+    def show_progress(self, pr: dict):
+        """Per class (target), test wells, cells per colour: progress bars (counts, not plots)."""
+        items = [(f"{c}", n, t) for c, (n, t) in pr.get("classes", {}).items()]
+        t = pr.get("test", {})
+        if t:
+            items.append(("test objects (blind)", t.get("labelled", 0), max(t.get("objects", 0), 1)))
+        for col, (n, tg) in pr.get("cells", {}).items():
+            items.append((f"cells: {'+'.join(self.app.cfg.display_name(x) for x in col.split('+'))}", n, tg))
+        for name, n, tg in items:
+            bar = self.prog_bars.get(name)
+            if bar is None:
+                row = QHBoxLayout()
+                lab = QLabel(name)
+                lab.setMinimumWidth(150)
+                row.addWidget(lab)
+                bar = QProgressBar()
+                bar.setTextVisible(True)
+                row.addWidget(bar, 1)
+                self.prog_box.addLayout(row)
+                self.prog_bars[name] = bar
+            bar.setMaximum(max(int(tg), 1))
+            bar.setValue(min(int(n), int(tg)))
+            bar.setFormat(f"{n} / {tg}")
+
+    def show_curve(self, curve: pd.DataFrame | None, text: str = ""):
+        if self.curve is None:
+            return
+        self.curve.clear()
+        if curve is not None and len(curve):
+            import pyqtgraph as pg
+            self.curve.plot(curve.n.to_numpy(float), curve.macro_f1.to_numpy(float), pen=pg.mkPen("#4fc3f7", width=2),
+                            symbol="o", symbolSize=6, symbolBrush="#4fc3f7")
+        self.curve_lbl.setText(text or "Learning curve after training: score on the test wells against the number "
+                                       "of training labels.")
 
     def browse_store(self):
         p, _ = QFileDialog.getSaveFileName(self, "Label library", self.store_path.text() or "ci_labels.db",

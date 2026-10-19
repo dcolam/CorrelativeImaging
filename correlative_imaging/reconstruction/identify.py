@@ -12,6 +12,10 @@
              fitted on control wells. Mixture separation (Ashman's D) is reported per channel; D < `min_mixture_sep`
              flags a channel whose positives and negatives do not separate well (e.g. nearly all cells positive).
              Fewer than 20 cells: no mixture; P from the body SNR against the hole background (flagged).
+2b your colour  With cell labels (outside the test wells) that judge a channel at least MIN_USER times positive and
+             MIN_USER times negative, P(positive in c) comes from a logistic fit of those answers on the same
+             asinh scale instead of the mixture (the mixture is still fitted and reported, with its agreement with
+             your answers). Cells judged "several cells" / "not a cell" are never part of that fit.
 3 combination  P(S) = prod_{c in S} P_c x prod_{c not in S} (1 - P_c) over every subset S of the identity channels
              (2^K, K = 1..4 in practice). The call is the most likely subset ("none" = negative in all), or
              "uncertain" when its probability is below `p_call`. Marker channels are measured, never called.
@@ -27,6 +31,7 @@ from .config import Config
 
 S0 = 0.05          # asinh scale: 5 % of a typical field cell
 MIN_CELLS = 20
+MIN_USER = 5       # judged cells per side (positive / negative) before your colour calibration takes over
 
 
 def _mixture(x: np.ndarray):
@@ -51,12 +56,20 @@ def combos(channels: list) -> list[tuple]:
     return out
 
 
+def _user_fit(x: np.ndarray, pos: np.ndarray):
+    from sklearn.linear_model import LogisticRegression
+    lr = LogisticRegression(C=10.0).fit(x[:, None], pos.astype(int))
+    a, b = float(lr.coef_[0, 0]), float(lr.intercept_[0])
+    return a, b
+
+
 def identify(cells: pd.DataFrame, wells: pd.DataFrame, ref: pd.DataFrame, identity: list, cfg: Config,
-             stored: dict | None = None):
+             stored: dict | None = None, user: pd.DataFrame | None = None):
     """cells: reconstructed cells (plate_id, well_id, body_mean_<ch>). Returns (cells + n_<ch>, p_<ch>, call,
     p_call_best, dominant), info per channel. With `stored` (a previous run's info) the per-channel mixtures are
-    not refitted but applied as stored, so changing a few cells does not shift any other call."""
-    c = cells.copy()
+    not refitted but applied as stored, so changing a few cells does not shift any other call. user: judged cells
+    (plate_id, well_id, cell_id, verdict, colour), test wells already removed (see module doc, 2b)."""
+    c = cells.copy().reset_index(drop=True)
     info = {}
     if not len(c):
         return c, info
@@ -71,6 +84,11 @@ def identify(cells: pd.DataFrame, wells: pd.DataFrame, ref: pd.DataFrame, identi
         c[f"n_{ch}"] = (c[f"body_mean_{ch}"] - bg) / rm
         x = np.arcsinh(c[f"n_{ch}"].to_numpy(float) / S0)
         st = (stored or {}).get(ch)
+        if stored is not None and st and st.get("user"):
+            a, b = st["user"]["a"], st["user"]["b"]
+            c[f"p_{ch}"] = 1 / (1 + np.exp(-(a * x + b)))
+            info[ch] = st
+            continue
         if stored is not None and st and st.get("means"):
             from scipy.stats import norm
             mu, sd, w = np.asarray(st["means"]), np.asarray(st["sds"]), np.asarray(st["weights"])
@@ -89,6 +107,21 @@ def identify(cells: pd.DataFrame, wells: pd.DataFrame, ref: pd.DataFrame, identi
         else:
             c[f"p_{ch}"], info[ch] = mx
             info[ch]["weak_separation"] = info[ch]["ashman_d"] < cfg.min_mixture_sep
+        if user is not None and len(user) and stored is None:
+            u = c[["plate_id", "well_id", "cell_id"]].reset_index().merge(user, on=["plate_id", "well_id", "cell_id"])
+            u = u[(u.verdict.fillna("one cell").isin(["one cell", ""])) & (u.colour.fillna("") != "")]
+            if len(u):
+                pos = np.array([ch in str(col).split("+") for col in u.colour])
+                xu = x[u["index"].to_numpy()]
+                ok = np.isfinite(xu)
+                agree = float(((c[f"p_{ch}"].to_numpy(float)[u["index"].to_numpy()] >= 0.5) == pos).mean())
+                info[ch]["user_agreement_before"] = agree
+                info[ch]["user_n"] = dict(pos=int(pos[ok].sum()), neg=int((~pos[ok]).sum()))
+                if pos[ok].sum() >= MIN_USER and (~pos[ok]).sum() >= MIN_USER:
+                    a, b = _user_fit(xu[ok], pos[ok])
+                    c[f"p_{ch}"] = 1 / (1 + np.exp(-(a * x + b)))
+                    info[ch]["user"] = dict(a=a, b=b, n_pos=int(pos[ok].sum()), n_neg=int((~pos[ok]).sum()),
+                                            cut_n=float(S0 * np.sinh(-b / a)) if a else None)
     P = c[[f"p_{ch}" for ch in identity]].to_numpy(float)
     P = np.where(np.isfinite(P), P, 0.5)
     allc = combos(identity)
@@ -119,6 +152,8 @@ def well_calls(cells: pd.DataFrame, wells: pd.DataFrame, identity: list) -> pd.D
     if not len(cells):
         return base.assign(n_cells=0, call="no cell", status="no cell")
     c = cells.assign(rank=cells.p_cell.fillna(0) * cells.body_in_hole)
+    if "verdict" in c:                                  # judged by hand: "not a cell" never wins the well
+        c.loc[c.verdict == "not a cell", "rank"] = -1
     best = c.sort_values("rank", ascending=False).drop_duplicates(["plate_id", "well_id"])
     n = cells.groupby(["plate_id", "well_id"]).size().rename("n_cells")
     keep = ["plate_id", "well_id", "cell_id", "call", "combo", "p_combo", "dominant", "p_cell", "body_um2", "grow_x",
@@ -128,5 +163,13 @@ def well_calls(cells: pd.DataFrame, wells: pd.DataFrame, identity: list) -> pd.D
     out["n_cells"] = out.n_cells.fillna(0).astype(int)
     out["call"] = out.call.fillna("no cell")
     out["status"] = np.select([out.n_cells == 0, out.n_cells == 1], ["no cell", "one cell"], "several cells")
+    if "verdict" in best:
+        v = out[["plate_id", "well_id"]].merge(best[["plate_id", "well_id", "verdict"]], how="left").verdict
+        sev = (v == "several cells").to_numpy()
+        out.loc[sev, "status"] = "several cells (by eye)"     # cannot be split by eye: either could be patched
+        out.loc[sev, "call"] = "ambiguous"
+        notc = (v == "not a cell").to_numpy()
+        out.loc[notc, "status"] = "no cell"
+        out.loc[notc, "call"] = "no cell"
     out.insert(0, "well_plate", out.well_id + "." + out.plate_id)
     return out

@@ -46,7 +46,14 @@ class WellBrowser(QWidget):
         self.tabs.addTab(lw, "List")
         from .pca import ParticleMap
         self.pca = ParticleMap(app)
-        self.tabs.addTab(self.pca, "Particles (PCA)")
+        self.tabs.addTab(self.pca, "Particles (map)")
+        from .queue import LabelQueue
+        self.queue = LabelQueue(app)
+        self.tabs.insertTab(0, self.queue, "Label queue")
+        from .diag_view import DiagnosticsView
+        self.diag = DiagnosticsView(app)
+        self.tabs.addTab(self.diag, "Diagnostics")
+        self.tabs.setCurrentWidget(self.plate)
         v = QVBoxLayout(lw)
         v.setContentsMargins(4, 4, 4, 4)
         h = QHBoxLayout()
@@ -247,6 +254,186 @@ class ReconstructionApp:
         self.set_config(cfg)
         self.recommend()
         self.update_pca()
+        self.browser.queue.set_results(self.res)
+        self.panel.train.set_colour_boxes(self.res.run.get("identity_channels") or self.res.channels)
+        from ..config import MODELS
+        self.panel.train.cmp_models.clear()
+        self.panel.train.cmp_models.addItems(["preview"] + sorted(p.name for p in MODELS.glob("*.joblib")))
+        self.show_test_info()
+        self.browser.queue.update_info()
+
+    # -- test wells, blind labelling
+    def freeze_test_wells(self, other: str | None = None):
+        if self.res is None or self.store is None:
+            self.say("open results and choose a label library first")
+            return set()
+        have = self.store.test_wells(self.res.dataset)
+        if have:
+            self.say(f"test wells already frozen for {self.res.dataset}: {len(have)} wells")
+            return have
+        pick = self.store.freeze_test_wells_from(self.res.dataset, self.res.wells, other=other)
+        self.say(f"froze {len(pick)} test wells for {self.res.dataset}" + (f" (taken over from {other})" if other else ""))
+        self.show_test_info()
+        self.refresh()
+        return pick
+
+    def show_test_info(self):
+        if self.res is None or self.store is None:
+            return
+        tw = self.store.test_wells(self.res.dataset)
+        self.panel.train.test_info.setText(f"{len(tw)} test wells" if tw else "no test wells yet")
+
+    def is_blind(self, plate_id=None, well_id=None) -> bool:
+        t = self.panel.train
+        if t.blind.isChecked():
+            return True
+        if t.blind_test.isChecked() and self.store is not None and self.res is not None and plate_id is not None:
+            return (plate_id, well_id) in self.store.test_wells(self.res.dataset)
+        return False
+
+    def blind_changed(self, *_):
+        self.refresh()
+        if getattr(self, "_current_well", None):
+            self.show_well(*self._current_well)
+        self.browser.pca.draw()
+
+    # -- positions to store labels at (frame coordinates)
+    def frame_point(self, r):
+        w = self.res.wells
+        w = w[(w.plate_id == r.plate_id) & (w.well_id == r.well_id)].iloc[0]
+        return float(r.iy + w.off_r), float(r.ix + w.off_c)
+
+    def cell_point(self, r):
+        """A pixel deep inside the cell and inside one of its seed particles (stable across re-detection)."""
+        from scipy import ndimage as ndi
+        got = self.res.well(r.plate_id, r.well_id)
+        G = self.res.recon(r.plate_id, r.well_id)
+        if got is None or G is None:
+            return None, None
+        wd, maps = got
+        cell = (G == int(r.cell_id)) & wd.hole
+        P = self.res.particles
+        seeds = np.zeros_like(cell)
+        for o in str(getattr(r, "members", "") or "").split(";"):
+            m = P[(P.plate_id == r.plate_id) & (P.well_id == r.well_id) & (P.oid == o)]
+            if len(m):
+                L = maps.get((m.level.iloc[0], m.ch.iloc[0]))
+                if L is not None:
+                    seeds |= L == int(m.lab.iloc[0])
+        area = cell & seeds if (cell & seeds).any() else cell
+        if not area.any():
+            return None, None
+        dt = ndi.distance_transform_edt(area)
+        y, x = np.unravel_index(np.argmax(dt), dt.shape)
+        return float(y + wd.offset[0]), float(x + wd.offset[1])
+
+    def label_cell(self, verdict=None, colour=None):
+        """Label the reconstructed cell under the picked particle (Train tab buttons)."""
+        row = self.display.picked
+        if row is None or self.res is None or self.store is None or self.res.cells is None:
+            self.say("after Classify: pick a particle of the cell first")
+            return
+        G = self.res.recon(row.plate_id, row.well_id)
+        if G is None:
+            self.say("no reconstruction for this well")
+            return
+        maps = self.display.current["maps"]
+        m = (maps[(row.level, row.ch)] == row.lab) & (G > 0)
+        if not m.any():
+            self.say("the picked particle is not part of a reconstructed cell")
+            return
+        cid = int(np.bincount(G[m]).argmax())
+        C = self.res.cells
+        c = C[(C.plate_id == row.plate_id) & (C.well_id == row.well_id) & (C.cell_id == cid)]
+        if not len(c):
+            return
+        r = c.iloc[0]
+        y, x = self.cell_point(r)
+        if y is None:
+            return
+        blind = self.is_blind(row.plate_id, row.well_id)
+        self.store.set_cell(self.res.dataset, row.plate_id, row.well_id, y, x, verdict=verdict, colour=colour,
+                            source="blind" if blind else "hand")
+        self.panel.train.cell_info.setText(f"cell {cid}: " + ", ".join(x for x in (verdict, colour) if x))
+        self.browser.queue.update_info()
+
+    def train_cell_labels(self):
+        """Cell labels of the open dataset outside its test wells (for the colour calibration)."""
+        if self.store is None or self.res is None:
+            return None
+        C = self.store.cell_frame(self.res.dataset)
+        tw = self.store.test_wells(self.res.dataset)
+        return C[[(p, w) not in tw for p, w in zip(C.plate_id, C.well_id)]] if len(C) else None
+
+    # -- the labelling loop
+    def retrain_and_classify(self):
+        """Train on all labels so far (Train tab arms), save the model, classify the open results with it, rebuild
+        the queue. With fewer than 30 training labels the Detect preview stays."""
+        import datetime
+        from ..learn import assemble, learning_curve, train
+        if self.res is None or self.store is None:
+            self.say("open results and choose a label library first")
+            return
+        folders = [l.strip() for l in self.panel.train.folders.toPlainText().splitlines() if l.strip()]
+        # the loop's quick refit: one arm, no cross-validation (the Train button compares arms)
+        arm = self.trained.model.spec["arm"] if self.trained is not None else "self-train+rules"
+        arms = [arm]
+        rounds, tau = self.panel.train.rounds.value(), self.panel.train.tau.value()
+        prog = lambda m: self.bus.progress.emit(0, 0, m)
+        store, out, cfg = self.store, str(self.res.dir), self.read_config()
+
+        def job():
+            from ..learn import ParticleModel
+            from ..pipeline import classify_run
+            T, tg, rep = assemble(folders, store)
+            res = train(T, tg, arms=arms, rounds=rounds, tau=tau, progress=prog, cv=False,
+                        feature_config=rep.attrs.get("feature_config"))
+            curve = learning_curve(T, tg, res.model.spec["arm"])
+            name = (f"{'_'.join(res.model.spec.get('datasets', ['model']))[:50]}_{res.model.spec['arm']}_"
+                    f"n{res.model.spec['n_train']}_{datetime.datetime.now():%Y%m%d_%H%M}.joblib")
+            from ..config import MODELS
+            path = MODELS / name
+            res.model.save(path)
+            model = ParticleModel.load(path)
+            cfg.model = name
+            prog("classifying with the new model…")
+            classify_run(out, cfg, model, progress=lambda i, n, m="": None, cell_labels=self.train_cell_labels())
+            return res, curve, model, name
+
+        def done(r):
+            res, curve, model, name = r
+            self.trained = res
+            self.model, self.model_file = model, name
+            self.cfg.model = name
+            self.panel.run.set_models(name)
+            self.panel.train.show_result(res)
+            txt = ""
+            if curve is not None and len(curve) >= 2:
+                gain = (curve.macro_f1.iloc[-1] - curve.macro_f1.iloc[-2]) / max(curve.n.iloc[-1] - curve.n.iloc[-2], 1) * 50
+                txt = (f"Learning curve (test wells, {res.model.spec['arm']}): macro F1 {curve.macro_f1.iloc[-1]:.2f} with "
+                       f"{int(curve.n.iloc[-1])} labels; the last step gained {gain:+.3f} per 50 labels" +
+                       (" → close to a plateau: label cells or rare classes instead" if gain < 0.01 else
+                        " → more labels still help"))
+            elif curve is None:
+                txt = "Learning curve: needs at least 30 labels in the test wells (label them blind first)."
+            self.panel.train.show_curve(curve, txt)
+            self.say(f"trained ({res.model.spec['arm']}, {res.model.spec['n_train']} labels), saved {name}, classified")
+            self.open_results(out)
+
+        self._worker(job, done)
+
+    def compare_models(self):
+        from ..learn import compare_models
+        if self.res is None or self.store is None:
+            self.say("open results and choose a label library first")
+            return
+        models = self.panel.train.compare_list() or ["preview"]
+        store, out = self.store, str(self.res.dir)
+
+        def done(df):
+            self.panel.train.cmp.set(df)
+            self.say("models compared on the test wells")
+        self._worker(lambda: compare_models(out, store, models), done)
 
     def all_labels(self):
         """Hand labels of the open dataset matched to its particles (for the particle map)."""
@@ -260,6 +447,10 @@ class ReconstructionApp:
             self.browser.pca.set_results(self.res, self.all_labels())
         except Exception as e:
             self.say(f"particle map not drawn: {e}")
+        try:
+            self.browser.diag.set_results(self.res)
+        except Exception as e:
+            self.say(f"diagnostics not shown: {e}")
 
     def prefill(self, root: str, run_tag: str):
         """Called from `ci gui` after a run: open the run's existing results, or prepare Detect for it."""
@@ -328,6 +519,15 @@ class ReconstructionApp:
             tw = self.store.test_wells(res.dataset)
         w["labels"] = [int(nl.get((p, q), 0)) for p, q in zip(w.plate_id, w.well_id)]
         w["test"] = ["✓" if (p, q) in tw else "" for p, q in zip(w.plate_id, w.well_id)]
+        t = self.panel.train
+        hide = np.full(len(w), t.blind.isChecked()) | (np.array([(p, q) in tw for p, q in zip(w.plate_id, w.well_id)],
+                                                                 bool) & t.blind_test.isChecked())
+        if hide.any():                                  # blind: no status, call or preview to see
+            for c in ("status_shown", "dominant_shown", "call", "status", "dominant", "preview_status",
+                      "preview_dominant", "p_combo", "n_cells", "n_inside", "p_cell"):
+                if c in w:
+                    w[c] = w[c].astype(object)
+                    w.loc[hide, c] = "blind" if c in ("status_shown", "status") else None
         if self.plate_map is not None:
             extra = [c for c in self.plate_map.columns if c not in ("plate_id", "well_id")][:3]
             w = w.merge(self.plate_map[["plate_id", "well_id"] + extra], how="left")
@@ -370,9 +570,14 @@ class ReconstructionApp:
         if self.model is not None and "pclass" not in P:
             P = self.model.predict(P)
         labels = self._well_labels(P)
+        blind = self.is_blind(plate_id, well_id)
+        self.display.blind = blind
         self.display.show(wd, maps, P, G, self.cfg, cells, labels)
         call = ""
-        if self.res.calls is not None:
+        if blind:
+            call = "   (blind" + (": test well)" if (plate_id, well_id) in self.store.test_wells(self.res.dataset)
+                                 else ")")
+        elif self.res.calls is not None:
             c = self.res.calls[(self.res.calls.plate_id == plate_id) & (self.res.calls.well_id == well_id)]
             if len(c):
                 r = c.iloc[0]
@@ -454,7 +659,7 @@ class ReconstructionApp:
             return
         menu = QMenu(self.panel)
         for _, r in hits.iterrows():
-            cls = r.get("pclass", "") if isinstance(r.get("pclass", ""), str) else ""
+            cls = r.get("pclass", "") if isinstance(r.get("pclass", ""), str) and not self.display.blind else ""
             text = f"{self.cfg.display_name(r.ch)} · {'lenient' if r.level == 'hole' else 'stringent'}" + \
                    (f" · {cls} {r.get('p_' + cls, np.nan):.2f}" if cls else "") + \
                    (f" · {r.in_um2:.0f} µm²" if r.pool else " · outside the hole (neighbour)")
@@ -634,8 +839,8 @@ class ReconstructionApp:
         if lab is not None and len(lab):
             m = lab[lab.oid == row.oid]
             hand = m.label.iloc[0] if len(m) else ""
-        ps = " ".join(chip(f"{c} {row.get('p_' + c, np.nan):.2f}", CLASS_COLORS[c]) for c in CLASSES
-                      if f"p_{c}" in row)
+        ps = "" if self.display.blind else " ".join(chip(f"{c} {row.get('p_' + c, np.nan):.2f}", CLASS_COLORS[c])
+                                                     for c in CLASSES if f"p_{c}" in row)
         prop = int(row.get("n_proposed", 1) or 1) if hasattr(row, "get") else 1
         self.panel.train.b_accept.setEnabled(prop > 1)
         if not bool(row.pool):
@@ -752,6 +957,7 @@ class ReconstructionApp:
             return
         wells = self.panel.run.wells.text().split() or None
         prog = lambda i, n, m="": self.bus.progress.emit(i, n, m)
+        cl = self.train_cell_labels
         if stage in ("detect", "all"):
             root, tag = self.panel.run.root.text().strip(), self.panel.run.run.currentText()
             if not root or not tag:
@@ -766,14 +972,11 @@ class ReconstructionApp:
                 edits = store.edits(getattr(src, "dataset", "")) if store is not None else None
                 detect_run(src, cfg, out, wells, progress=prog, source_spec=spec, edits=edits)
                 if stage == "all":
-                    if self.model is None and not (cfg.model_path() and cfg.model_path().exists()):
-                        prog(0, 0, "detected; no model yet: label particles and train, then Classify")
-                    else:
-                        classify_run(out, cfg, self.model, progress=prog)
+                    classify_run(out, cfg, self.model, progress=prog, cell_labels=cl())
                 return out
         else:
             def job():
-                classify_run(out, cfg, self.model, progress=prog)
+                classify_run(out, cfg, self.model, progress=prog, cell_labels=cl())
                 return out
         self.say(f"{stage} → {out}")
         self._worker(job, lambda d: (self.say("done"), self.open_results(d)))

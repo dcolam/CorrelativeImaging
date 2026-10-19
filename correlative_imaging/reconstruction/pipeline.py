@@ -224,6 +224,12 @@ def detect_run(src, cfg: Config, out_dir, wells: list | None = None, workers: in
                detected=_now(), detect_s=round(time.time() - t0, 1), n_wells=len(W), n_particles=len(F),
                n_pool=int(F.pool.sum()), n_skipped=skipped, n_edited_wells=len(edits or {}))
     (out / "run.json").write_text(json.dumps(run, indent=2))
+    try:
+        from .diagnostics import detect_diagnostics
+        say(len(rows), len(rows), "diagnostic plots")
+        detect_diagnostics(out, cfg)
+    except Exception as e:                              # plots never fail Detect
+        say(len(rows), len(rows), f"diagnostic plots failed: {e}")
     return dict(wells=W, particles=F, reference=ref)
 
 
@@ -267,8 +273,11 @@ class Results:
         return load_recon(self.dir, plate_id, well_id)
 
 
-def classify_run(out_dir, cfg: Config | None = None, model=None, workers: int = 8, progress=None) -> dict:
-    """Stage 2 on a detected output folder. model: a learn.ParticleModel (default: cfg.model)."""
+def classify_run(out_dir, cfg: Config | None = None, model=None, workers: int = 8, progress=None,
+                 cell_labels: pd.DataFrame | None = None) -> dict:
+    """Stage 2 on a detected output folder. model: a learn.ParticleModel (default: cfg.model; none: the Detect
+    preview). cell_labels: LabelStore.cell_frame rows of this dataset, test wells removed (verdicts and colours:
+    identify.py 2b)."""
     from .identify import identify, well_calls
     from .learn import ParticleModel
     say = progress or (lambda i, n, m="": print(m or f"{i}/{n}", flush=True) if (m or i % 100 == 0 or i == n) else None)
@@ -280,8 +289,18 @@ def classify_run(out_dir, cfg: Config | None = None, model=None, workers: int = 
     if model is None:
         mp = cfg.model_path()
         if mp is None or not mp.exists():
-            raise ValueError("no particle model: train one (Train tab / `train`) or set `model` in the settings")
-        model = ParticleModel.load(mp)
+            if cfg.model:
+                raise ValueError(f"model {cfg.model} not found")
+            from .preview import PreviewModel
+            model = PreviewModel()                     # clean slate: the Detect preview stands in for a model
+            say(0, 0, "no model: classifying with the Detect preview (train a model once you have labels)")
+        else:
+            model = ParticleModel.load(mp)
+    need = [f for f in model.spec.get("features", []) if f not in res.particles or (
+        f == "f_coloc" and len(res.channels) > 1 and not any(c.startswith("r_") for c in res.particles.columns))]
+    if need:
+        raise ValueError(f"the model needs features these results lack ({', '.join(need)}): they were detected "
+                         "before the feature existed. Run Detect again")
     from .config import complete_feature_config
     fc_model = complete_feature_config(model.spec.get("feature_config") or {})
     fc_run = res.config.feature_config()
@@ -315,7 +334,15 @@ def classify_run(out_dir, cfg: Config | None = None, model=None, workers: int = 
             say(i + 1, len(rows), "")
     cells = pd.DataFrame(cell_rows)
     say(len(rows), len(rows), "identity call")
-    cells, info = identify(cells, res.wells, res.reference, identity_ch, cfg)
+    user = None
+    if cell_labels is not None and len(cell_labels) and len(cells):
+        from .labels import match_cells
+        m = match_cells(cell_labels, res)                # by point, on the reconstruction just written
+        if len(m):
+            user = m[["plate_id", "well_id", "cell_id", "verdict", "colour"]].drop_duplicates(
+                ["plate_id", "well_id", "cell_id"], keep="last")
+            cells = cells.merge(user[["plate_id", "well_id", "cell_id", "verdict"]], how="left")
+    cells, info = identify(cells, res.wells, res.reference, identity_ch, cfg, user=user)
     calls = well_calls(cells, res.wells, identity_ch)
     # particle -> cell membership (for the viewer)
     mem = {(r.plate_id, r.well_id, o): r.cell_id for r in cells.itertuples() for o in str(r.members).split(";") if o} \
@@ -329,6 +356,11 @@ def classify_run(out_dir, cfg: Config | None = None, model=None, workers: int = 
     run.update(classified=_now(), classify_s=round(time.time() - t0, 1), model=model.spec,
                config=json.loads(cfg.to_json()), identity_channels=identity_ch, warning=warn, edited_wells=[])
     (out / "run.json").write_text(json.dumps(run, indent=2, default=str))
+    try:
+        from .diagnostics import classify_diagnostics
+        classify_diagnostics(out, info, cfg)
+    except Exception:                                   # plots never fail Classify
+        pass
     return dict(cells=cells, calls=calls, particles=F, identity=info)
 
 
@@ -386,6 +418,9 @@ def redetect_well(out_dir, plate_id: str, well_id: str, edits: dict | None, cfg:
         from .learn import ParticleModel
         if model is None and cfg.model_path() and cfg.model_path().exists():
             model = ParticleModel.load(cfg.model_path())
+        if model is None and (run.get("model") or {}).get("arm") == "preview":
+            from .preview import PreviewModel
+            model = PreviewModel()
         if model is not None:
             F = model.predict(F)
             identity_ch = run.get("identity_channels") or cfg.identity_channels(names)

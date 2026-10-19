@@ -62,6 +62,7 @@ class WellDisplay:
         self.show_levels = {"whole": True, "hole": True}
         self.show_context = True
         self.show_noise = False
+        self.blind = False       # hide every class / call / cell (blind labelling, test wells)
 
     def _name(self, s):
         return self.PREFIX + s
@@ -226,7 +227,7 @@ class WellDisplay:
             g = d[d.level == level]
             if not self.show_context:
                 g = g[g.pool | (g.n_parts > 1 if "n_parts" in g else False)]     # cut-off pieces always show
-            if not self.show_noise:
+            if not self.show_noise and not self.blind:
                 cls = g["pclass"] if "pclass" in g else g.get("dclass")
                 if cls is not None:
                     g = g[~cls.isin(["noise"]).to_numpy()]
@@ -247,7 +248,7 @@ class WellDisplay:
     def _cells(self, G, cells, cfg, shape):
         from napari.utils.colormaps import DirectLabelColormap
         L = self.L["cells"]
-        if G is None or not G.any():
+        if G is None or not G.any() or self.blind:
             L.data = np.zeros(shape, np.int32)
             return
         R = np.where(G > 0, G, np.where(G < 0, 1000 - G, 0)).astype(np.int32)
@@ -274,6 +275,8 @@ class WellDisplay:
             pc = getattr(r, "pclass", None)
             if h:
                 txt.append(f"[{SHORT[h]}]"); col.append("#ffffff")
+            elif self.blind:
+                txt.append("?"); col.append("#8a929c")
             elif isinstance(pc, str) and pc:
                 txt.append(SHORT[pc]); col.append(CLASS_COLORS[pc])
             else:

@@ -143,6 +143,23 @@ def edit_maps(wd: WellData, maps: dict, sm: np.ndarray, hbg: dict, cfg: Config, 
     return origin
 
 
+def _coloc(v: np.ndarray, k: int, names: list) -> dict:
+    """v: (C, n) pixel values of one particle. r_<other> = Pearson r of channel k with each other channel (NaN with
+    fewer than 5 pixels or a flat channel)."""
+    out = {}
+    if v.shape[1] < 5:
+        return {f"r_{c}": np.nan for j, c in enumerate(names) if j != k}
+    a = v[k] - v[k].mean()
+    sa = np.sqrt((a * a).sum())
+    for j, c in enumerate(names):
+        if j == k:
+            continue
+        b = v[j] - v[j].mean()
+        sb = np.sqrt((b * b).sum())
+        out[f"r_{c}"] = float((a * b).sum() / (sa * sb)) if sa > 0 and sb > 0 else np.nan
+    return out
+
+
 def detect_well(wd: WellData, cfg: Config, edits: dict | None = None):
     """Returns (particles, maps, well_row). particles: one row per object (see module doc).
     edits: {"cuts": [polyline, ...], "merges": [{channel, level, y1, x1, y2, x2}, ...],
@@ -233,6 +250,11 @@ def detect_well(wd: WellData, cfg: Config, edits: dict | None = None):
                          iy=float(q.centroid[0]), ix=float(q.centroid[1]),
                          d_in=float(np.hypot(q.centroid[0] - hr, q.centroid[1] - hc) / R),
                          **{f"in_{c2}": float(q.intensity_mean[j]) for j, c2 in enumerate(wd.names)})
+            if not outer:
+                # colocalisation: pixel-wise Pearson r between this channel and each other one, over the pixels
+                # measured (inside the hole for particles in the hole)
+                yx = inside[lb].coords if touch else p.coords
+                o.update(_coloc(wd.chans[:, yx[:, 0], yx[:, 1]], k, wd.names))
             objs.append(o)
     p = pd.DataFrame(objs)
     if len(p):

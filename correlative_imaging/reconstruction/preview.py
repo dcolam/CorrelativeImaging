@@ -114,3 +114,20 @@ def suggest_markers(previews: pd.DataFrame, identity: list, min_share: float = 0
     if not cand or len(cand) == len(identity) or not any(v < 0.5 for v in share.values()):
         return []
     return cand
+
+
+class PreviewModel:
+    """Classify without a trained model (a clean slate): the Detect preview as the particle classes (inside -> cell,
+    neighbour, debris, noise; probability 1, never merged), so the reconstruction and the identity call run before any
+    label exists. Its output is never written to the label store."""
+    spec = dict(arm="preview", classes=None, features=[], fitted="", note="Detect preview, no trained model")
+
+    def predict(self, F: pd.DataFrame) -> pd.DataFrame:
+        from .labels import CLASSES
+        F = F.copy()
+        d = F["dclass"] if "dclass" in F else provisional_classes(F)
+        cls = d.map({"inside": "cell"}).fillna(d)
+        for c in CLASSES:
+            F[f"p_{c}"] = (cls == c).astype(float)
+        F["pclass"] = cls.where(F.pool.astype(bool), None)
+        return F

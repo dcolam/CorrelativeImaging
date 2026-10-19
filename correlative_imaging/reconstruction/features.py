@@ -18,7 +18,10 @@ feature, so one model serves every channel and every dataset.
   context        f_density  log1p number of objects (any channel) in the context disc
   other channels f_oth_max, f_oth_mean (log10 typical-cell units over the same footprint), f_oth_pos (fraction of
                  other channels with SNR > 3), f_flat (min / max brightness over all channels: 1 = equally bright
-                 everywhere, the debris signature), f_dom (own minus brightest other, log10)
+                 everywhere, the debris signature), f_dom (own minus brightest other, log10),
+                 f_coloc (the highest pixel-wise Pearson r with another channel inside the particle: co-varying
+                 pixels = one structure seen in two channels, e.g. a double-positive cell or autofluorescent debris;
+                 bleed-through gives r near 1 with a much dimmer other channel)
 """
 from __future__ import annotations
 
@@ -31,7 +34,7 @@ FEATURES = ["f_snr", "f_hsnr", "f_rel", "f_relmax", "f_field_pct", "f_rel_ctx",
             "f_area_in", "f_area_full", "f_area_z", "f_circ", "f_sol", "f_ecc", "f_peaks",
             "f_share", "f_fill", "f_d_in", "f_d_full", "f_edge", "f_lenient", "f_parent_share", "f_field_d2",
             "f_density",
-            "f_oth_max", "f_oth_mean", "f_oth_pos", "f_flat", "f_dom"]
+            "f_oth_max", "f_oth_mean", "f_oth_pos", "f_flat", "f_dom", "f_coloc"]
 # the reference workflow's feature set, kept for the ablation in learn.py
 LEGACY_FEATURES = ["f_snr", "f_area_in", "f_share", "f_fill"]
 
@@ -151,4 +154,8 @@ def build_features(p: pd.DataFrame, wells: pd.DataFrame, ref: pd.DataFrame, chan
         Rc = np.clip(REL, _EPS, None)
         p["f_flat"] = np.where(n_oth > 0, np.nanmin(Rc, 1) / np.nanmax(Rc, 1), np.nan)
     p["f_dom"] = p.f_rel - p.f_oth_max
+    rcols = [f"r_{c}" for c in channels if f"r_{c}" in p]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        p["f_coloc"] = np.nanmax(p[rcols].to_numpy(float), 1) if rcols else np.nan   # NaN: one channel / detected before
     return p.rename(columns={"fd2": "field_d2"})

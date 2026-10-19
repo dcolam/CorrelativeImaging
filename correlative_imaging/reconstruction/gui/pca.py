@@ -1,14 +1,19 @@
-"""Particle map: a PCA of the features of every particle in the holes (the same 27 numbers the classifier sees).
+"""Particle map: every particle in the holes, in one of two spaces.
 
-Each point is a particle; colour by the Detect preview class, the model's class, the hand label, the channel or the
-plate. Hover shows the particle, a click opens its well with the particle picked; the particles of the well on
-screen are ringed. The PCA is fitted on the open results (median-imputed, standardised features)."""
+  features (PCA)       a PCA of the features the classifier sees (median-imputed, standardised). Classes overlap
+                       here: the classifier separates them with non-linear rules a linear map cannot show.
+  model probabilities  each class is a corner of a pentagon; a particle sits at the probability-weighted mean of the
+                       corners. Sure particles sit at a corner, unsure ones between corners: where to label.
+
+Colour by the Detect preview class, the model's class, the hand label, the channel, the plate or the threshold
+level. Hover shows the particle, a click opens its well with the particle picked; the particles of the well on screen
+are ringed. Shift-drag a rectangle to select particles, then "Queue selected" puts them on a label-queue page."""
 from __future__ import annotations
 
 import numpy as np
 import pandas as pd
 from qtpy.QtCore import Qt
-from qtpy.QtWidgets import QCheckBox, QComboBox, QHBoxLayout, QLabel, QVBoxLayout, QWidget
+from qtpy.QtWidgets import QCheckBox, QComboBox, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
 
 from ..features import FEATURES
 from .theme import CLASS_COLORS
@@ -29,6 +34,16 @@ class ParticleMap(QWidget):
         self.by.addItems(["preview class", "model class", "hand label", "channel", "plate", "threshold level"])
         self.by.currentTextChanged.connect(self.draw)
         h.addWidget(self.by)
+        h.addWidget(QLabel("space"))
+        self.space = QComboBox()
+        self.space.addItems(["features (PCA)", "model probabilities"])
+        self.space.currentTextChanged.connect(self._place)
+        h.addWidget(self.space)
+        self.b_queue = QPushButton("Queue selected")
+        self.b_queue.setEnabled(False)
+        self.b_queue.setToolTip("shift-drag a rectangle over points first; they become a page of the label queue")
+        self.b_queue.clicked.connect(self.queue_selected)
+        h.addWidget(self.b_queue)
         self.only_lab = QCheckBox("hand-labelled only")
         self.only_lab.toggled.connect(self.draw)
         h.addWidget(self.only_lab)
@@ -44,7 +59,30 @@ class ParticleMap(QWidget):
             v.addWidget(QLabel("pyqtgraph is not installed: pip install pyqtgraph"))
             return
         pg.setConfigOptions(antialias=True)
-        self.plot = pg.PlotWidget(background=None)
+        owner = self
+
+        class _VB(pg.ViewBox):                       # shift-drag: select a rectangle of points
+            def mouseDragEvent(self, ev, axis=None):
+                if ev.modifiers() & Qt.ShiftModifier:
+                    ev.accept()
+                    a, b = self.mapToView(ev.buttonDownPos()), self.mapToView(ev.pos())
+                    r = (min(a.x(), b.x()), min(a.y(), b.y()), abs(a.x() - b.x()), abs(a.y() - b.y()))
+                    owner._rect.setRect(*r)
+                    owner._rect.show()
+                    if ev.isFinish():
+                        owner._select(r)
+                        owner._rect.hide()
+                else:
+                    super().mouseDragEvent(ev, axis)
+        self.plot = pg.PlotWidget(background=None, viewBox=_VB())
+        from qtpy.QtWidgets import QGraphicsRectItem
+        self._rect = QGraphicsRectItem()
+        self._rect.setPen(pg.mkPen("#ffffff", width=1, style=Qt.DashLine))
+        self._rect.hide()
+        self.plot.addItem(self._rect)
+        self.sel = None
+        self.sel_item = pg.ScatterPlotItem(size=9, pen=pg.mkPen("#4fc3f7", width=1.5), brush=None)
+        self.plot.addItem(self.sel_item)
         self.plot.showGrid(x=False, y=False)
         self.plot.setMenuEnabled(False)
         self.scatter = pg.ScatterPlotItem(size=6, pen=None, hoverable=True, tip=self._tip)
@@ -77,13 +115,72 @@ class ParticleMap(QWidget):
         Z = pca.transform(X)
         self.var = pca.explained_variance_ratio_
         cols = ["plate_id", "well_id", "oid", "ch", "level"] + [c for c in ("dclass", "pclass") if c in P]
-        self.df = P[cols].assign(pc1=Z[:, 0], pc2=Z[:, 1])
+        self.df = P[cols].assign(f1=Z[:, 0], f2=Z[:, 1])
+        from ..labels import CLASSES
+        pc = [f"p_{c}" for c in CLASSES]
+        if all(c in P for c in pc):
+            ang = np.pi / 2 + 2 * np.pi * np.arange(len(CLASSES)) / len(CLASSES)
+            V = np.c_[np.cos(ang), np.sin(ang)]
+            Pr = np.nan_to_num(P[pc].to_numpy(float))
+            Pr = Pr / np.clip(Pr.sum(1, keepdims=True), 1e-9, None)
+            jit = np.random.default_rng(0).normal(0, 0.015, (len(P), 2))
+            Q = Pr @ V + jit
+            self.df = self.df.assign(q1=Q[:, 0], q2=Q[:, 1])
+            self._corners = (V, CLASSES)
+        else:
+            self._corners = None
+        self._place()
         lab = {} if labels is None or not len(labels) else \
             {(r.plate_id, r.well_id, r.oid): r.label for r in labels.itertuples()}
         self.df["hand"] = [lab.get(k, "") for k in zip(self.df.plate_id, self.df.well_id, self.df.oid)]
-        self.plot.setLabel("bottom", f"PC1 ({self.var[0]:.0%})")
-        self.plot.setLabel("left", f"PC2 ({self.var[1]:.0%})")
         self.draw()
+
+    def _place(self, *_):
+        """Coordinates of the chosen space -> pc1 / pc2 (what draw / mark use)."""
+        import pyqtgraph as pg
+        if self.plot is None or not len(self.df):
+            return
+        prob = self.space.currentText() == "model probabilities"
+        if prob and "q1" not in self.df:
+            self.info.setText("model probabilities: Classify first")
+            prob = False
+        self.df["pc1"], self.df["pc2"] = (self.df.q1, self.df.q2) if prob else (self.df.f1, self.df.f2)
+        for it in getattr(self, "_corner_items", []):
+            self.plot.removeItem(it)
+        self._corner_items = []
+        if prob and self._corners is not None:
+            V, names = self._corners
+            for (x, y), n in zip(V, names):
+                t = pg.TextItem(n, color=CLASS_COLORS.get(n, "#ffffff"), anchor=(0.5, 0.5))
+                t.setPos(x * 1.12, y * 1.12)
+                self.plot.addItem(t)
+                self._corner_items.append(t)
+            self.plot.setLabel("bottom", "")
+            self.plot.setLabel("left", "")
+        else:
+            self.plot.setLabel("bottom", f"PC1 ({self.var[0]:.0%})" if self.var is not None else "")
+            self.plot.setLabel("left", f"PC2 ({self.var[1]:.0%})" if self.var is not None else "")
+        self.sel = None
+        self.sel_item.setData([])
+        self.b_queue.setEnabled(False)
+        self.draw()
+        self.plot.autoRange()
+
+    def _select(self, r):
+        x0, y0, w, h = r
+        d = getattr(self, "shown", pd.DataFrame())
+        if not len(d):
+            return
+        m = (d.pc1 >= x0) & (d.pc1 <= x0 + w) & (d.pc2 >= y0) & (d.pc2 <= y0 + h)
+        self.sel = d[m]
+        self.sel_item.setData(x=self.sel.pc1.to_numpy(), y=self.sel.pc2.to_numpy())
+        self.b_queue.setEnabled(len(self.sel) > 0)
+        self.b_queue.setText(f"Queue selected ({len(self.sel)})")
+
+    def queue_selected(self):
+        if self.sel is None or not len(self.sel):
+            return
+        self.app.browser.queue.load_selection(self.sel[["plate_id", "well_id", "oid"]])
 
     def _colors(self, d) -> tuple[list, dict]:
         by = self.by.currentText()
@@ -102,7 +199,16 @@ class ParticleMap(QWidget):
         else:
             keys, cmap = d.level.map({"hole": "lenient", "whole": "stringent"}), {"lenient": "#4fc3f7",
                                                                                  "stringent": "#f08a24"}
-        return list(keys), cmap
+        keys = list(keys)
+        if by in ("preview class", "model class"):        # blind: no class for hidden wells
+            t = self.app.panel.train
+            tw = self.app.store.test_wells(self.app.res.dataset) if self.app.store is not None and \
+                self.app.res is not None else set()
+            for i, (p, w) in enumerate(zip(d.plate_id, d.well_id)):
+                if t.blind.isChecked() or (t.blind_test.isChecked() and (p, w) in tw):
+                    keys[i] = "blind"
+            cmap = {**cmap, "blind": "#3a3f47"}
+        return keys, cmap
 
     def draw(self, *_):
         if self.plot is None:
@@ -140,7 +246,7 @@ class ParticleMap(QWidget):
     # -- interaction
     def _tip(self, x, y, data):
         r = self.shown.iloc[int(data)]
-        cls = r.get("pclass") or r.get("dclass") or ""
+        cls = "" if self.app.is_blind(r.plate_id, r.well_id) else (r.get("pclass") or r.get("dclass") or "")
         return (f"{r.plate_id} {r.well_id} · {self.app.cfg.display_name(r.ch)} "
                 f"{'lenient' if r.level == 'hole' else 'stringent'}\n{cls}" + (f" · hand: {r.hand}" if r.hand else ""))
 

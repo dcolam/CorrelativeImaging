@@ -16,7 +16,16 @@ well labels). Tables: ``particle_labels``, ``test_wells`` (the frozen held-out s
 ``particle_cuts`` (hand-drawn lines that split particles; frame coordinates, all channels and levels),
 ``particle_merges`` (two positions whose particles are joined; one channel and level), ``particle_splits``
 (accepted split proposals: the particle at that position is split at its dips), ``particle_watersheds`` (particles
-split on demand; their dividing lines act as cuts) and ``well_verdicts``.
+split on demand; their dividing lines act as cuts), ``cell_labels`` and ``well_verdicts``.
+
+``source`` of a particle label: "hand" (clicked in the canvas), "blind" (labelled with every suggestion hidden: the
+test wells always), "accepted" / "corrected" (a suggestion shown in the label queue was kept / changed), "legacy"
+(imported). Only human decisions are stored: Detect's pre-labels and the model's classes never are.
+
+Cell labels (one per reconstructed cell, stored at a point inside one of its seed particles, frame coordinates):
+``verdict`` one cell / several cells (inseparable: two or more cells that cannot be split by eye, either could be
+the patched one) / not a cell, and ``colour``: the identity channels the cell is positive for ("+"-joined raw
+channel names, "none" for none, "" = not judged).
 """
 from __future__ import annotations
 
@@ -29,6 +38,8 @@ import numpy as np
 import pandas as pd
 
 CLASSES = ["cell", "neighbour", "merged", "debris", "noise"]
+VERDICTS = ["one cell", "several cells", "not a cell"]
+SOURCES = ["hand", "blind", "accepted", "corrected", "legacy"]
 # carousel / first labelling session -> classes (None = not used for training)
 LEGACY_MAP = {"patched cell": "cell", "maybe cell": "cell", "neighbour": "neighbour", "two fused cells": "merged",
               "background_noise": "noise", "halo / haze": "noise", "plug / debris": "debris",
@@ -49,6 +60,8 @@ CREATE TABLE IF NOT EXISTS particle_splits (dataset TEXT, plate_id TEXT, well_id
     y REAL, x REAL, labeller TEXT, t TEXT);
 CREATE TABLE IF NOT EXISTS particle_watersheds (dataset TEXT, plate_id TEXT, well_id TEXT, channel TEXT,
     level TEXT, y REAL, x REAL, labeller TEXT, t TEXT);
+CREATE TABLE IF NOT EXISTS cell_labels (dataset TEXT, plate_id TEXT, well_id TEXT, y REAL, x REAL,
+    verdict TEXT, colour TEXT, source TEXT, labeller TEXT, t TEXT, PRIMARY KEY (dataset, plate_id, well_id, y, x));
 CREATE TABLE IF NOT EXISTS well_verdicts (dataset TEXT, plate_id TEXT, well_id TEXT, verdict TEXT, note TEXT,
     labeller TEXT, t TEXT, PRIMARY KEY (dataset, plate_id, well_id));
 """
@@ -102,6 +115,41 @@ class LabelStore:
         with self._con() as con:
             return {(p, w) for p, w in con.execute("SELECT plate_id, well_id FROM test_wells WHERE dataset=?",
                                                     (dataset,))}
+
+    def seed_test_wells(self, dataset: str, wells) -> int:
+        """Add held-out wells explicitly (e.g. copied from another library, or chosen before any labelling)."""
+        with self._con() as con:
+            n0 = con.execute("SELECT count(*) FROM test_wells WHERE dataset=?", (dataset,)).fetchone()[0]
+            con.executemany("INSERT OR IGNORE INTO test_wells VALUES (?,?,?,?)",
+                            [(dataset, p, w, _now()) for p, w in wells])
+            return con.execute("SELECT count(*) FROM test_wells WHERE dataset=?", (dataset,)).fetchone()[0] - n0
+
+    def freeze_test_wells_from(self, dataset: str, wells: pd.DataFrame, frac: float = 0.2, seed: int = 0,
+                               other: str | Path | None = None) -> set:
+        """Clean slate: pick the held-out wells before any labelling, from the results' wells that hold something
+        in the hole (preview status other than "no particles"), stratified by plate. With `other` (an older label
+        library of the same dataset), its test wells are taken over and the rest is drawn only from wells it never
+        labelled, so a model trained on that library can be scored fairly on them."""
+        have = self.test_wells(dataset)
+        if have:
+            return have
+        w = wells
+        if "preview_status" in w:
+            w = w[w.preview_status != "no particles"]
+        pick = set()
+        if other:
+            o = LabelStore(other)
+            pick |= o.test_wells(dataset)
+            seen = set(zip(o.frame(dataset).plate_id, o.frame(dataset).well_id))
+            w = w[[k not in seen for k in zip(w.plate_id, w.well_id)]]
+        rng = np.random.default_rng(seed)
+        for _, g in w.groupby("plate_id"):
+            n = int(round(frac * len(g)))
+            if n:
+                idx = rng.choice(len(g), n, replace=False)
+                pick |= set(zip(g.plate_id.iloc[idx], g.well_id.iloc[idx]))
+        self.seed_test_wells(dataset, sorted(pick))
+        return pick
 
     def freeze_test_wells(self, dataset: str, frac: float = 0.2, seed: int = 0) -> set:
         """Pick the held-out wells of a dataset once (a fraction of its labelled wells); later calls return the
@@ -173,6 +221,32 @@ class LabelStore:
                 out.setdefault((p, w), new())["watersheds"].append(dict(channel=ch, level=lev, y=y, x=x))
         return out
 
+    # -- cell labels
+    def set_cell(self, dataset, plate_id, well_id, y, x, verdict=None, colour=None, source="hand"):
+        """Store or update the label of the cell at (y, x); None keeps what is stored."""
+        y, x = round(float(y), 2), round(float(x), 2)
+        with self._con() as con:
+            old = con.execute("SELECT verdict, colour FROM cell_labels WHERE dataset=? AND plate_id=? AND well_id=? "
+                              "AND y=? AND x=?", (dataset, plate_id, well_id, y, x)).fetchone()
+            v = verdict if verdict is not None else (old[0] if old else "")
+            c = colour if colour is not None else (old[1] if old else "")
+            if verdict is not None and verdict not in VERDICTS + [""]:
+                raise ValueError(f"unknown verdict {verdict!r}")
+            con.execute("INSERT OR REPLACE INTO cell_labels VALUES (?,?,?,?,?,?,?,?,?,?)",
+                        (dataset, plate_id, well_id, y, x, v, c, source, getpass.getuser(), _now()))
+
+    def remove_cell(self, dataset, plate_id, well_id, y, x):
+        with self._con() as con:
+            con.execute("DELETE FROM cell_labels WHERE dataset=? AND plate_id=? AND well_id=? AND y=? AND x=?",
+                        (dataset, plate_id, well_id, round(float(y), 2), round(float(x), 2)))
+
+    def cell_frame(self, dataset: str | None = None) -> pd.DataFrame:
+        with self._con() as con:
+            q, a = "SELECT * FROM cell_labels", ()
+            if dataset:
+                q, a = q + " WHERE dataset=?", (dataset,)
+            return pd.read_sql(q, con, params=a)
+
     # -- well verdicts
     def set_verdict(self, dataset, plate_id, well_id, verdict, note=""):
         with self._con() as con:
@@ -238,3 +312,31 @@ def match_labels(labels: pd.DataFrame, particles: pd.DataFrame, wells: pd.DataFr
                             weight=1.0 / len(best), ly=r.y, lx=r.x))
     return pd.DataFrame(out, columns=["dataset", "plate_id", "well_id", "oid", "level", "label", "orig_label",
                                       "source", "dist_um", "weight", "ly", "lx"])
+
+
+def match_cells(cell_labels: pd.DataFrame, res) -> pd.DataFrame:
+    """Attach each cell label to the reconstructed cell under its point (the run's recon/<well>.npz). Returns the
+    label rows + cell_id (labels on no cell are dropped) and the cell's call / members if Classify wrote them."""
+    from .pipeline import load_recon
+    cols = list(cell_labels.columns) + ["cell_id"]
+    if cell_labels is None or not len(cell_labels):
+        return pd.DataFrame(columns=cols)
+    W = res.wells.set_index(["plate_id", "well_id"])
+    out = []
+    for (p, w), g in cell_labels.groupby(["plate_id", "well_id"]):
+        if (p, w) not in W.index:
+            continue
+        G = load_recon(res.dir, p, w)
+        if G is None:
+            continue
+        r0, c0 = int(W.at[(p, w), "off_r"]), int(W.at[(p, w), "off_c"])
+        for r in g.itertuples(index=False):
+            y, x = int(round(r.y)) - r0, int(round(r.x)) - c0
+            if 0 <= y < G.shape[0] and 0 <= x < G.shape[1] and G[y, x] > 0:
+                out.append(dict(r._asdict(), cell_id=int(G[y, x])))
+    m = pd.DataFrame(out, columns=cols)
+    if len(m) and res.cells is not None and len(res.cells):
+        keep = [c for c in ("call", "members", "status") if c in res.cells]
+        m = m.merge(res.cells[["plate_id", "well_id", "cell_id"] + keep], on=["plate_id", "well_id", "cell_id"],
+                    how="left")
+    return m

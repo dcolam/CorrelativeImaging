@@ -54,7 +54,7 @@ pip install -e ".[viewer,reconstruction,ml,dask,bioformats]"   # everything used
 |---|---|---|
 | *(none)* | numpy, scipy, scikit-image ≥ 0.26, pandas, bioio + readers (TIFF, OME-TIFF, CZI, LIF, ND2, OME-Zarr, PNG/JPG), tifffile, roifile, pyarrow, pyyaml, click, rich, tqdm | `ci info / run / batch` (headless) |
 | `viewer` | napari with a Qt backend | `ci gui`, `ci preview`, `ci results` |
-| `reconstruction` | scikit-learn (+ joblib), napari ≥ 0.5 | `ci reconstruct` and `python -m correlative_imaging.reconstruction …` (detect, classify, train) |
+| `reconstruction` | scikit-learn (+ joblib), napari ≥ 0.5, pyqtgraph, matplotlib | `ci reconstruct` and `python -m correlative_imaging.reconstruction …` (detect, classify, train) |
 | `ml` | scikit-learn, umap-learn, matplotlib, pyqtgraph | Results Explorer: LDA, Clusters tab |
 | `dask` | dask[distributed], bokeh | "Use Dask" multi-process batch engine + dashboard |
 | `bioformats` | bioio-bioformats + a bundled JDK 17 (jdk4py) | Olympus VSI, SCN, ICS, … (no system Java needed) |
