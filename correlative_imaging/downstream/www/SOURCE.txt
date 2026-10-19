@@ -1,0 +1,4 @@
+diagviewer.js and diagviewer.css are copied UNCHANGED from ephacRTools 0.3.0, inst/www/ (2026-10-16).
+md5 diagviewer.js  c26dd500ad4c54043b38852d310e2f24
+md5 diagviewer.css 18e8fc72626ab8a58de368b480f79148
+Single source is ephacRTools: update both copies together (viewer.check_diagviewer() compares them).

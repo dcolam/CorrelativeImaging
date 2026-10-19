@@ -1,0 +1,59 @@
+{
+  "channels": {
+    "488nm": "GFP",
+    "561nm": "mScarlet",
+    "640nm": "ROMK"
+  },
+  "reporters": [
+    "GFP",
+    "mScarlet"
+  ],
+  "markers": [
+    "ROMK"
+  ],
+  "colors": {
+    "GFP": "#00ff00",
+    "mScarlet": "#ff00ff",
+    "ROMK": "#3a7bff",
+    "BF": "#ffffff"
+  },
+  "bleed": [
+    {
+      "from": "mScarlet",
+      "into": "GFP",
+      "max_log_ratio": -1.0
+    }
+  ],
+  "min_object_px": 50,
+  "min_inside_um2": 0.5,
+  "neighbour_share_max": 0.5,
+  "neighbour_fill_max": 0.25,
+  "p_candidate": 0.5,
+  "p_weak": 0.2,
+  "cell_gap_um": 2.0,
+  "tier_high": {
+    "p_cell": 0.95,
+    "p_nb": 0.2,
+    "need_stringent": true
+  },
+  "tier_middle": {
+    "p_cell": 0.8,
+    "p_nb": 0.5
+  },
+  "call_fold": 3.0,
+  "call_mode": "exclusive",
+  "refine_frac": 0.35,
+  "refine_floor_snr": 2.0,
+  "refine_margin_um": 1.5,
+  "refine_max_area_x_hole": 2.0,
+  "refine_smooth_px": 1.0,
+  "body_channels": null,
+  "calib_min_field_um2": 30.0,
+  "calib_p_call": 0.8,
+  "calib_bleed_quantile": 0.25,
+  "calib_eps": 0.02,
+  "models": "models/romk_2026-10-14.json",
+  "path_map": {
+    "Z:\\": "/mnt/z/"
+  }
+}

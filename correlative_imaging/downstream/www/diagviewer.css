@@ -1,0 +1,49 @@
+.dv-root { font-size: 12px; }
+.dv-toolbar { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; }
+.dv-title { font-weight: bold; font-size: 14px; }
+.dv-spacer { flex: 1; }
+.dv-lock { font-weight: normal; margin: 0 0 0 6px; }
+.dv-stage { display: grid; grid-template-columns: repeat(var(--dv-cols, 1), minmax(0, 1fr)); gap: 4px; }
+.dv-panel { position: relative; background: #000; min-width: 0; }
+.dv-canvas { display: block; width: 100%; cursor: crosshair; }
+.dv-panel-label {
+  position: absolute; top: 3px; left: 3px; padding: 0 5px;
+  background: rgba(0,0,0,.65); color: #fff; font-size: 11px; border-radius: 2px; pointer-events: none;
+}
+.dv-readout {
+  font-family: monospace; font-size: 12px; min-height: 22px; padding: 3px 6px;
+  background: #f5f5f5; border: 1px solid #e3e3e3; margin: 4px 0; white-space: nowrap; overflow-x: auto;
+}
+.dv-readout .dv-xy { margin-right: 14px; color: #666; }
+.dv-readout .dv-val { margin-right: 14px; }
+.dv-readout .dv-val i { display: inline-block; width: 9px; height: 9px; margin-right: 4px; border: 1px solid #999; }
+.dv-controls { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 8px; }
+.dv-ch { border: 1px solid #ddd; border-radius: 3px; padding: 4px 6px; }
+.dv-ch-head { display: flex; align-items: center; gap: 5px; }
+.dv-ch-head .dv-range-txt { flex: 1; color: #999; font-size: 10px; text-align: right; }
+.dv-color { width: 22px; height: 18px; padding: 0; border: none; background: none; }
+.dv-hist { width: 100%; height: 24px; display: block; margin: 2px 0; background: #fafafa; }
+.dv-ch-sl { display: flex; align-items: center; gap: 4px; }
+.dv-ch-sl > span { width: 32px; color: #666; }
+.dv-range, .dv-gamma { flex: 1; margin: 0; }
+.dv-num { width: 64px; font-size: 11px; padding: 0 2px; }
+.dv-gamma-l { width: 52px !important; }
+
+/* well tiles in the diagnostic plate viewer */
+.imgplate-hidden { background: #3a3a3a; opacity: .55; }
+.imgplate-missing { background: repeating-linear-gradient(45deg,#1e1e1e,#1e1e1e 4px,#2b2b2b 4px,#2b2b2b 8px); }
+.imgplate-selected::before {
+  content: ""; position: absolute; inset: 0; z-index: 2; pointer-events: none;
+  border: 3px solid #ffcc00; border-radius: 4px; box-shadow: inset 0 0 6px #ffcc00;
+}
+.imgplate-labelled::after {
+  content: ""; position: absolute; top: 2px; left: 2px; width: 6px; height: 6px;
+  border-radius: 50%; background: #3fd13f; pointer-events: none;
+}
+.ann-ch-btn.active { color: #fff; }
+.ann-wellgrid { display: grid; grid-template-columns: repeat(24, 14px); gap: 1px; }
+.ann-wellgrid div { width: 14px; height: 10px; background: #ddd; cursor: pointer; }
+.ann-wellgrid div.has { background: #9ab; }
+.ann-wellgrid div.done { background: #3c9d3c; }
+.ann-wellgrid div.neg { background: #888; }
+.ann-wellgrid div.cur { outline: 2px solid #f0a000; }

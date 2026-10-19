@@ -1,0 +1,39 @@
+{
+  "channels": [
+    "GFP",
+    "mScarlet",
+    "ROMK"
+  ],
+  "cell": {
+    "intercept": -3.6516742616281945,
+    "coef": [
+      2.0232376372091103,
+      0.47641168288980335,
+      -0.9258813921646103,
+      0.6228077187435549,
+      0.6165052332897564,
+      0.6692786093852043
+    ],
+    "n_cell": 948,
+    "n_noise": 734,
+    "cv_auc": 0.9496968705427719,
+    "features": "asinh(snr/2), log10(area_um2), dummies(channels[1:]), asinh x dummies"
+  },
+  "nb": {
+    "intercept": -2.0868693586530465,
+    "coef": [
+      -0.5969046601487126,
+      -0.5237832806567252
+    ],
+    "n_neighbour": 183,
+    "n_other": 734,
+    "cv_auc": 0.9584992876578002,
+    "features": "logit(share_inside), log(fill)"
+  },
+  "provenance": {
+    "labels": "correlative_imaging_reports/manuscript_figures/scratch_analysis/neighbour_filter/labels_geom.csv (carousel session 2026-10-14, ROMK run v5)",
+    "labels_sha1": "40c8a6731131dfd59bb17d0bbb29f398d971d825",
+    "fitted": "2026-10-16T15:12:16",
+    "sklearn": "1.9.0"
+  }
+}

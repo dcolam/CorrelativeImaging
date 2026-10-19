@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Patched-cell identity</title>
+<link rel="stylesheet" href="diagviewer.css">
+<style>
+:root{--bg:#f6f6f6;--panel:#fff;--fg:#222;--mut:#777;--acc:#2a7fd4;--line:#ddd}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.4 system-ui,sans-serif}
+header{padding:8px 16px;border-bottom:1px solid var(--line);display:flex;flex-wrap:wrap;gap:8px;align-items:center;background:var(--panel)}
+header h1{font-size:16px;margin:0 10px 0 0}
+select,button,input{font:inherit;padding:4px 8px;border:1px solid var(--line);border-radius:5px;background:#fff;color:var(--fg)}
+button.on{background:var(--acc);color:#fff}
+main{display:grid;grid-template-columns:minmax(0,1fr) 360px;gap:14px;padding:14px}
+@media(max-width:1000px){main{grid-template-columns:1fr}}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:10px;margin-bottom:10px}
+.tier{display:inline-block;padding:2px 10px;border-radius:12px;font-weight:600}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:1px 10px;font-size:13px}.kv span:nth-child(odd){color:var(--mut)}
+nav{display:flex;gap:8px;align-items:center;margin-bottom:8px;flex-wrap:wrap}
+.legend{font-size:12px;color:var(--mut)} .layers label{margin-right:10px;font-size:13px}
+table.pt{border-collapse:collapse;font-size:11px;width:100%} table.pt td,table.pt th{padding:1px 4px;border-bottom:1px solid #eee;text-align:right}
+table.pt td:first-child,table.pt th:first-child{text-align:left}
+#msg{color:#b33} #store{color:#2a7f4f;font-size:12px}
+#pop{position:fixed;display:none;z-index:50;background:#fff;border:1px solid #bbb;border-radius:8px;padding:8px;box-shadow:0 4px 18px rgba(0,0,0,.25);font-size:12px;max-width:520px}
+#pop .row{margin:3px 0} #pop .row b{display:inline-block;min-width:150px} #pop button{font-size:11px;padding:2px 6px;margin:1px}
+#pop button.on{background:var(--acc);color:#fff} .sw{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:3px;vertical-align:middle}
+</style></head><body>
+<header><h1 id="title"></h1>
+<select id="ftier"><option value="">all tiers</option></select>
+<select id="fcall"><option value="">all calibrated calls</option></select>
+<select id="fgroup"><option value="">all groups</option></select>
+<select id="fplate"><option value="">all plates</option></select>
+<button id="blind">blind: off</button><button id="shuffle">shuffle</button>
+<button id="labmode">label particles: off</button>
+<button id="export">export verdicts + labels</button><span id="store">saving in this browser only</span></header>
+<div id="pop"></div>
+<main><section>
+<nav><button id="prev">&larr; prev</button><span id="pos"></span><button id="next">next &rarr;</button><span id="msg"></span></nav>
+<div class="card layers">Overlays:
+<label><input type="checkbox" data-l="refined" checked> refined cell (thick)</label>
+<label><input type="checkbox" data-l="stringent" checked> stringent (solid)</label>
+<label><input type="checkbox" data-l="lenient" checked> lenient (dashed)</label>
+<label><input type="checkbox" data-l="dropped" checked> dropped particles</label>
+<label><input type="checkbox" data-l="neighbour" checked> neighbours (grey)</label>
+<label><input type="checkbox" data-l="field" checked> field particles</label>
+<label><input type="checkbox" data-l="extent" checked> whole extent of hole particles</label>
+<label><input type="checkbox" data-l="labels" checked> probabilities</label>
+<span style="margin-left:14px">Brightfield: <input type="range" id="bfz" min="0" max="0" step="1" value="0" style="vertical-align:middle;width:110px"> <b id="bfzl">–</b></span></div>
+<div id="dv" class="dv-root" data-layout="split"></div>
+<p class="legend">Thick outline = the refined patched cell (grown from its seed, neighbours competing for pixels), coloured by its calibrated call
+(white = uncertain / dim). In the hole: solid = stringent (whole-image threshold), dashed = lenient (hole threshold); thick = candidate, thin dotted = dropped
+(weak / noise / "bt" bleed-through). Number = P(real cell, not noise). Grey fill + grey dashed outline = the whole neighbour cell behind a rim piece.
+Thin outlines = whole extent of hole particles; away from the hole = field particles. Cyan = hole. Contrast: sliders and histogram per channel;
+wheel = zoom, drag = pan, double-click = fit. Keys: &larr; &rarr;, 1-5 verdict, L = label mode.
+Label mode: click a particle in any panel, pick its label (keys 1-6 for the first particle listed); labelled particles carry a tag
+(PC patched cell, MC maybe cell, NB neighbour, 2F two fused cells, BG background noise, ? debris/unsure).</p>
+</section><aside>
+<div class="card"><span id="tier" class="tier"></span> <span id="callbadge" class="tier"></span><div class="kv" id="kv" style="margin-top:6px"></div></div>
+<div class="card"><b>Your verdict</b><br>
+<span id="verd"><button data-v="agree">1 agree</button><button data-v="wrong colour">2 wrong colour</button><button data-v="wrong cell">3 wrong cell</button>
+<button data-v="patched not visible">4 patched not visible</button><button data-v="unsure">5 unsure</button></span>
+<input id="note" placeholder="note" style="width:95%;margin-top:6px"><div id="saved" class="legend"></div></div>
+<div class="card"><b>Candidate cells</b><div id="ctab"></div></div>
+<div class="card"><b>Particles touching the hole</b><div id="ptab" style="overflow:auto;max-height:300px"></div></div>
+</aside></main>
+<script src="diagviewer.js"></script>
+<script>
+const D = /*DATA*/[];
+const CFG = /*CFG*/{};
+const TCOL={"high":"#7d7","middle":"#cd6","low":"#ec6","several cells":"#fa7","many neighbours":"#f88","neighbours only":"#d9d","marker only":"#8af","low SNR":"#ccc","empty":"#aaa"};
+const ORDER=Object.keys(TCOL);
+const CCOL=Object.assign({BF:"#ffffff"},CFG.colors||{});
+const store={get(k){try{return JSON.parse(localStorage.getItem(k)||"{}")}catch(e){return{}}},set(k,v){try{localStorage.setItem(k,JSON.stringify(v))}catch(e){}}};
+const VKEY="dsVerdicts:"+(CFG.title||""), LKEY="dsLabels:"+(CFG.title||"");
+let V=store.get(VKEY), LABELS=store.get(LKEY), blind=false, list=[], i=0, cur=null, row=null, bridge=null, labMode=false;
+const PLAB=["patched cell","maybe cell","neighbour","two fused cells","background_noise","debris/unsure"];
+const PSHORT={"patched cell":"PC","maybe cell":"MC","neighbour":"NB","two fused cells":"2F","background_noise":"BG","debris/unsure":"?"};
+const OV={refined:true,stringent:true,lenient:true,dropped:true,neighbour:true,field:true,labels:true,extent:true};
+let BFDATA=[], BFL=[];
+const $=id=>document.getElementById(id);
+$("title").textContent=CFG.title||"Patched-cell identity";
+const viewer=DiagViewer.get("dv");
+const callCol=c=>CCOL[c]||"#ffffff";
+
+// ---- overlays drawn on top of every diagviewer panel ----
+const proto=Object.getPrototypeOf(viewer), drawOrig=proto.drawPanel;
+function pathOf(ctx,polys){polys.forEach(p=>{const x=p[0],y=p[1];ctx.moveTo(x[0],y[0]);for(let k=1;k<x.length;k++)ctx.lineTo(x[k],y[k]);ctx.closePath()})}
+proto.drawPanel=function(p){
+  drawOrig.call(this,p);
+  if(!cur||!p.cssW||cur.w!==this.w) return;
+  const v=this.view, base=p.cssW/this.w, s=base*v.scale*p.dpr, ox=v.tx*base*p.dpr, oy=v.ty*base*p.dpr;
+  const ctx=p.canvas.getContext("2d"), px=n=>n*p.dpr/s;
+  const only=p.def.chans?this.channels[p.def.chans[0]].label:null;
+  const isBF=only&&cur.labels.indexOf(only)>=cur.n_fluo;
+  const show=o=>(!only||o.ch===only);
+  const segOn=o=>(o.seg==="hole"?OV.lenient:OV.stringent);
+  ctx.save(); ctx.setTransform(s,0,0,s,ox,oy);
+  if(OV.refined&&cur.refined) cur.refined.forEach(rc=>{
+    const c=(row&&row.cells||[]).find(x=>x.cell===rc.cell)||{}; const col=CFG.reporters.includes(c.call)?callCol(c.call):"#ffffff";
+    ctx.beginPath();pathOf(ctx,rc.outline);ctx.setLineDash(CFG.reporters.includes(c.call)?[]:[px(4),px(3)]);
+    ctx.strokeStyle="rgba(0,0,0,.65)";ctx.lineWidth=px(4.6);ctx.stroke();ctx.strokeStyle=col;ctx.lineWidth=px(2.6);ctx.stroke()});
+  if(isBF){ctx.restore();return}
+  if(OV.neighbour){
+    ctx.save(); ctx.beginPath(); ctx.rect(-1,-1,this.w+2,this.h+2); pathOf(ctx,cur.hole); ctx.clip("evenodd");
+    cur.ov.filter(o=>o.role==="neighbour"&&show(o)&&segOn(o)).forEach(o=>{const c=(o.ref&&cur.byId[o.ref])||o;ctx.beginPath();pathOf(ctx,c.full);ctx.fillStyle="rgba(90,90,90,0.82)";ctx.fill()});
+    ctx.restore();
+    cur.ov.filter(o=>o.role==="neighbour"&&show(o)&&segOn(o)).forEach(o=>{
+      const c=(o.ref&&cur.byId[o.ref])||o; ctx.beginPath();pathOf(ctx,c.full);ctx.setLineDash([px(5),px(3)]);ctx.strokeStyle="#cfcfcf";ctx.lineWidth=px(1.4);ctx.stroke()});
+  }
+  if(OV.extent) cur.ov.filter(o=>o.touch&&o.role!=="neighbour"&&show(o)&&segOn(o)&&(o.role==="candidate"||OV.dropped)).forEach(o=>{
+    ctx.beginPath();pathOf(ctx,o.full);ctx.setLineDash(o.seg==="hole"?[px(2),px(2)]:[]);ctx.globalAlpha=.7;ctx.strokeStyle=CCOL[o.ch];ctx.lineWidth=px(.8);ctx.stroke();ctx.globalAlpha=1});
+  const refd=new Set(cur.ov.filter(o=>o.role==="neighbour"&&o.ref).map(o=>o.ref));
+  if(OV.field) cur.ov.filter(o=>o.role==="field"&&!refd.has(o.oid)&&show(o)).forEach(o=>{
+    ctx.beginPath();pathOf(ctx,o.full);ctx.setLineDash([]);ctx.globalAlpha=.55;ctx.strokeStyle=CCOL[o.ch];ctx.lineWidth=px(1);ctx.stroke();ctx.globalAlpha=1});
+  const inHole=cur.ov.filter(o=>o.ins&&o.role&&o.role!=="neighbour"&&o.role!=="field"&&show(o)&&segOn(o)&&(o.role==="candidate"||OV.dropped));
+  inHole.forEach(o=>{
+    const cand=o.role==="candidate", len=o.seg==="hole";
+    ctx.beginPath();pathOf(ctx,o.ins);
+    ctx.setLineDash(cand?(len?[px(5),px(2.5)]:[]):[px(1.5),px(2.5)]);
+    ctx.strokeStyle=CCOL[o.ch]; ctx.globalAlpha=cand?1:.6; ctx.lineWidth=px(cand?(len?1.8:2.4):1); ctx.stroke(); ctx.globalAlpha=1});
+  ctx.restore();
+  const LW=LABELS[cur.plate+"_"+cur.well]||{};
+  if(Object.keys(LW).length){
+    ctx.save(); ctx.setTransform(1,0,0,1,0,0); ctx.font="bold "+(11*p.dpr)+"px system-ui,sans-serif"; ctx.textAlign="center"; ctx.textBaseline="middle";
+    cur.ov.filter(o=>LW[o.oid]&&show(o)&&o.at_in).forEach(o=>{const X=o.at_in[0]*s+ox, Y=(o.at_in[1]-this.w/9)*s+oy, t=PSHORT[LW[o.oid]]+(o.seg==="hole"?"·L":"·S");
+      const w=ctx.measureText(t).width+8*p.dpr,h=15*p.dpr; ctx.fillStyle="#ffd400";ctx.fillRect(X-w/2,Y-h/2,w,h);ctx.fillStyle="#000";ctx.fillText(t,X,Y)});
+    ctx.restore();
+  }
+  if(!OV.labels) return;
+  ctx.save(); ctx.setTransform(1,0,0,1,0,0); ctx.font=(11*p.dpr)+"px system-ui,sans-serif"; ctx.textAlign="center"; ctx.textBaseline="middle";
+  const tag=(x,y,txt,bg,fg)=>{const X=x*s+ox,Y=y*s+oy,w=ctx.measureText(txt).width+6*p.dpr,h=14*p.dpr;
+    ctx.fillStyle=bg;ctx.fillRect(X-w/2,Y-h/2,w,h);ctx.fillStyle=fg;ctx.fillText(txt,X,Y)};
+  const dirs=[[0,-1],[0,1],[1,0],[-1,0]], d=this.w/14, segOff={whole:-.5,hole:.5};
+  const off=ch=>dirs[Math.max(0,cur.labels.indexOf(ch))%4];
+  if(OV.neighbour) cur.ov.filter(o=>o.role==="neighbour"&&o.at_out&&show(o)&&segOn(o)).forEach(o=>
+    tag(o.at_out[0]+segOff[o.seg]*d,o.at_out[1],"nb","rgba(60,60,60,.85)",CCOL[o.ch]));
+  inHole.filter(o=>o.at_in).forEach(o=>{const f=off(o.ch);
+    tag(o.at_in[0]+f[0]*d+segOff[o.seg]*d*(only?1:.8),o.at_in[1]+f[1]*d,(o.seg==="hole"?"L ":"S ")+(o.role==="bleed"?"bt ":"")+Math.round(100*o.p_cell)+"%",
+        o.role==="candidate"?"rgba(0,0,0,.7)":"rgba(0,0,0,.35)",o.role==="candidate"?CCOL[o.ch]:"#bbb")});
+  ctx.restore();
+};
+document.querySelectorAll(".layers input[type=checkbox]").forEach(c=>c.onchange=()=>{OV[c.dataset.l]=c.checked; viewer.drawAll()});
+
+// ---- loading a well (JSONP, works from file://) ----
+function u16of(b64){const bin=atob(b64),u=new Uint8Array(bin.length);for(let k=0;k<bin.length;k++)u[k]=bin.charCodeAt(k);return new Uint16Array(u.buffer)}
+const b64=f=>{const b=new Uint8Array(f.buffer);let s="";for(let k=0;k<b.length;k+=8192)s+=String.fromCharCode.apply(null,b.subarray(k,k+8192));return btoa(s)};
+window.DV_WELL=function(d){
+  const want=list[i]; if(!want||d.plate!==want.plate||d.well!==want.well) return;
+  const byId={}; d.ov.forEach(o=>byId[o.oid]=o); d.byId=byId; cur=d; $("msg").textContent="";
+  const f32=d.channels.map((c,k)=>{const u=u16of(c),q=d.q[k],f=new Float32Array(u.length);for(let j=0;j<u.length;j++)f[j]=q[0]+u[j]*q[1];return f});
+  BFDATA=f32.slice(d.n_fluo); BFL=d.labels.slice(d.n_fluo);
+  $("bfz").max=Math.max(BFDATA.length-1,0); if(+$("bfz").value>BFDATA.length-1)$("bfz").value=Math.max(BFDATA.length-1,0);
+  const z=+$("bfz").value; $("bfzl").textContent=BFL[z]||"–";
+  const chans=f32.slice(0,d.n_fluo).concat(BFDATA.length?[BFDATA[z]]:[]);
+  const labels=d.labels.slice(0,d.n_fluo).concat(BFDATA.length?["BF"]:[]);
+  viewer.load({w:d.w,h:d.h,title:blind?"(blind)":`${d.plate} ${d.well}`,labels:labels,colors:CCOL,
+    channels:chans.map(b64), rois:d.hole.map(p=>({x:p[0],y:p[1]})), key:d.plate+"|"+d.well});
+  setBF(); table(d);
+};
+function setBF(){const z=+$("bfz").value; $("bfzl").textContent=BFL[z]||"–";
+  const c=viewer.channels&&viewer.channels.find(c=>c.label==="BF"); if(!c||!BFDATA[z])return;
+  c.data=BFDATA[z]; let lo=Infinity,hi=-Infinity; for(const v of c.data){if(v<lo)lo=v;if(v>hi)hi=v}
+  c.dmin=lo; c.dmax=hi>lo?hi:lo+1; c.min=lo; c.max=c.dmax; c.auto=[c.min,c.max]; c.hist=null;   // BF unadjusted: raw min-max
+  viewer.computeChannel(c); if(c.sync)c.sync(); viewer.scheduleRender(true)}
+$("bfz").oninput=setBF;
+function load(d){cur=null; const s=document.createElement("script"); s.src=`wells/${d.plate}_${d.well}.js`;
+  s.onerror=()=>{$("msg").textContent=" image data missing for this well"}; document.body.appendChild(s); setTimeout(()=>s.remove(),3000)}
+const pctf=x=>x==null?"–":Math.round(100*x)+" %";
+function table(d){
+  const rows=d.ov.filter(o=>o.touch&&o.role).sort((a,b)=>(a.seg>b.seg?1:-1)||(a.ch>b.ch?1:-1));
+  $("ptab").innerHTML=`<table class="pt"><tr><th>thr.</th><th>ch</th><th>role</th><th>cell</th><th>P(cell)</th><th>P(nb)</th><th>SNR</th><th>µm²</th><th>inside</th><th>fill</th><th>label</th></tr>`+
+   rows.map(o=>`<tr><td>${o.seg==="hole"?"lenient":"stringent"}</td><td><span class="sw" style="background:${CCOL[o.ch]}"></span>${o.ch}</td><td>${o.role}</td><td>${o.cell==null?"":o.cell}</td><td>${pctf(o.p_cell)}</td><td>${pctf(o.p_nb)}</td><td>${o.snr}</td><td>${o.area}</td><td>${pctf(o.share)}</td><td>${pctf(o.fill)}</td><td>${(LABELS[d.plate+"_"+d.well]||{})[o.oid]||""}</td></tr>`).join("")+"</table>"}
+function celltable(r){
+  if(!r.cells||!r.cells.length){$("ctab").innerHTML='<span class="legend">none</span>';return}
+  const reps=CFG.reporters;
+  $("ctab").innerHTML=`<table class="pt"><tr><th>cell</th><th>channels</th><th>call</th>${reps.map(x=>`<th>${x} ×cell</th>`).join("")}${reps.map(x=>`<th>P(${x})</th>`).join("")}<th>µm²</th><th>grown ×</th></tr>`+
+    r.cells.map(c=>`<tr><td>${c.cell}</td><td>${c.chans}</td><td><span class="sw" style="background:${callCol(c.call)}"></span>${c.call||"–"}</td>${reps.map(x=>`<td>${c["n_"+x]??"–"}</td>`).join("")}${reps.map(x=>`<td>${pctf(c["p_"+x])}</td>`).join("")}<td>${c.body??"–"}</td><td>${c.grow??"–"}</td></tr>`).join("")+"</table>"}
+
+// ---- list, filters, verdicts ----
+const grp=d=>d.info&&CFG.group_by.length?CFG.group_by.map(k=>d.info[k]).join(" "):"";
+function opts(sel,vals){vals.forEach(v=>{const o=document.createElement("option");o.value=o.textContent=v;sel.appendChild(o)})}
+opts($("ftier"),ORDER.filter(t=>D.some(d=>d.tier===t)));
+opts($("fcall"),[...new Set(D.map(d=>d.call_cal))].sort());
+opts($("fgroup"),[...new Set(D.map(grp))].filter(x=>x).sort()); opts($("fplate"),[...new Set(D.map(d=>d.plate))].sort());
+if(!CFG.group_by.length) $("fgroup").style.display="none";
+const key=d=>d.plate+"_"+d.well;
+function filt(){const t=$("ftier").value,c=$("fcall").value,g=$("fgroup").value,p=$("fplate").value;
+  list=D.filter(d=>(!t||d.tier===t)&&(!c||d.call_cal===c)&&(!g||grp(d)===g)&&(!p||d.plate===p));
+  list.sort((a,b)=>ORDER.indexOf(a.tier)-ORDER.indexOf(b.tier)||a.plate.localeCompare(b.plate)||a.well.localeCompare(b.well)); i=0; show()}
+function show(){ if(!list.length){$("pos").textContent="no wells";return}
+  const d=list[i]; row=d; $("pos").textContent=`${i+1} / ${list.length}`; $("tier").textContent=d.tier; $("tier").style.background=TCOL[d.tier]||"#ddd";
+  $("callbadge").textContent=d.call_cal; $("callbadge").style.background=CFG.reporters.includes(d.call_cal)?callCol(d.call_cal):"#eee";
+  const rows=[["well",blind?"(blind) #"+(i+1):`${d.plate} ${d.well}`]];
+  if(!blind&&d.info) Object.entries(d.info).forEach(([k,v])=>rows.push([k,v??"–"]));
+  rows.push(["calibrated call",d.call_cal],...CFG.reporters.map(x=>["P("+x+")",pctf(d.P[x])]),["simple call (3-fold)",d.call],
+    ["refined body µm²",d.body??"–"],["grown ×",d.grow??"–"],["body inside hole",pctf(d.in_hole)],
+    ["candidate cells",d.n_cand],["their channels",d.chans||"–"],["P(cell) best",pctf(d.p_cell)],["P(neighbour) best",pctf(d.p_nb)],
+    ["stringent agrees",d.agree==null?"–":(d.agree?"yes":"no")],["neighbour cells",d.n_nb],["marker-only objects",d.n_marker],["weak particles",d.n_weak]);
+  $("kv").innerHTML=rows.map(([k,v])=>`<span>${k}</span><span>${v}</span>`).join("");
+  celltable(d);
+  const v=V[key(d)]; $("saved").textContent=v?`saved: ${v.v}${v.note?" – "+v.note:""}`:""; $("note").value=v?v.note||"":"";
+  document.querySelectorAll("#verd button").forEach(b=>b.classList.toggle("on",!!v&&b.dataset.v===v.v));
+  load(d)}
+function verdict(val){const d=list[i]; if(!d)return; V[key(d)]={v:val,note:$("note").value,t:new Date().toISOString(),blind}; store.set(VKEY,V);
+  if(bridge) bridge.saveVerdict(JSON.stringify(Object.assign({plate:d.plate,well:d.well},V[key(d)])));
+  $("saved").textContent=`saved: ${val}`; document.querySelectorAll("#verd button").forEach(b=>b.classList.toggle("on",b.dataset.v===val))}
+document.querySelectorAll("#verd button").forEach(b=>b.onclick=()=>verdict(b.dataset.v));
+$("note").onchange=()=>{const d=list[i]; if(d&&V[key(d)]){V[key(d)].note=$("note").value; store.set(VKEY,V);
+  if(bridge) bridge.saveVerdict(JSON.stringify(Object.assign({plate:d.plate,well:d.well},V[key(d)])))}};
+$("prev").onclick=()=>{i=(i-1+list.length)%list.length;show()}; $("next").onclick=()=>{i=(i+1)%list.length;show()};
+["ftier","fcall","fgroup","fplate"].forEach(id=>$(id).onchange=filt);
+function shuffle(){for(let k=list.length-1;k>0;k--){const j=Math.floor(Math.random()*(k+1));[list[k],list[j]]=[list[j],list[k]]} i=0; show()}
+$("blind").onclick=()=>{blind=!blind;$("blind").textContent="blind: "+(blind?"on":"off");$("blind").classList.toggle("on",blind);
+  $("fgroup").disabled=blind; if(blind){$("fgroup").value="";filt();shuffle()} else show()};
+$("shuffle").onclick=shuffle;
+$("export").onclick=()=>{const rows=[["plate","well","tier","call_cal","call","verdict","note","blind","time"]];
+  D.forEach(d=>{const v=V[key(d)]; if(v) rows.push([d.plate,d.well,d.tier,d.call_cal,d.call,v.v,(v.note||"").replace(/[,\n]/g," "),v.blind,v.t])});
+  const a=document.createElement("a"); a.href=URL.createObjectURL(new Blob([rows.map(r=>r.join(",")).join("\n")],{type:"text/csv"})); a.download="verdicts.csv"; a.click();
+  const lr=[["plate","well","oid","particle_label"]]; Object.entries(LABELS).forEach(([k,m])=>{const [pl,w]=k.split("_");Object.entries(m).forEach(([o,l])=>lr.push([pl,w,o,l]))});
+  const b=document.createElement("a"); b.href=URL.createObjectURL(new Blob([lr.map(r=>r.join(",")).join("\n")],{type:"text/csv"})); b.download="particle_labels.csv"; setTimeout(()=>b.click(),300)};
+document.addEventListener("keydown",e=>{const t=e.target.tagName; if(t==="INPUT"||t==="SELECT")return;
+  if(popHits.length){ if(/^[1-6]$/.test(e.key)){setLabel(popHits[0],PLAB[+e.key-1]);closePop();return} if(e.key==="Escape"){closePop();return} }
+  if(e.key==="l"||e.key==="L"){$("labmode").click();return}
+  if(e.key==="ArrowRight")$("next").click(); else if(e.key==="ArrowLeft")$("prev").click();
+  else if(/^[1-5]$/.test(e.key)) verdict(["agree","wrong colour","wrong cell","patched not visible","unsure"][+e.key-1])});
+// ---- particle labelling ----
+function inPoly(x,y,pg){const xs=pg[0],ys=pg[1];let c=false;for(let a=0,b=xs.length-1;a<xs.length;b=a++){
+  if(((ys[a]>y)!==(ys[b]>y))&&(x<(xs[b]-xs[a])*(y-ys[a])/(ys[b]-ys[a])+xs[a]))c=!c}return c}
+let popHits=[], downAt=null;
+function closePop(){$("pop").style.display="none";popHits=[]}
+function setLabel(o,lab){const k=cur.plate+"_"+cur.well; LABELS[k]=LABELS[k]||{};
+  if(lab&&LABELS[k][o.oid]!==lab)LABELS[k][o.oid]=lab; else delete LABELS[k][o.oid];
+  store.set(LKEY,LABELS);
+  if(bridge) bridge.saveLabel(JSON.stringify({plate:cur.plate,well:cur.well,oid:o.oid,seg:o.seg,ch:o.ch,label:LABELS[k][o.oid]||null,blind}));
+  viewer.drawAll(); table(cur)}
+function openPop(x,y,hits){popHits=hits; const pop=$("pop");
+  if(!hits.length){pop.innerHTML='<span class="legend">no particle touching the hole here</span>'}
+  else{const k=cur.plate+"_"+cur.well, L=LABELS[k]||{};
+    pop.innerHTML=hits.map((o,j)=>`<div class="row"><b><span class="sw" style="background:${CCOL[o.ch]}"></span>${j===0?"[1-6] ":""}${o.seg==="hole"?"lenient":"stringent"} ${o.ch} · ${o.role} · P(cell) ${pctf(o.p_cell)}</b>`+
+      PLAB.map(l=>`<button data-j="${j}" data-l="${l}" class="${L[o.oid]===l?"on":""}">${l}</button>`).join("")+`</div>`).join("")}
+  pop.style.left=Math.min(x+12,innerWidth-540)+"px"; pop.style.top=Math.min(y+12,innerHeight-40-36*Math.max(hits.length,1))+"px"; pop.style.display="block";
+  pop.querySelectorAll("button").forEach(b=>b.onclick=ev=>{ev.stopPropagation();setLabel(hits[+b.dataset.j],b.dataset.l);closePop()})}
+$("labmode").onclick=()=>{labMode=!labMode;$("labmode").textContent="label particles: "+(labMode?"on":"off");$("labmode").classList.toggle("on",labMode);
+  $("dv").style.cursor=labMode?"crosshair":""; if(!labMode)closePop()};
+$("dv").addEventListener("mousedown",e=>{downAt=[e.clientX,e.clientY]},true);
+$("dv").addEventListener("click",e=>{
+  if(!labMode||!cur) return;
+  if(downAt&&Math.hypot(e.clientX-downAt[0],e.clientY-downAt[1])>4) return;
+  const p=viewer.panels.find(p=>{const r=p.canvas.getBoundingClientRect();return e.clientX>=r.left&&e.clientX<=r.right&&e.clientY>=r.top&&e.clientY<=r.bottom});
+  if(!p||!p.cssW) return;
+  const r=p.canvas.getBoundingClientRect(), base=p.cssW/viewer.w, v=viewer.view;
+  const x=((e.clientX-r.left)/base-v.tx)/v.scale, y=((e.clientY-r.top)/base-v.ty)/v.scale;
+  const only=p.def.chans?viewer.channels[p.def.chans[0]].label:null;
+  const ok=o=>o.touch&&o.role&&(!only||o.ch===only)&&(o.seg==="hole"?OV.lenient:OV.stringent);
+  const inIns=cur.ov.filter(o=>ok(o)&&(o.ins||[]).some(pg=>inPoly(x,y,pg)));
+  const inFull=cur.ov.filter(o=>ok(o)&&!inIns.includes(o)&&(o.full||[]).some(pg=>inPoly(x,y,pg)));
+  e.stopPropagation(); e.preventDefault();
+  openPop(e.clientX,e.clientY,inIns.concat(inFull).slice(0,6))},true);
+document.addEventListener("click",e=>{if(!$("pop").contains(e.target)&&!$("dv").contains(e.target))closePop()});
+
+// ---- bridge to the GUI (embedded in Qt): verdicts + labels go to review.db ----
+(function(){ if(!(window.qt&&qt.webChannelTransport)) return;
+  const sc=document.createElement("script"); sc.src="qrc:///qtwebchannel/qwebchannel.js";
+  sc.onload=()=>new QWebChannel(qt.webChannelTransport,ch=>{bridge=ch.objects.bridge;
+    bridge.getState(js=>{const st=JSON.parse(js); V=Object.assign({},st.verdicts); LABELS=Object.assign({},st.labels);
+      $("store").textContent="saving to review.db"; if(list.length) show()})});
+  document.head.appendChild(sc)})();
+
+filt();
+if(location.hash.length>1){const k=location.hash.slice(1), j=list.findIndex(d=>key(d)===k); if(j>=0){i=j; show()}}
+</script></body></html>
