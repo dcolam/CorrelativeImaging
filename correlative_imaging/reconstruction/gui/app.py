@@ -44,6 +44,9 @@ class WellBrowser(QWidget):
         self.tabs.addTab(self.plate, "Plate")
         lw = QWidget()
         self.tabs.addTab(lw, "List")
+        from .pca import ParticleMap
+        self.pca = ParticleMap(app)
+        self.tabs.addTab(self.pca, "Particles (PCA)")
         v = QVBoxLayout(lw)
         v.setContentsMargins(4, 4, 4, 4)
         h = QHBoxLayout()
@@ -241,6 +244,20 @@ class ReconstructionApp:
         self.say(f"opened {d}: {len(self.res.wells)} wells, dataset {self.res.dataset}")
         self.set_config(cfg)
         self.recommend()
+        self.update_pca()
+
+    def all_labels(self):
+        """Hand labels of the open dataset matched to its particles (for the particle map)."""
+        if self.store is None or self.res is None:
+            return None
+        L = self.store.frame(self.res.dataset)
+        return match_labels(L, self.res.particles, self.res.wells) if len(L) else None
+
+    def update_pca(self):
+        try:
+            self.browser.pca.set_results(self.res, self.all_labels())
+        except Exception as e:
+            self.say(f"particle map not drawn: {e}")
 
     def prefill(self, root: str, run_tag: str):
         """Called from `ci gui` after a run: open the run's existing results, or prepare Detect for it."""
@@ -362,6 +379,7 @@ class ReconstructionApp:
                 call = f"   preview: {r.preview_status}" + (f", mostly {self.call_text(dom)}" if dom else "")
         self.browser.plate.mark(plate_id, well_id)
         self._current_well = (plate_id, well_id)
+        self.browser.pca.mark(plate_id, well_id)
         chans = [L for L in self.v.layers if L.name.startswith(self.display.PREFIX) and "channel" in L.metadata]
         if chans:
             self.v.layers.selection.active = chans[0]
@@ -462,6 +480,7 @@ class ReconstructionApp:
         finally:
             QApplication.restoreOverrideCursor()
         self.refresh()
+        self.update_pca()
         self.show_well(pl, wl)
         P = self.res.particles
         n = P[(P.plate_id == pl) & (P.well_id == wl) & P.pool]
@@ -492,10 +511,13 @@ class ReconstructionApp:
             return
         name = "✂ cut"
         if on:
+            cur = self.display.current
+            tr = (cur["delta"][0] * cur["scale"][0], cur["delta"][1] * cur["scale"][1])
             if name not in self.v.layers:
                 self.v.add_shapes([], shape_type="line", name=name, edge_color="#ffffff", edge_width=1.0,
-                                  scale=self.display.current["scale"])
+                                  scale=cur["scale"])
             L = self.v.layers[name]
+            L.translate = tr                                   # same placement as the overlays: window pixels
             self.v.layers.selection.active = L
             L.mode = "add_line"
             self.say("draw cut: drag a line across the particle (several are fine), then Apply cuts")
@@ -623,6 +645,12 @@ class ReconstructionApp:
         self.show_well(row.plate_id, row.well_id)
         self.pick(row)
         self.panel.train.counts.set(self.store.counts())
+        pm = self.browser.pca
+        if len(getattr(pm, "df", [])):                      # keep the map's hand labels current
+            labs = self.all_labels()
+            lab = {} if labs is None else {(r.plate_id, r.well_id, r.oid): r.label for r in labs.itertuples()}
+            pm.df["hand"] = [lab.get(k, "") for k in zip(pm.df.plate_id, pm.df.well_id, pm.df.oid)]
+            pm.draw()
 
     def import_labels(self, path: str):
         if self.res is None or self.store is None:

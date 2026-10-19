@@ -61,6 +61,10 @@ class Config:
     identity_bg: str = "hole"     # background under the body: "hole" (the hole's own, removes aperture glow) | "frame"
     min_mixture_sep: float = 2.0  # per-channel mixture separation (Ashman's D) below which the channel is flagged
 
+    # --- display ------------------------------------------------------------------------------------------------
+    view_R: float = 6.0           # the viewer shows +- this many hole radii from the run's own crop / frame TIF
+                                  # (display only; the analysis window stays work_R)
+
     # --- local --------------------------------------------------------------------------------------------------
     path_map: dict = field(default_factory=dict)   # stored path prefix -> local prefix, e.g. {"Z:\\": "/mnt/z/"}
 

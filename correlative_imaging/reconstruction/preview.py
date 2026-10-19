@@ -4,7 +4,8 @@ Everything here is a PREVIEW, kept in its own columns (`dclass`, `preview_*`), n
 and never used by the classifier, so the model is not trained on these rules.
 
 Provisional class of each particle in the hole (`dclass`), first rule that applies:
-  noise      no clear signal: SNR < 2 against the frame background AND against the hole background
+  noise      no clear signal: SNR < 3 against the frame background, or dimmer than 5 % of a typical cell
+             (on the ROMK hand labels: 316/354 noise caught, 47/620 cells lost)
   debris     (2+ channels) small (< 5 um2 inside) and bright in every other channel too (flatness > 0.5, all other
              channels SNR > 3)
   neighbour  mostly outside (share < 0.5), sitting in the outer half of the hole (inside centroid > 0.5 hole radii
@@ -32,6 +33,8 @@ DCLASSES = ["inside", "neighbour", "debris", "noise"]
 NB_MIN_REL = 0.3       # whole object at least 0.3 typical cells bright
 NB_MAX_D2 = 8.0        # field-likeness distance (4 squared z-scores; ~4 = typical)
 DOMINANCE = 1.5
+NOISE_SNR = 3.0        # below 3 frame-noise SDs
+NOISE_REL = 0.05       # or below 5 % of a typical cell of that channel
 
 
 def provisional_classes(F: pd.DataFrame) -> pd.Series:
@@ -45,7 +48,7 @@ def provisional_classes(F: pd.DataFrame) -> pd.Series:
     par_edge = np.array([bool(e) if e is not None and e == e else False for e in par_edge])
     size_ok = np.where(par_edge, False, np.nan_to_num(par_d2, nan=np.inf) <= NB_MAX_D2)
     bright = np.nan_to_num(par_rel, nan=0) >= NB_MIN_REL
-    noise = (F.snr < 2) & (F.hsnr < 2)
+    noise = (F.snr < NOISE_SNR) | (F.rel < NOISE_REL)
     debris = (F.in_um2 < 5) & (F.f_flat > 0.5) & (F.f_oth_pos >= 1)
     nb = (F.share < 0.5) & (F.d_in > 0.5) & (bright | size_ok)
     out = np.select([~pool, noise, debris, nb], [None, "noise", "debris", "neighbour"], "inside")

@@ -54,7 +54,8 @@ def save_cache(out: Path, wd: WellData, maps: dict):
     arrs = dict(chans=wd.chans.astype(np.float32), hole=wd.hole, names=np.array(wd.names),
                 bf=np.stack([a for _, a in wd.bf]).astype(np.float16) if wd.bf else np.zeros((0,) + wd.hole.shape, np.float16),
                 bf_labels=np.array([l for l, _ in wd.bf] or [""]), offset=np.array(wd.offset), px_um=wd.px_um,
-                thr=json.dumps({f"{k[0]}|{k[1]}": v for k, v in wd.thr.items()}), bg=json.dumps(wd.bg))
+                thr=json.dumps({f"{k[0]}|{k[1]}": v for k, v in wd.thr.items()}), bg=json.dumps(wd.bg),
+                view_src=json.dumps(wd.view_src or {}))
     for (lev, ch), L in maps.items():
         arrs[f"map|{lev}|{ch}"] = L.astype(np.uint16 if L.max() < 65535 else np.int32)
     np.savez_compressed(d / f"{_key(wd.plate_id, wd.well_id)}.npz", **arrs)
@@ -71,8 +72,9 @@ def load_cache(out: Path, plate_id: str, well_id: str):
     bg = {k: tuple(v) for k, v in json.loads(str(z["bg"])).items()}
     bf_labels = [str(l) for l in z["bf_labels"]]
     bf = [(l, z["bf"][i].astype(np.float32)) for i, l in enumerate(bf_labels) if i < len(z["bf"])]
+    view = json.loads(str(z["view_src"])) if "view_src" in z.files else {}
     wd = WellData(plate_id, well_id, float(z["px_um"]), z["chans"].astype(np.float32), names, z["hole"], thr, bg, bf,
-                  tuple(int(v) for v in z["offset"]))
+                  tuple(int(v) for v in z["offset"]), view_src=view or None)
     maps = {(k.split("|")[1], k.split("|")[2]): z[k].astype(np.int32) for k in z.files if k.startswith("map|")}
     return wd, maps
 

@@ -25,10 +25,13 @@ it opens that. Otherwise the Run tab is filled in for that run, ready for Detect
 
 The GUI is napari with two docks.
 
-**Wells (left)** has two tabs:
+**Wells (bottom)** has three tabs:
 - **Plate:** a plate view (96 / 384 / 1536, taken from the well ids). Wells are coloured by status, dominant channel
   or P. A white frame means the well is labelled; a dashed amber frame means it is a test well.
 - **List:** a searchable, filterable list of wells.
+- **Particles (PCA):** a PCA of the 27 features of every particle in the holes (what the classifier sees). Colour by
+  preview class, model class, hand label, channel, plate or threshold level. Hover for details, click to open the
+  well with that particle picked. The current well's particles are ringed.
 
 Before Classify the colours are the Detect preview; afterwards they are the calls. The dock says which. `n` and `p`
 step through the list.
@@ -116,6 +119,16 @@ Per well it gives a status (no particles / neighbours only / one object / severa
 channel**: signal above the hole background, in typical-cell units, times area. When the top two channels are within
 1.5×, it's shown as "a+b".
 
+Measured on ROMK against the hand labels and the plate map:
+- 85 % of hand-labelled particles get the matching provisional class (noise rule: SNR < 3 or < 5 % of a typical
+  cell);
+- 2 of 82 Empty wells get a colour;
+- the dominant channel is right in 103 of the 109 pure wells that get one;
+- the well status agrees with the full Classify in 82 % of wells.
+
+The Results tab shows this distribution right after Detect: wells per status, dominant channel per plate, particles
+per channel and class.
+
 These are previews. They are kept apart from the model's classes and are **never** written to the label store.
 Labelling a particle overrides its tag; the classifier learns only from hand labels.
 
@@ -131,6 +144,11 @@ The analysis window is always ±2.2 hole radii (`work_R`) around the hole:
   older runs have crops but no crop positions and no stored thresholds.
 
 Either way the window size stays the same, so the features stay comparable to the trained model.
+
+**What the viewer shows is larger:** ±`view_R` (default 6) hole radii, read when a well is opened from the same TIF
+the window came from (the pipeline's hole crop, e.g. 511 × 513 px on PNC). All overlays sit on the analysis window
+inside it. On PNC the pixels are on the pipeline's 2× binned grid (0.427 µm; the hole is ~44 px across). That is the
+pipeline's `Binning` step, not this tool. Only an unbinned run gives more pixels.
 
 ## Command line
 

@@ -49,6 +49,8 @@ SETTINGS = {
                       "unpatched cell (the brightness unit)", "locked"),
     "smooth_px": ("smoothing (px)", "light smoothing for peaks and growth (measurements are unsmoothed)", "locked"),
     "peak_h": ("peak height (hole-noise SDs)", "a peak must rise this far above its surroundings", "locked"),
+    "view_R": ("view around the hole (hole radii)", "how much of the run's own crop / frame the viewer shows; display "
+               "only (the analysis window stays fixed)", "local"),
     "path_map": ("path map (JSON)", 'stored path prefix -> local prefix, e.g. {"Z:\\\\": "/mnt/z/"}', "local"),
 }
 
@@ -360,7 +362,7 @@ class SettingsTab(QWidget):
         v.addWidget(box)
         for grp, title in (("safe", "Reconstruction and call · safe to change, then Classify again"),
                            ("locked", "Detection · defines the features, locked to the model"),
-                           ("local", "This computer")):
+                           ("local", "Display and this computer")):
             box = QGroupBox(title)
             form = QFormLayout(box)
             if grp == "locked":
@@ -732,6 +734,30 @@ class ResultsTab(QWidget):
         scroll.setWidgetResizable(True)
         body = QWidget()
         v = QVBoxLayout(body)
+        v.addWidget(section("Detect preview (no model)"))
+        v.addWidget(hint("A first look straight after Detect: provisional particle classes (inside / neighbour / "
+                         "debris / noise) and per well the status and the dominant channel. On ROMK it agrees with "
+                         "the hand labels for 85 % of particles and with the classified well status for 82 % of "
+                         "wells."))
+        g = QGridLayout()
+        self.pcards = {}
+        for i, (k, t) in enumerate([("one object", "one object"), ("several objects", "several objects"),
+                                    ("neighbours only", "neighbours only"), ("no particles", "no particles")]):
+            c, val = card(t)
+            self.pcards[k] = val
+            g.addWidget(c, 0, i)
+        v.addLayout(g)
+        self.prev_plate = FrameModel()
+        ppv = FrameView(self.prev_plate)
+        ppv.setMinimumHeight(130)
+        v.addWidget(QLabel("dominant channel per plate (wells with something inside the hole)"))
+        v.addWidget(ppv)
+        self.prev_cls = FrameModel()
+        pcv = FrameView(self.prev_cls, stretch=True)
+        pcv.setMaximumHeight(130)
+        v.addWidget(QLabel("particles in the holes per channel, by provisional class"))
+        v.addWidget(pcv)
+        v.addWidget(section("After Classify"))
         g = QGridLayout()
         self.cards = {}
         for i, (k, t) in enumerate([("one", "one cell"), ("several", "several cells"), ("none", "no cell"),
@@ -776,7 +802,28 @@ class ResultsTab(QWidget):
         outer.addWidget(scroll)
         self.map = None
 
+    def update_preview(self, res):
+        disp = self.app.cfg.display_name
+        if res is None or "preview_status" not in res.wells:
+            for c in self.pcards.values():
+                c.setText("–")
+            self.prev_plate.set(pd.DataFrame())
+            self.prev_cls.set(pd.DataFrame())
+            return
+        W = res.wells
+        for k, c in self.pcards.items():
+            c.setText(str(int((W.preview_status == k).sum())))
+        d = W[W.preview_dominant.fillna("") != ""]
+        dom = d.preview_dominant.map(lambda s: "+".join(disp(x) for x in str(s).split("+")))
+        self.prev_plate.set(pd.crosstab(d.plate_id, dom).reset_index() if len(d) else pd.DataFrame())
+        P = res.particles
+        P = P[P.pool]
+        if "dclass" in P and len(P):
+            ct = pd.crosstab(P.ch.map(disp), P.dclass).reset_index().rename(columns={"ch": "channel"})
+            self.prev_cls.set(ct)
+
     def update(self, res):
+        self.update_preview(res)
         if res is None or res.calls is None:
             for c in self.cards.values():
                 c.setText("–")

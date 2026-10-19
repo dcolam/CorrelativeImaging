@@ -58,6 +58,7 @@ class WellData:
     offset: tuple = (0, 0)            # window origin in the frame (row, col)
     frame_shape: tuple | None = None  # shape of the full frame, if known
     notes: list = field(default_factory=list)   # how thresholds / background were obtained
+    view_src: dict | None = None      # image file the window came from (display: a larger view around the hole)
 
     @property
     def R_px(self) -> float:
@@ -298,9 +299,12 @@ class RunSource:
             bg[ch] = (float(b[0]), float(b[1]))
         r0, r1, c0, c1 = _window(hole_f, cfg.work_R)
         cut = (slice(r0, r1), slice(c0, c1))
+        bf_idx = [k for k in range(stack.shape[0]) if k not in fl and (k >= len(labels) or labels[k] not in r.channels_db)]
+        view = dict(file=str(image), r0=int(origin[0]), c0=int(origin[1]), fl=[int(k) for k in fl],
+                    bf=[int(k) for k in bf_idx], bf_labels=[labels[k] if k < len(labels) else f"BF {k}" for k in bf_idx])
         return WellData(plate_id, well_id, float(r.px_um), np.ascontiguousarray(fluo[(slice(None),) + cut]), names,
                         hole_f[cut].copy(), thr, bg, [(lab, a[cut].copy()) for lab, a in bf],
-                        (origin[0] + r0, origin[1] + c0), frame_shape, notes)
+                        (origin[0] + r0, origin[1] + c0), frame_shape, notes, view)
 
     def field_table(self) -> pd.DataFrame:
         return pd.concat([field_from_db(db, pl, self.cfg.field_min_um2) for pl, db in self._db.items()],

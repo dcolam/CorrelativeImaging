@@ -2,6 +2,8 @@
 
 Layers (created once, then their data is swapped per well; visibility and contrast stay as you set them):
   BF                    brightfield planes (raw min-max), hidden by default; several planes -> slider
+  (images show +- `view_R` hole radii read from the run's own crop / frame TIF; every overlay below sits on the
+   analysis window (+- `work_R`) inside that view)
   <channel>             fluorescence, additive, the run's colour for that channel
   <channel> outlines    particle edges of that channel in the channel's colour (a pixel image, fast to swap):
                         stringent threshold solid, lenient (hole) threshold dashed. Shown and hidden together with
@@ -62,6 +64,38 @@ class WellDisplay:
 
     def _name(self, s):
         return self.PREFIX + s
+
+    def _read_view(self, wd, cfg):
+        """A larger view around the hole from the run's own TIF (crop or whole frame), if it can be read.
+        Returns (fluorescence list in wd.names order, [(label, BF plane)], (row, col) frame origin) or None."""
+        src = wd.view_src or {}
+        f = src.get("file")
+        if not f or cfg.view_R <= cfg.work_R:
+            return None
+        from pathlib import Path
+        if not Path(f).exists():
+            return None
+        try:
+            import tifffile
+            arr = self._tif_cache.get(f) if hasattr(self, "_tif_cache") else None
+            if arr is None:
+                try:
+                    arr = tifffile.memmap(f, mode="r")
+                except Exception:
+                    arr = tifffile.imread(f)
+                self._tif_cache = {f: arr}
+            H, W = arr.shape[-2:]
+            hy, hx = np.nonzero(wd.hole)
+            R = np.sqrt(len(hy) / np.pi)
+            cy = int(round(hy.mean())) + wd.offset[0] - src["r0"]
+            cx = int(round(hx.mean())) + wd.offset[1] - src["c0"]
+            half = int(np.ceil(cfg.view_R * R))
+            y0, y1, x0, x1 = max(cy - half, 0), min(cy + half + 1, H), max(cx - half, 0), min(cx + half + 1, W)
+            fl = [np.asarray(arr[k, y0:y1, x0:x1], np.float32) for k in src["fl"]]
+            bf = [(lab, np.asarray(arr[k, y0:y1, x0:x1], np.float32)) for lab, k in zip(src["bf_labels"], src["bf"])]
+            return fl, bf, (src["r0"] + y0, src["c0"] + x0)
+        except Exception:
+            return None
 
     def clear(self):
         for L in [L for L in self.v.layers if L.name.startswith(self.PREFIX)]:
@@ -130,18 +164,30 @@ class WellDisplay:
         if sig != self.sig or any(L not in self.v.layers for L in self.L.values()):
             self._build(wd, cfg, scale)
             self.sig = sig
-        shape_changed = self.current is None or self.current["wd"].hole.shape != wd.hole.shape
-        self.current = dict(plate_id=wd.plate_id, well_id=wd.well_id, wd=wd, maps=maps, P=P, scale=scale)
+        view = self._read_view(wd, cfg)
+        if view is not None:
+            fl_v, bf_v, vo = view
+            delta = (wd.offset[0] - vo[0], wd.offset[1] - vo[1])
+        else:
+            fl_v, bf_v, delta = list(wd.chans), wd.bf, (0, 0)
+        shown = fl_v[0].shape if fl_v else wd.hole.shape
+        shape_changed = self.current is None or self.current.get("shown") != shown
+        self.current = dict(plate_id=wd.plate_id, well_id=wd.well_id, wd=wd, maps=maps, P=P, scale=scale,
+                            delta=delta, shown=shown)
         self.picked = None
-        for L in self.L.values():
+        tr = (delta[0] * scale[0], delta[1] * scale[1])
+        for role, L in self.L.items():
             if tuple(L.scale[-2:]) != scale:
                 L.scale = scale
-        if "bf" in self.L and wd.bf:
-            bf = np.stack([a for _, a in wd.bf])
+            want = (0.0, 0.0) if (role == "bf" or role.startswith("img:")) else tr
+            if tuple(L.translate[-2:]) != tuple(want):
+                L.translate = want
+        if "bf" in self.L and bf_v:
+            bf = np.stack([a for _, a in bf_v])
             self.L["bf"].data = bf if len(bf) > 1 else bf[0]
             self.L["bf"].contrast_limits = (float(bf.min()), float(bf.max()) or 1.0)
         for k, ch in enumerate(wd.names):
-            self.L[f"img:{ch}"].data = wd.chans[k]
+            self.L[f"img:{ch}"].data = fl_v[k]
             self.L[f"out:{ch}"].data = self._outline_raster(wd, maps, P, ch)
         from skimage.segmentation import find_boundaries
         self.L["hole"].data = find_boundaries(wd.hole, mode="inner").astype(np.uint8)
@@ -239,8 +285,8 @@ class WellDisplay:
         """Pool particles whose mask contains the clicked pixel (any channel, both thresholds)."""
         if self.current is None:
             return pd.DataFrame()
-        s = self.current["scale"]
-        y, x = int(round(world_pos[-2] / s[0])), int(round(world_pos[-1] / s[1]))
+        s, dl = self.current["scale"], self.current.get("delta", (0, 0))
+        y, x = int(round(world_pos[-2] / s[0] - dl[0])), int(round(world_pos[-1] / s[1] - dl[1]))
         maps, P = self.current["maps"], self.current["P"]
         H, W = self.current["wd"].hole.shape
         if not (0 <= y < H and 0 <= x < W) or not len(P):
