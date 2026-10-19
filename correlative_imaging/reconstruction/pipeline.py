@@ -172,8 +172,9 @@ def _atomic(path: Path, write):
 
 
 def detect_run(src, cfg: Config, out_dir, wells: list | None = None, workers: int = 8, progress=None,
-               source_spec: dict | None = None, edits: dict | None = None) -> dict:
-    """Stage 1. `wells`: optional list of "PLATE_WELL" keys. progress(done, total, message).
+               source_spec: dict | None = None, edits: dict | None = None, cancel=None) -> dict:
+    """Stage 1. `wells`: optional list of "PLATE_WELL" keys. progress(done, total, message). cancel: a
+    threading.Event; set, the wells not started yet are skipped and RuntimeError is raised.
     edits: {(plate_id, well_id): {"cuts": [...], "merges": [...]}} from the label library (LabelStore.edits)."""
     say = progress or (lambda i, n, m="": print(m or f"{i}/{n}", flush=True) if (m or i % 100 == 0 or i == n) else None)
     out = Path(out_dir)
@@ -186,6 +187,8 @@ def detect_run(src, cfg: Config, out_dir, wells: list | None = None, workers: in
     rows = list(meta.itertuples())
 
     def one(r):
+        if cancel is not None and cancel.is_set():          # cancelled: the remaining wells are skipped
+            return None
         wd = src.load(r.plate_id, r.well_id)
         if wd is None:
             return None
@@ -200,6 +203,8 @@ def detect_run(src, cfg: Config, out_dir, wells: list | None = None, workers: in
                 res.append(r)
                 names = names or r[2]
             say(i + 1, len(rows), "")
+    if cancel is not None and cancel.is_set():
+        raise RuntimeError("Detect cancelled")
     if not res:
         raise ValueError("no well could be loaded (missing diagnostics TIFs or hole ROIs?)")
     skipped = len(rows) - len(res)

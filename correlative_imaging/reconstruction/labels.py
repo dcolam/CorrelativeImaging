@@ -287,29 +287,40 @@ def match_labels(labels: pd.DataFrame, particles: pd.DataFrame, wells: pd.DataFr
     nearest centroid inside the hole within `tol_um`. With level "any" the nearest particle of each level is taken
     (one physical object seen at both thresholds); `weight` = 1 / number of particles a label went to.
     Returns one row per (label, particle) with the label columns + oid, level, dist_um, weight."""
-    W = wells.set_index(["plate_id", "well_id"])
-    pool = particles[particles.pool]
     out = []
+    if labels is None or not len(labels):
+        return pd.DataFrame(out, columns=["dataset", "plate_id", "well_id", "oid", "level", "label", "orig_label",
+                                          "source", "dist_um", "weight", "ly", "lx"])
+    off = {(p, w): (float(r0), float(c0), float(px)) for p, w, r0, c0, px in
+           zip(wells.plate_id, wells.well_id, wells.off_r, wells.off_c, wells.px_um)}
+    # only the labelled wells' particles (a full groupby over every well is the slow part)
+    lk = set(zip(labels.plate_id, labels.well_id))
+    pk = [k in lk for k in zip(particles.plate_id.to_numpy(object), particles.well_id.to_numpy(object))]
+    pool = particles[np.asarray(pk, bool) & particles.pool.astype(bool).to_numpy()]
     groups = {k: g for k, g in pool.groupby(["plate_id", "well_id", "ch"])}
-    for r in labels.itertuples():
-        g = groups.get((r.plate_id, r.well_id, r.channel))
-        if g is None or (r.plate_id, r.well_id) not in W.index:
+    for (pl, wl, ch), lg in labels.groupby(["plate_id", "well_id", "channel"]):
+        g = groups.get((pl, wl, ch))
+        if g is None or (pl, wl) not in off:
             continue
-        w = W.loc[(r.plate_id, r.well_id)]
-        y = g.iy.to_numpy() + w.off_r + legacy_offset
-        x = g.ix.to_numpy() + w.off_c + legacy_offset
-        d = np.hypot(y - r.y, x - r.x) * w.px_um
-        cand = g.assign(dist_um=d)
-        cand = cand[cand.dist_um <= tol_um]
-        if r.level != "any":
-            cand = cand[cand.level == r.level]
-        if not len(cand):
-            continue
-        best = cand.sort_values("dist_um").drop_duplicates("level")
-        for b in best.itertuples():
-            out.append(dict(dataset=r.dataset, plate_id=r.plate_id, well_id=r.well_id, oid=b.oid, level=b.level,
-                            label=r.label, orig_label=r.orig_label, source=r.source, dist_um=b.dist_um,
-                            weight=1.0 / len(best), ly=r.y, lx=r.x))
+        r0, c0, px = off[(pl, wl)]
+        y = g.iy.to_numpy(float) + r0 + legacy_offset
+        x = g.ix.to_numpy(float) + c0 + legacy_offset
+        D = np.hypot(y[None] - lg.y.to_numpy(float)[:, None], x[None] - lg.x.to_numpy(float)[:, None]) * px
+        lev = g.level.to_numpy()
+        oid = g.oid.to_numpy()
+        for r, d in zip(lg.itertuples(index=False), D):
+            ok = d <= tol_um
+            if r.level != "any":
+                ok &= lev == r.level
+            if not ok.any():
+                continue
+            best = {}
+            for k in np.flatnonzero(ok)[np.argsort(d[ok])]:          # nearest particle of each level
+                best.setdefault(lev[k], k)
+            for k in best.values():
+                out.append(dict(dataset=r.dataset, plate_id=pl, well_id=wl, oid=oid[k], level=lev[k],
+                                label=r.label, orig_label=r.orig_label, source=r.source, dist_um=float(d[k]),
+                                weight=1.0 / len(best), ly=r.y, lx=r.x))
     return pd.DataFrame(out, columns=["dataset", "plate_id", "well_id", "oid", "level", "label", "orig_label",
                                       "source", "dist_um", "weight", "ly", "lx"])
 

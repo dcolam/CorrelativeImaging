@@ -238,14 +238,20 @@ class ReconstructionApp:
             self.say(f"cannot open {d}: {e}")
             return
         cfg = self.res.config
-        if not cfg.model and self.cfg.model:
-            cfg.model = self.cfg.model
+        arm = (self.res.run.get("model") or {}).get("arm")
+        if arm == "preview":
+            cfg.model = ""                              # classified without a model: never borrow one
+        elif not cfg.model and self.cfg.model and arm is None:
+            cfg.model = self.cfg.model                  # detected only: keep the model chosen for Classify
         if self.res.run.get("model"):
             self.say(f"classified with model arm '{self.res.run['model'].get('arm')}'")
         if self.res.run.get("warning"):
             self.say("WARNING " + self.res.run["warning"])
-        if self.store is None:
-            self.set_store(self._last_store() or str(Path(d).parent / "ci_labels.db"))
+        beside = Path(d).parent / "ci_labels.db"
+        if beside.exists() and (self.store is None or Path(self.store.path) != beside):
+            self.set_store(str(beside))                 # a library next to the results wins (one per project)
+        elif self.store is None:
+            self.set_store(self._last_store() or str(beside))
         folders = self.panel.train.folders
         if str(self.res.dir) not in folders.toPlainText():
             folders.setPlainText((folders.toPlainText().strip() + "\n" + str(self.res.dir)).strip())

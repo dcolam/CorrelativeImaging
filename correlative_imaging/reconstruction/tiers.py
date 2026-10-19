@@ -41,13 +41,16 @@ def objects(P: pd.DataFrame) -> pd.DataFrame:
     return pool[(pool.level == "hole") | ~pool.oid.isin(covered)]
 
 
-def _labelled_oids(res, store) -> set:
+def matched(res, store) -> pd.DataFrame:
+    """The dataset's particle labels matched to the open results (shared by a page and the progress)."""
     from .labels import match_labels
     L = store.frame(res.dataset)
-    if not len(L):
-        return set()
-    m = match_labels(L, res.particles, res.wells)
-    return set(zip(m.plate_id, m.well_id, m.oid))
+    return match_labels(L, res.particles, res.wells)
+
+
+def _labelled_oids(res, store, m: pd.DataFrame | None = None) -> set:
+    m = matched(res, store) if m is None else m
+    return set(zip(m.plate_id, m.well_id, m.oid)) if len(m) else set()
 
 
 def particle_tiers(res, model=None) -> pd.DataFrame:
@@ -80,14 +83,14 @@ def particle_tiers(res, model=None) -> pd.DataFrame:
 
 
 def particle_page(res, store, model=None, n: int = 24, mode: str = "train", seed: int | None = None,
-                  done: set | None = None) -> pd.DataFrame:
+                  done: set | None = None, m: pd.DataFrame | None = None) -> pd.DataFrame:
     """The next page of objects to label. mode "train": outside the test wells, mixed tiers; "test": the test wells,
     whole wells in turn, blind. `done`: (plate, well, oid) already shown this session (skipped ones too)."""
     rng = np.random.default_rng(seed)
     T = particle_tiers(res, model)
     test = store.test_wells(res.dataset)
     is_test = np.array([(p, w) in test for p, w in zip(T.plate_id, T.well_id)], bool)
-    skip = _labelled_oids(res, store) | (done or set())
+    skip = _labelled_oids(res, store, m) | (done or set())
     T = T[[k not in skip for k in zip(T.plate_id, T.well_id, T.oid)]]
     is_test = np.array([(p, w) in test for p, w in zip(T.plate_id, T.well_id)], bool)
     if mode == "test":
@@ -163,7 +166,7 @@ def cell_page(res, store, n: int = 12, mode: str = "train", seed: int | None = N
     return pd.concat([a, rest]).assign(blind=False)
 
 
-def label_progress(res, store, targets: dict | None = None) -> dict:
+def label_progress(res, store, targets: dict | None = None, m: pd.DataFrame | None = None) -> dict:
     """Counts against simple targets: per class (training, outside the test wells), test objects labelled, and
     cells judged per colour combination."""
     from .labels import match_cells, match_labels
@@ -172,7 +175,9 @@ def label_progress(res, store, targets: dict | None = None) -> dict:
     L = store.frame(res.dataset)
     test = store.test_wells(res.dataset)
     out = {"classes": {}, "test": {}, "cells": {}}
-    m = match_labels(L, res.particles, res.wells) if len(L) else pd.DataFrame(columns=["plate_id", "well_id", "label", "ly", "lx"])
+    if m is None:
+        m = match_labels(L, res.particles, res.wells) if len(L) else pd.DataFrame(
+            columns=["plate_id", "well_id", "label", "ly", "lx"])
     if len(m):
         m = m.drop_duplicates(["plate_id", "well_id", "ly", "lx"])
     is_t = np.array([(p, w) in test for p, w in zip(m.plate_id, m.well_id)], bool) if len(m) else np.zeros(0, bool)

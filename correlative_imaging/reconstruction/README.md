@@ -25,13 +25,22 @@ it opens that. Otherwise the Run tab is filled in for that run, ready for Detect
 
 The GUI is napari with two docks.
 
-**Wells (bottom)** has three tabs:
+**Wells (bottom)** has five tabs:
+- **Label queue:** pages of thumbnails to label from the keyboard (see "Labelling loop" below).
 - **Plate:** a plate view (96 / 384 / 1536, taken from the well ids). Wells are coloured by status, dominant channel
   or P. A white frame means the well is labelled; a dashed amber frame means it is a test well.
 - **List:** a searchable, filterable list of wells.
-- **Particles (PCA):** a PCA of the 27 features of every particle in the holes (what the classifier sees). Colour by
-  preview class, model class, hand label, channel, plate or threshold level. Hover for details, click to open the
-  well with that particle picked. The current well's particles are ringed.
+- **Particles (map):** every particle in the holes, in one of two spaces:
+  - **features (PCA):** a PCA of the 28 features the classifier sees. The classes overlap here: on ROMK, PC1 (35 %)
+    is brightness and PC2 (16 %) geometry, and the hand classes barely separate (silhouette 0.04). The classifier's
+    rules are non-linear, which a linear map cannot show.
+  - **model probabilities:** each class is a corner of a pentagon, and a particle sits at the probability-weighted
+    mean of the corners. Sure particles sit at a corner, unsure ones between corners.
+
+  Colour by preview class, model class, hand label, channel, plate or threshold level. Hover for details, click to
+  open the well with that particle picked; the current well's particles are ringed. **Shift-drag** a rectangle to
+  select points, then "Queue selected" makes them a label-queue page.
+- **Diagnostics:** the plots Detect and Classify write (see "Diagnostics" below).
 
 Before Classify the colours are the Detect preview; afterwards they are the calls. The dock says which. `n` and `p`
 step through the list.
@@ -73,6 +82,90 @@ opens; re-detecting the same well after an edit keeps your contrast.
 
 **Labelling:** turn on label mode (`L`), click a particle and press `1`–`5` (cell, neighbour, merged, debris, noise).
 `Del` removes a label. Where several particles overlap (channels, two thresholds), a menu lists them.
+
+## Labelling loop (clean slate: no model, no labels)
+
+The aim: a few hundred well-chosen decisions instead of thousands of clicks, and an honest score.
+
+1. **Detect.** Gives the preview, the diagnostic plots and the particles. In `ci gui` it can run by itself after the
+   run (Run tab: "Then detect particles for Cell reconstruction", on by default; about 1 s per well with 8 threads,
+   so roughly 45 min for 3,000 wells; "Stop detect" cancels).
+2. **Freeze the test wells** (Train tab). 20 % of the wells with something in the hole, per plate, chosen *before*
+   any labelling. "…take over from another library" keeps an older library's test wells and draws the rest only from
+   wells it never labelled, so a model trained on that library can be scored fairly (`freeze-test-wells --from`).
+3. **Classify without a model.** With no model, Classify uses the Detect preview as the particle classes (inside =
+   cell). Cells, calls and the cell pages of the queue then exist from the start. The run says `model: preview`.
+4. **Label in the queue** (bottom dock). Each object in a hole has a suggestion and a tier (`tiers.py`):
+   - *auto*: almost surely right, never shown or stored (with a model: P ≥ 0.97 and the preview agrees; without one:
+     the colour-blind rules of `learn.weak_labels`, which the "+rules" arms already use as weak labels);
+   - *confirm*: shown with the suggestion; Enter accepts, a number corrects;
+   - *ask*: unsure (model and preview disagree, P < 0.7, or near a cut of the preview rules).
+
+   A page holds 24 objects: half ask, 30 % confirm, 20 % random from all tiers, so the training set is not only hard
+   cases and the acceptance rate means something. Objects are spread over plates, channels and wells (at most 2 per
+   well). One tile per physical object: the lenient piece, or a stringent particle no lenient piece covers. The label
+   is stored with level "any", so it applies to both thresholds.
+   - **Particles · test wells:** whole test wells in turn, always **blind** (no suggestion).
+   - **Cells:** one tile per reconstructed cell. Verdict: 1 one cell, 2 several cells that cannot be split by eye
+     (either could be the patched one), 3 not a cell. Colour: Q W E R toggle identity channels 1–4, 0 none.
+   - Keys: ←→↑↓ move, Enter accept, Space open the well in the canvas, Backspace skip, N new page.
+   - Stored source: `blind`, `accepted` (suggestion kept) or `corrected`. The acceptance rate and any anchoring to the
+     suggestions can be measured later.
+5. **Retrain + classify** (queue bar). Trains one arm on all labels so far, without cross-validation (~20 s on ROMK;
+   the Train button still compares all arms). It saves the model as `<dataset>_<arm>_n<labels>_<time>.joblib`,
+   classifies the results with it and rebuilds the queue, whose suggestions then come from the model.
+6. **Learning curve** (Train tab, after retraining). Scores the test wells against the number of training labels and
+   says what the last step gained per 50 labels. It needs ≥ 30 test labels; below that the curve is noise.
+   **Progress bars** show labels per class against 30, the test objects labelled blind, and judged cells per colour.
+7. **Compare models** (Train tab, or `compare --models preview old.joblib new.joblib`). Scores any saved model, or
+   the preview, on the blind labels of the open results' test wells. This works across datasets too: open PNC results,
+   compare the ROMK model with a PNC one.
+
+**Blind labelling** (Train tab). "Always blind in test wells" (on by default) hides everything that could anchor a
+label in a test well:
+- the canvas tags (they show "?"), the reconstructed cells and the call in the title;
+- the class probabilities in the picked text and the pick menu;
+- the noise filter of the outlines (all outlines show);
+- the well's status, call and preview in the plate and the list;
+- its class colours in the particle map.
+
+"Blind labelling" does the same for every well.
+
+**What cell labels do:**
+- **Colour.** With ≥ 5 judged positive and ≥ 5 judged negative cells for a channel (outside the test wells), that
+  channel's P(positive) comes from a logistic fit of your answers instead of the unsupervised mixture
+  (`identify.py`, 2b). The mixture is still fitted and its agreement with you is reported in `identity.json`.
+- **"Several cells".** The well's status becomes "several cells (by eye)" and its call "ambiguous".
+- **"Not a cell".** That cell never wins its well.
+- **Training.** Seed particles of judged cells become weak training labels (weight 0.5): "one cell" → cell,
+  "several cells" → merged. A particle's own label always wins.
+
+Test wells never feed any of this. Only human decisions are stored: Detect's pre-labels and model classes never are.
+
+## Diagnostics (after Detect and Classify)
+
+Written to `<results>/diagnostics/*.png` (plus `diagnostics.json`) and shown in the Diagnostics tab. All are
+distributions: ECDFs, step histograms, density hexbins and heatmaps, no bar plots. Before Classify the classes are
+the preview's *provisional* ones.
+
+| plot | what |
+|---|---|
+| 1 SNR | per channel, ECDF of particle SNR (frame background SDs) by provisional class; the noise cut (3) marked |
+| 2 brightness | per channel, ECDF of brightness in typical-cell units; the noise cut (0.05) marked |
+| 3 dynamic range | per channel and plate, histogram over wells of log10 (brightest particle − hole background) / hole noise SD |
+| 4 particles per well | ECDF over wells of the particle count per provisional class, and of "inside" particles per channel |
+| 5 background | per channel, ECDF over wells of the hole background (solid) and frame background (dashed), per plate |
+| 6 cross-channel | every channel over the same particle footprint, asinh(typical-cell units / 0.05): density per pair, Spearman ρ over particles and over wells |
+| 7 colocalisation | pixel-wise Pearson r of a particle's channel with each other channel: ECDF per pair and the median as a heatmap |
+| 8 identity | after Classify: the cells' brightness per identity channel with the calibration's components and cut |
+
+On ROMK, for example, plot 6 shows GFP and mScarlet as mutually exclusive (an L shape), with ROMK on both. Plot 7
+shows GFP particles co-varying more with ROMK than with mScarlet.
+
+**New feature `f_coloc`:** the highest pixel-wise Pearson r of a particle with another channel. Its per-channel
+values are kept as `r_<channel>` columns. Results detected before it lack the feature: a model trained with it
+refuses those results ("Run Detect again"), while older models (27 features) still run on new results. On ROMK, the
+27 old features and all 639 calls of the old model are unchanged.
 
 ## Splitting and editing particles
 
@@ -199,11 +292,13 @@ treats every fluorescence channel of the run as an identity channel.
 | 1 | `sources.py` | load a well into `WellData` (window ±`work_R` = 2.2 hole radii). Uses the hole crop when its origin is known and it covers the window, else `<well>_whole_channels.tif` (see above). Channels are matched by the TIF labels, never by position. Thresholds and background come from the DB when stored; otherwise they're computed as the pipeline does (triangle; mean/SD outside particles). The hole is the .roi rasterised like `segment.py`. `JsonpCropSource` reads viewer-export crops (used to import the first ROMK labels). |
 | 2 | `detect.py` | particles at two thresholds (stringent whole-image; lenient hole threshold applied to the window). Measured in full and inside the hole, every channel over the same footprint; peaks; parent object; the hole's own background. |
 | 3 | `reference.py` | field reference per plate × channel (whole-image objects ≥ 30 µm²): typical brightness (dynamic-range unit), size, shape. |
-| 4 | `features.py` | 27 features that don't depend on the number of channels (own signal in calibrated units, shape, position, context, summaries of the other channels; see the module doc). The channel itself is never a feature. |
-| 5 | `labels.py` | label library (`ci_labels.db`): labels stored by position, so they survive reruns; frozen test wells; legacy import. |
-| 6 | `learn.py` | classifier (gradient-boosted trees), pretraining on all particles (label spreading, self-training), grouped CV + frozen test, "label next" queue. |
+| 4 | `features.py` | 28 features that don't depend on the number of channels (own signal in calibrated units, shape, position, context, summaries of the other channels; see the module doc). The channel itself is never a feature. |
+| 5 | `labels.py` | label library (`ci_labels.db`): particle labels (with their source) and cell labels stored by position, so they survive reruns; frozen test wells (also chosen before labelling, or taken over from another library); edits; legacy import. |
+| 6 | `learn.py` | classifier (gradient-boosted trees), pretraining on all particles (label spreading, self-training), grouped CV + frozen test, quick refit for the loop, learning curve, model comparison on the test wells, "label next" queue. |
 | 7 | `reconstruct.py` | neighbour-aware cells: a basin per significant peak, split at dips (saddle/lower peak < 0.6), cell and neighbour basins never joined, growth relative to the seed within 1.5 µm of the hole. |
-| – | `preview.py` | Detect-stage provisional classes, well status and dominant channel (no model). |
+| – | `preview.py` | Detect-stage provisional classes, well status and dominant channel (no model); `PreviewModel`, the stand-in for Classify before any model exists. |
+| – | `tiers.py` | the label queue: suggestion + tier (auto / confirm / ask) per object, mixed pages, blind test pages, cell pages, progress against targets. |
+| – | `diagnostics.py` | the plots written after Detect and Classify (Agg canvas only, never fails a run). |
 | 8 | `identify.py` | n_c in typical-cell units over the body (hole background subtracted). Per-channel mixture over all cells in the holes of the run; P over all 2^K channel combinations; "uncertain" below 0.8. |
 | – | `pipeline.py` | `detect_run` (stage 1, no model) and `classify_run` (stage 2, from the per-well cache). |
 | – | `gui/` | napari docks (`app.py`, `panel.py`, `display.py`), theme from napari. |
@@ -212,7 +307,8 @@ Outputs (results folder):
 - `run.json`, `wells.csv`, `reference.csv`;
 - `particles.parquet` (features + P(class) + cell membership);
 - `cells.csv`, `calls.csv` (one row per well, key `well_plate` = `B05.18T39383`), `identity.json`;
-- `cache/` (window pixels float16, hole, BF, label maps; about 0.25 MB per well) and `recon/`.
+- `cache/` (hole, label maps, thresholds; pixels only for viewer-export sources, otherwise read back from the run's TIF) and `recon/`;
+- `diagnostics/` (plots + `diagnostics.json`).
 
 ## Ground rules built in
 
@@ -320,9 +416,9 @@ pass. pytest is not installed in
 
 ## Not done / next
 
-1. **Label a second dataset** (a current run, e.g. PNC or a new iPSC run). About 300 particles, starting with
-   "Label next", then retrain on both. The cross-dataset number needs these labels; that dataset's frozen test wells
-   are drawn on first training.
+1. **The clean-slate experiment** (set up 2026-10-19): blind labels from scratch on ROMK (test wells taken over from
+   the old library) and on PNC, then compare the new model, the old model and the preview on each dataset's test
+   wells, and across datasets.
 2. **Debris and merged need more labels:** 7 and 27 now.
 3. **Validate on the full ROMK v5 run once the share is online.** `RunSource` reads `whole_channels.tif` if v5 wrote
    it (all 1232 wells, all 1796 labels, full context instead of ±2.2 R crops).

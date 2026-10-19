@@ -4989,6 +4989,33 @@ class _CropSelectionDialog(QDialog):
         return {k for k, cb in self._boxes.items() if cb.isChecked()}
 
 
+class _ReconDetectWorker(QThread):
+    """Cell reconstruction's Detect (no model needed) for a finished run, in the background: particles, preview and
+    diagnostic plots in <root>/reconstruction_<run tag>, ready when Cell reconstruction opens."""
+    progress = Signal(int, int, str)
+    finished_ok = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, root, run_tag, parent=None):
+        super().__init__(parent)
+        self.root, self.run_tag = Path(root), run_tag
+        self.cancel = threading.Event()
+
+    def run(self):
+        try:
+            from correlative_imaging.reconstruction.config import Config
+            from correlative_imaging.reconstruction.pipeline import detect_run, source_from_spec
+            cfg = Config()
+            spec = dict(kind="run", root=str(self.root), run_tag=self.run_tag)
+            src = source_from_spec(spec, cfg)
+            out = self.root / f"reconstruction_{self.run_tag}"
+            detect_run(src, cfg, out, progress=lambda i, n, m="": self.progress.emit(i, n, m), source_spec=spec,
+                       cancel=self.cancel)
+            self.finished_ok.emit(str(out))
+        except Exception as e:                              # never disturbs the finished run
+            self.failed.emit(str(e))
+
+
 def _run_of_dbs(db_paths: str):
     """(output root, run tag) from the database path(s) a batch reports ("; "-joined for several plates): each plate
     writes <root>/<plate folder>/<run tag>.db."""
@@ -5306,6 +5333,16 @@ class RunTab(QWidget):
         self._recon_btn.clicked.connect(lambda: self._open_reconstruction(*(self._last_run or (None, None))))
         ctrl.addWidget(self._recon_btn)
         bl.addLayout(ctrl)
+        self._recon_detect_cb = QCheckBox("Then detect particles for Cell reconstruction (in the background)")
+        self._recon_detect_cb.setToolTip("after the run: find the particles of every hole, the Detect preview and the "
+                                         "diagnostic plots (no model needed), so Cell reconstruction opens ready to "
+                                         "label. Takes about 1 s per well with 8 threads.")
+        self._recon_detect_cb.setChecked(QSettings("CorrelativeImaging", "gui").value("recon_detect_after_run", True,
+                                                                                     type=bool))
+        self._recon_detect_cb.toggled.connect(
+            lambda on: QSettings("CorrelativeImaging", "gui").setValue("recon_detect_after_run", on))
+        bl.addWidget(self._recon_detect_cb)
+        self._recon_worker = None
         # shown when a run finishes: jump straight into the result viewers
         self._last_run = None
         self._child_windows = []
@@ -5319,7 +5356,10 @@ class RunTab(QWidget):
         _rc = QPushButton("Cell reconstruction")
         _rc.setStyleSheet("font-weight:bold")
         _rc.clicked.connect(lambda: self._open_reconstruction(*(self._last_run or (None, None))))
-        _db.addWidget(_rx); _db.addWidget(_rc)
+        self._recon_cancel = QPushButton("Stop detect")
+        self._recon_cancel.setVisible(False)
+        self._recon_cancel.clicked.connect(self._cancel_recon_detect)
+        _db.addWidget(_rx); _db.addWidget(_rc); _db.addWidget(self._recon_cancel)
         self._done_bar.setStyleSheet("QWidget { background: rgba(43,179,163,0.18); border-radius: 4px; }")
         self._done_bar.setVisible(False)
         bl.addWidget(self._done_bar)
@@ -5938,6 +5978,41 @@ class RunTab(QWidget):
             n = len([p for p in db_path.split(";") if p.strip()])
             self._done_lbl.setText(f"Run finished · {n} plate(s) · {run[1]}")
             self._done_bar.setVisible(True)
+            if self._recon_detect_cb.isChecked():
+                self._start_recon_detect(*run)
+
+    def _start_recon_detect(self, root, run_tag) -> None:
+        if self._recon_worker is not None and self._recon_worker.isRunning():
+            return
+        if (Path(root) / f"reconstruction_{run_tag}" / "run.json").exists():
+            # never overwrite results that may hold edits or a classification
+            self._log(f"Cell reconstruction: reconstruction_{run_tag} already exists, not detected again")
+            return
+        w = _ReconDetectWorker(root, run_tag, self)
+        base = self._done_lbl.text()
+
+        def prog(i, n, m):
+            self._done_lbl.setText(f"{base} · detecting particles {i}/{n}" + (f" ({m})" if m else ""))
+
+        def ok(out):
+            self._recon_cancel.setVisible(False)
+            self._done_lbl.setText(f"{base} · particles detected: Cell reconstruction opens them")
+            self._log(f"Cell reconstruction: particles detected → {out}")
+
+        def bad(msg):
+            self._recon_cancel.setVisible(False)
+            self._done_lbl.setText(f"{base} · particle detection stopped: {msg}")
+            self._log(f"Cell reconstruction Detect: {msg}")
+        w.progress.connect(prog)
+        w.finished_ok.connect(ok)
+        w.failed.connect(bad)
+        self._recon_worker = w
+        self._recon_cancel.setVisible(True)
+        w.start()
+
+    def _cancel_recon_detect(self) -> None:
+        if self._recon_worker is not None:
+            self._recon_worker.cancel.set()
 
     def _open_reconstruction(self, root=None, run_tag=None) -> None:
         """Cell reconstruction in a second napari window of this process (napari.run() is already running)."""

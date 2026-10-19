@@ -60,7 +60,12 @@ class _Wells:
             return None
         wd, maps = got
         b = wd.box_slices
-        lim = [(float(np.percentile(c[b], 1)), float(np.percentile(c[b], 99.8))) for c in wd.chans]
+        # from the frame background up to the brightest pixels, but never closer than 15 noise SDs: an empty hole
+        # stays dark instead of its noise being stretched into "signal"
+        lim = []
+        for c, ch in zip(wd.chans, wd.names):
+            bm, bs = wd.bg.get(ch, (float(np.percentile(c[b], 5)), float(np.std(c[b]))))
+            lim.append((float(bm), max(float(np.percentile(c[b], 99.8)), float(bm) + 15 * float(bs))))
         G = self.res.recon(plate_id, well_id)
         v = (wd, maps, G, lim)
         with self.lock:
@@ -185,6 +190,9 @@ class LabelQueue(QWidget):
                                   "results with it and rebuild the queue")
         self.b_retrain.clicked.connect(app.retrain_and_classify)
         bar.addWidget(self.b_retrain)
+        self.src = QLabel("")
+        self.src.setProperty("role", "hint")
+        bar.addWidget(self.src)
         bar.addStretch(1)
         self.info = QLabel("")
         self.info.setProperty("role", "hint")
@@ -248,16 +256,39 @@ class LabelQueue(QWidget):
                 rows = tiers.cell_page(app.res, app.store, n=max(self.n // 2, 6), mode="test" if self.test else "train",
                                        done=self.done)
             else:
+                self._m = tiers.matched(app.res, app.store)
                 rows = tiers.particle_page(app.res, app.store, app.model, n=self.n,
-                                           mode="test" if self.test else "train", done=self.done)
+                                           mode="test" if self.test else "train", done=self.done, m=self._m)
         except Exception as e:
             self.info.setText(f"queue failed: {e}")
             return
+        m = app.model
+        arm = getattr(m, "spec", {}).get("arm") if m is not None else None
+        self.src.setText("suggestions: " + ("Detect preview (no model)" if arm in (None, "preview")
+                                            else f"model {app.model_file or arm}")
+                         if self.kind == "particle" else "suggestions: the call")
         self.rows = rows.reset_index(drop=True)
         self.state = {}
         self.cur = 0
         self._build()
         self.update_info()
+        self._prefetch()
+
+    def _prefetch(self):
+        """Read the wells of a likely next page ahead (they stay in the well cache)."""
+        app = self.app
+        if self.kind != "particle" or self.wells is None:
+            return
+        from .. import tiers
+        done = self.done | {self._key(r) for r in self.rows.itertuples(index=False)}
+        res, store, model, mode, n, wells = app.res, app.store, app.model, "test" if self.test else "train", self.n, \
+            self.wells
+
+        def job():                                      # in the background: never blocks the keys
+            nxt = tiers.particle_page(res, store, model, n=n, mode=mode, done=done)
+            for r in nxt.drop_duplicates(["plate_id", "well_id"]).itertuples(index=False):
+                wells.get(r.plate_id, r.well_id)
+        self.pool.submit(job)
 
     def load_selection(self, keys: pd.DataFrame):
         """A page of hand-picked particles (from the particle map); test wells are left out (blind elsewhere)."""
@@ -477,7 +508,13 @@ class LabelQueue(QWidget):
                     self.app.pick(m.iloc[0])
 
     def _after(self):
-        self.update_info()
+        self._n_since = getattr(self, "_n_since", 0) + 1
+        if self._n_since >= 10:                          # the full progress (all labels matched) now and then
+            self._n_since = 0
+            self.update_info()
+        else:
+            self.info.setText(f"page {len(self.state)}/{len(self.tiles)}" + self.info.text()[self.info.text().find(" ·"):]
+                              if " ·" in self.info.text() else f"page {len(self.state)}/{len(self.tiles)}")
         if self.tiles and len(self.state) >= len(self.tiles):
             QTimer.singleShot(250, self.new_page)
         else:
@@ -531,7 +568,9 @@ class LabelQueue(QWidget):
         n_done = len(self.state)
         try:
             from ..tiers import label_progress
-            pr = label_progress(app.res, app.store)
+            m = getattr(self, "_m", None)
+            self._m = None                                 # one shared match per page, fresh afterwards
+            pr = label_progress(app.res, app.store, m=m)
             t = pr["test"]
             self.info.setText(f"page {n_done}/{len(self.tiles)} · test wells: {t['labelled']}/{t['objects']} objects "
                               f"labelled in {t['wells']} wells")
