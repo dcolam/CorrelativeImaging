@@ -130,9 +130,9 @@ class RunTab(QWidget):
         f.addRow("wells", self.wells)
         v.addLayout(f)
         v.addWidget(section("Channels"))
-        v.addWidget(hint("Names and colours are display only (decisions use the raw channel). A marker channel is "
-                         "measured but never counts as identity (e.g. a channel on every cell). Untick to ignore a "
-                         "channel."))
+        v.addWidget(hint("Names and colours are display only (decisions use the raw channel). Every channel is an "
+                         "identity channel by default: it shapes the cell body and is part of the colour call. A "
+                         "marker channel is only measured and reported. Untick to ignore a channel."))
         self.chan_grid = QGridLayout()
         self.chan_rows = {}
         v.addLayout(self.chan_grid)
@@ -334,8 +334,7 @@ class RunTab(QWidget):
                 self.find_runs()
                 self.run.setCurrentText(src.get("run_tag", ""))
                 self.out.setText(str(res.dir))
-            self.info.setText(f"dataset <b>{res.dataset}</b> · channels {', '.join(res.channels)} · "
-                              f"{'classified' if res.calls is not None else 'detected, not classified'}")
+            self.info.setText(f"dataset <b>{res.dataset}</b> · channels {', '.join(res.channels)}")
 
 
 class SettingsTab(QWidget):

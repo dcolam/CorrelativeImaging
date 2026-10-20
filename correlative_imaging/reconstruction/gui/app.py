@@ -126,9 +126,14 @@ class ReconstructionApp:
         t = theme(viewer)
         from .panel import PanelHost
         self.host = PanelHost(self.panel)
+        from .workflow_strip import WorkflowStrip
+        self.strip = WorkflowStrip(self, t)
+        self.host.layout().insertWidget(0, self.strip)
+        self._running, self._pr, self._job_running = set(), None, False
         self.batch = {"particle": self.panel.label.particles, "cell": self.panel.label.cells}
         for w in (self.host, self.browser):
             w.setStyleSheet(stylesheet(t))
+        self.update_workflow()
         rdw = viewer.window.add_dock_widget(self.host, area="right", name="Cell reconstruction")
         from .channels import ControlView
         self.channels = ControlView(self)
@@ -230,6 +235,7 @@ class ReconstructionApp:
         if not path:
             return
         self.store = LabelStore(path)
+        self._pr = None
         from qtpy.QtCore import QSettings
         QSettings("CorrelativeImaging", "reconstruction").setValue("label_library", str(self.store.path))
         self.panel.train.store_path.setText(str(self.store.path))
@@ -245,6 +251,7 @@ class ReconstructionApp:
 
     def open_results(self, d: str):
         from ..pipeline import Results
+        self._pr = None                                 # label counts belong to one results folder + library
         try:
             self.res = Results(d)
         except Exception as e:
@@ -293,29 +300,83 @@ class ReconstructionApp:
         self.panel.label.sub.setCurrentWidget(self.batch[kind])
 
     def update_status(self, pr: dict | None = None):
-        """The retrain bar: new training labels since the last retrain."""
-        res, st = self.res, self.store
-        lt = self.panel.label
-        if res is None:
+        """The workflow strip and the retrain bar (both from workflow.workflow_state). pr: label progress of the
+        batch labeller (labels matched to particles), kept for the next updates."""
+        if pr is not None:
+            self._pr = pr
+        S = self.update_workflow()
+        if S is None or self.res is None:
             return
-        tw = st.test_wells(res.dataset) if st is not None else set()
-        arm = (res.run.get("model") or {}).get("arm")
-        classified = res.calls is not None
-        model_txt = ("not classified" if not classified else "classified with the Detect preview (no model)"
-                     if arm == "preview" else f"classified with model {self.model_file or arm}")
-        t = (pr or {}).get("test", {})
-        n_test = t.get("labelled", 0)
-        n_train = sum(n for n, _ in (pr or {}).get("classes", {}).values())
-        new = n_train
-        L = st.frame(res.dataset) if st is not None else None
-        fitted = getattr(self.model, "spec", {}).get("fitted") if self.model is not None else None
-        if L is not None and len(L) and fitted:
-            Lt = L[[(p, w) not in tw for p, w in zip(L.plate_id, L.well_id)]]
-            new = int((Lt.t.astype(str) > str(fitted)).sum())
-        lt.retrain_info.setText(
-            f"<b>{new}</b> new training labels since the last retrain (retrain every ~50–100)" if classified
-            else "Retrain needs Classify and some labels first.")
-        lt.b_retrain.setEnabled(classified and n_train >= 30)
+        lt = self.panel.label
+        tr = S["train"]
+        if tr.state in ("blocked",):
+            txt = tr.reason
+        elif "new_labels" in tr.facts:
+            txt = f"<b>{tr.facts['new_labels']}</b> new training labels since the last training (retrain every ~50–100)"
+        else:
+            txt = f"{S['label'].facts.get('n_train', 0)} training labels: train a first model"
+        lt.retrain_info.setText(txt)
+        lt.b_retrain.setEnabled(tr.can_run and not self._job_running)
+
+    # -- the workflow strip
+    def workflow_dir(self):
+        if self.res is not None:
+            return self.res.dir
+        t = self.panel.run.out.text().strip()
+        return Path(t) if t else None
+
+    def update_workflow(self):
+        from ..workflow import workflow_state
+        try:
+            pr = self._pr if (self._pr is not None and self.res is not None) else None
+            S = workflow_state(self.workflow_dir(), self.store, self.model, progress=pr, running=self._running)
+        except Exception as e:                              # the strip never breaks the app
+            self.say(f"workflow status not read: {e}")
+            return None
+        self.strip.set_state(S)
+        return S
+
+    def blocked(self, key: str) -> str | None:
+        """Why a workflow step cannot run now (the same rule for the strip, the Run tab and the retrain bar)."""
+        S = self.update_workflow()
+        if S is None or key not in S:
+            return None
+        s = S[key]
+        if not s.can_run or s.state == "blocked":
+            return s.reason or "not possible yet"
+        return None
+
+    def show_step(self, key: str):
+        """Open the tab of a workflow step."""
+        p = self.panel
+        if key in ("detect", "classify"):
+            p.setCurrentWidget(p.run)
+        elif key == "label":
+            p.setCurrentWidget(p.label)
+        elif key == "train":
+            p.setCurrentWidget(p.train.model_page)
+        elif key == "results":
+            p.setCurrentWidget(p.results)
+
+    def run_step(self, key: str):
+        """The main action of a workflow step (the strip's button)."""
+        self.show_step(key)
+        why = self.blocked(key) if key != "results" else None
+        if why:
+            self.say(f"{key.capitalize()}: {why}")
+            return
+        if key == "detect":
+            self.run_stage("detect")
+        elif key == "classify":
+            self.run_stage("classify")
+        elif key == "train":
+            self.retrain_and_classify()
+        elif key == "label":
+            tw = self.store.test_wells(self.res.dataset) if (self.store is not None and self.res is not None) else set()
+            if self.store is None or not tw:
+                self.panel.label.setup.btn.setChecked(True)     # library and test wells come first
+            else:
+                self.show_batch("particle")
 
     # -- test wells, blind labelling
     def freeze_test_wells(self, other: str | None = None):
@@ -433,6 +494,10 @@ class ReconstructionApp:
         if self.res is None or self.store is None:
             self.say("open results and choose a label library first")
             return
+        why = self.blocked("train")
+        if why:
+            self.say(f"Train: {why}")
+            return
         folders = [l.strip() for l in self.panel.train.folders.toPlainText().splitlines() if l.strip()]
         # the loop's quick refit: one arm, no cross-validation (the Train button compares arms)
         arm = self.trained.model.spec["arm"] if self.trained is not None else "self-train+rules"
@@ -444,9 +509,12 @@ class ReconstructionApp:
         def job():
             from ..learn import ParticleModel
             from ..pipeline import classify_run
+            from ..workflow import record_job
+            record_job(out, "train", "started")             # classify_run records its own part
             T, tg, rep = assemble(folders, store)
             res = train(T, tg, arms=arms, rounds=rounds, tau=tau, progress=prog, cv=False,
                         feature_config=rep.attrs.get("feature_config"))
+            record_job(out, "train", "finished")
             curve = learning_curve(T, tg, res.model.spec["arm"])
             name = (f"{'_'.join(res.model.spec.get('datasets', ['model']))[:50]}_{res.model.spec['arm']}_"
                     f"n{res.model.spec['n_train']}_{datetime.datetime.now():%Y%m%d_%H%M}.joblib")
@@ -479,7 +547,7 @@ class ReconstructionApp:
             self.say(f"trained ({res.model.spec['arm']}, {res.model.spec['n_train']} labels), saved {name}, classified")
             self.open_results(out)
 
-        self._worker(job, done, "retraining and classifying")
+        self._worker(job, done, "retraining and classifying", steps=("train", "classify"))
 
     def compare_models(self):
         from ..learn import compare_models
@@ -555,6 +623,7 @@ class ReconstructionApp:
     def refresh(self):
         res = self.res
         self.panel.run.update(res, self.store, self.model.spec if self.model else None)
+        self.update_status()
         if self.store is not None:
             self.panel.train.counts.set(self.store.counts())
         self.panel.results.update(res)
@@ -998,24 +1067,37 @@ class ReconstructionApp:
                 self.panel.train.mode.setChecked(True)
 
     # -- long work
-    def _worker(self, fn, done, what: str = "working"):
+    def _worker(self, fn, done, what: str = "working", steps: tuple = ()):
+        """A background job. steps: the workflow steps it works on (shown as running; a failure of a step the
+        pipeline does not record itself, e.g. training, goes to job.json)."""
         from napari.qt.threading import create_worker
+        from ..workflow import record_job
+        d = self.workflow_dir()
+
+        def failed(e):
+            self.say(f"error: {e}")
+            if d is not None and "train" in steps and Path(d).exists():
+                from ..workflow import jobs
+                # training itself failed (a failing Classify after it records its own failure)
+                if steps == ("train",) or jobs(d).get("train", {}).get("status") == "started":
+                    record_job(d, "train", "failed", f"{type(e).__name__}: {e}")
         w = create_worker(fn)
         w.returned.connect(done)
-        w.errored.connect(lambda e: self.say(f"error: {e}"))
-        w.finished.connect(lambda: self._busy(False))
+        w.errored.connect(failed)
+        w.finished.connect(lambda: (self._running.clear(), self.strip.follow_next(), self._busy(False)))
+        self._running = set(steps)
         self._busy(True, what)
         w.start()
         self._w = w
 
     def _busy(self, on, what: str = ""):
         """Buttons off and the bar under the status line running while a job works in the background."""
+        self._job_running = on
         for b in (self.panel.run.b_detect, self.panel.run.b_classify, self.panel.run.b_all, self.panel.train.b_train,
                   self.panel.label.b_retrain):
             b.setEnabled(not on)
         self.host.busy(on, what)
-        if not on:
-            self.update_status()
+        self.update_status()
 
     def run_stage(self, stage: str):
         from ..pipeline import classify_run, detect_run, source_from_spec
@@ -1033,6 +1115,11 @@ class ReconstructionApp:
         if not out:
             self.say("choose a results folder")
             return
+        if stage == "classify":
+            why = self.blocked("classify")
+            if why:
+                self.say(f"Classify: {why}")
+                return
         wells = self.panel.run.wells.text().split() or None
         prog = lambda i, n, m="": self.bus.progress.emit(i, n, m)
         cl = self.train_cell_labels
@@ -1058,7 +1145,8 @@ class ReconstructionApp:
                 return out
         self.say(f"{stage} → {out}")
         self._worker(job, lambda d: (self.say("done"), self.open_results(d)), {"detect": "detecting",
-                     "classify": "classifying", "all": "detecting and classifying"}.get(stage, stage))
+                     "classify": "classifying", "all": "detecting and classifying"}.get(stage, stage),
+                     steps={"detect": ("detect",), "classify": ("classify",), "all": ("detect", "classify")}[stage])
 
     def train(self):
         from ..learn import assemble, train
@@ -1084,10 +1172,13 @@ class ReconstructionApp:
 
         def done(res):
             self.trained = res
+            if self.workflow_dir() is not None:
+                from ..workflow import record_job
+                record_job(self.workflow_dir(), "train", "finished")
             self.panel.train.show_result(res)
             self.say(f"trained; best by grouped CV: {res.model.spec['arm']}")
 
-        self._worker(job, done, "training (comparing arms)")
+        self._worker(job, done, "training (comparing arms)", steps=("train",))
 
     def save_model(self):
         import datetime

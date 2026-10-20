@@ -11,6 +11,7 @@
   python -m correlative_imaging.reconstruction freeze-test-wells --out <dir> --labels new.db [--from old.db]
   python -m correlative_imaging.reconstruction compare --out <dir> --labels ci_labels.db --models preview a.joblib ...
         [--plate-map map.csv --check Condition=Empty]
+  python -m correlative_imaging.reconstruction status --out <dir> [--labels ci_labels.db] [--model <file.joblib>]
 
 `--config` takes a JSON file or a preset name (identity/presets/*.json).
 """
@@ -53,6 +54,8 @@ def main(argv=None):
     k.add_argument("--models", nargs="+", default=["preview"])
     k.add_argument("--plate-map", help="CSV with plate_id, well_id and condition columns (for --check)")
     k.add_argument("--check", help="COLUMN=VALUE: wells where no cell is expected, e.g. Condition=Empty")
+    s_ = sub.add_parser("status", help="where a results folder stands in the workflow (the GUI's strip, as text)")
+    s_.add_argument("--out", required=True); s_.add_argument("--labels"); s_.add_argument("--model")
     i = sub.add_parser("import-labels", help="import a first labelling session (CSV)")
     i.add_argument("--csv", required=True); i.add_argument("--labels", required=True)
     i.add_argument("--dataset", required=True); i.add_argument("--names", nargs="+", required=True)
@@ -125,6 +128,30 @@ def main(argv=None):
             chk, name = set(zip(m.plate_id[m[col] == val], m.well_id[m[col] == val])), val
         print(compare_models(a.out, LabelStore(a.labels), a.models, check_wells=chk, check_name=name)
               .to_string(index=False))
+    elif a.cmd == "status":
+        from .workflow import summary, workflow_state
+        store = model = None
+        if a.labels:
+            from .labels import LabelStore
+            if not Path(a.labels).exists():                # status only reads: never create a library
+                raise SystemExit(f"no label library at {a.labels}")
+            store = LabelStore(a.labels)
+        from .learn import ParticleModel
+        if a.model:
+            model = ParticleModel.load(a.model)
+        else:                                         # the model the results were last configured with
+            import json
+            from .config import Config
+            try:
+                name = json.loads((Path(a.out) / "run.json").read_text()).get("config", {}).get("model") or ""
+            except (OSError, ValueError):
+                name = ""
+            mp = Config(model=name).model_path() if name else None
+            model = ParticleModel.load(mp) if mp is not None and mp.exists() else None
+        import sys
+        if hasattr(sys.stdout, "reconfigure"):          # a Windows console cannot print every character
+            sys.stdout.reconfigure(errors="replace")
+        print(summary(workflow_state(a.out, store, model)))
     elif a.cmd == "import-labels":
         from .labels import LabelStore
         names = dict(n.split("=", 1) for n in a.names)

@@ -14,6 +14,7 @@ Output folder:
   cells.csv           reconstructed cells with body measurements, n_<ch>, p_<ch>, combination call
   calls.csv           one row per well (keyed by well_plate = B05.18T39383)
   identity.json       per-channel mixture of the identity call
+  job.json            the last job (detect / classify / train): started, finished or failed (workflow.py)
   cache/<plate>_<well>.npz   window pixels (float32, so a re-detect from the cache equals Detect), hole, BF planes
                              (float16), label maps (after splits / edits) and the split lines
   recon/<plate>_<well>.npz   reconstruction label image (cells > 0, neighbours < 0)
@@ -171,8 +172,30 @@ def _atomic(path: Path, write):
     os.replace(tmp, path)
 
 
+def _job(step: str, out_dir, fn):
+    """Run a stage with its record in job.json (started / finished / failed), so an interrupted or failed run shows
+    as such in the workflow status (workflow.py), from the GUI and the command line alike."""
+    from .workflow import record_job
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    record_job(out_dir, step, "started")
+    try:
+        r = fn()
+    except BaseException as e:
+        record_job(out_dir, step, "failed", f"{type(e).__name__}: {e}")
+        raise
+    record_job(out_dir, step, "finished")
+    return r
+
+
 def detect_run(src, cfg: Config, out_dir, wells: list | None = None, workers: int = 8, progress=None,
                source_spec: dict | None = None, edits: dict | None = None, cancel=None) -> dict:
+    """Stage 1 (see _detect_run), recorded in job.json."""
+    return _job("detect", out_dir, lambda: _detect_run(src, cfg, out_dir, wells, workers, progress, source_spec,
+                                                         edits, cancel))
+
+
+def _detect_run(src, cfg: Config, out_dir, wells: list | None = None, workers: int = 8, progress=None,
+                source_spec: dict | None = None, edits: dict | None = None, cancel=None) -> dict:
     """Stage 1. `wells`: optional list of "PLATE_WELL" keys. progress(done, total, message). cancel: a
     threading.Event; set, the wells not started yet are skipped and RuntimeError is raised.
     edits: {(plate_id, well_id): {"cuts": [...], "merges": [...]}} from the label library (LabelStore.edits)."""
@@ -298,6 +321,12 @@ class Results:
 
 def classify_run(out_dir, cfg: Config | None = None, model=None, workers: int = 8, progress=None,
                  cell_labels: pd.DataFrame | None = None) -> dict:
+    """Stage 2 (see _classify_run), recorded in job.json."""
+    return _job("classify", out_dir, lambda: _classify_run(out_dir, cfg, model, workers, progress, cell_labels))
+
+
+def _classify_run(out_dir, cfg: Config | None = None, model=None, workers: int = 8, progress=None,
+                  cell_labels: pd.DataFrame | None = None) -> dict:
     """Stage 2 on a detected output folder. model: a learn.ParticleModel (default: cfg.model; none: the Detect
     preview). cell_labels: LabelStore.cell_frame rows of this dataset, test wells removed (verdicts and colours:
     identify.py 2b)."""

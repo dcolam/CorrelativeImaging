@@ -27,6 +27,23 @@ it opens that. Otherwise the Run tab is filled in for that run, ready for Detect
 The GUI is laid out in workflow order: the **Control view** on the left (tabbed with napari's Layers and Layer
 controls) steers the canvas; the right panel holds the steps. A bar on top of the right panel runs while a job works.
 
+**Workflow strip (top of the right panel):** Detect → Label → Train → Classify → Results, one pictogram each, with
+its state read from the results folder and the label library (`workflow.py`, the same function as the `status`
+command):
+
+| state | meaning |
+|---|---|
+| done | its outputs exist and nothing they depend on changed since |
+| to do | not run yet |
+| out of date | an input changed afterwards (the card says which): Detect again, another model chosen, ≥ 50 new training labels since the model, cell labels since Classify, hand-edited wells classified alone |
+| unfinished | it started and did not finish (cancelled, crashed, or running in another window) |
+| failed | the last run raised an error (kept in `job.json`, so it survives a restart) |
+| not yet | an earlier step is missing (the card says which) |
+
+The step to do next is framed. Click a step for its card: what it does, its state and why, what it writes, and its
+one main action (the button is off, with the reason, when the step cannot run). Label, Train and Classify are a loop:
+Classify works without a model (the Detect preview), so cells can be judged before any training.
+
 **Control view (left):**
 - **Plate** (plate and colouring dropdowns; click a well) and **Label this well**: every object of the well on screen
   onto a bulk-labeller page, labelled ones too (a key overwrites their label).
@@ -304,6 +321,7 @@ On PNC the pixels are on the pipeline's 2× binned grid (0.427 µm; the hole is 
 python -m correlative_imaging.reconstruction detect   --root <output folder> --run-tag <tag> --out <dir> [--config romk]
 python -m correlative_imaging.reconstruction classify --out <dir> [--model <file.joblib>]
 python -m correlative_imaging.reconstruction train    --results <dir> [<dir> …] --labels ci_labels.db --model <name>
+python -m correlative_imaging.reconstruction status   --out <dir> [--labels ci_labels.db] [--model <file.joblib>]
 python -m correlative_imaging.reconstruction import-labels --csv labels_geom.csv --labels ci_labels.db --dataset romk_v5 \
        --names GFP=488nm mScarlet=561nm ROMK=640nm [--wells-csv wells_crop_matches_v5.csv]
 ```
