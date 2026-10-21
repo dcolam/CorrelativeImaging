@@ -79,3 +79,14 @@ def test_old_results_without_cell_sizes_never_raise():
     cells, calls, _ = add_clump_scores(_cells(), _calls(), F, pd.DataFrame(columns=["plate_id", "ch"]),
                                        ["561nm"], Config())
     assert cells.others_cells.isna().all() and "possible_clump" in calls
+
+
+def test_preview_prelabels_a_clump_as_merged():
+    from correlative_imaging.reconstruction.preview import PreviewModel, provisional_classes
+    F = pd.DataFrame(dict(pool=True, outer=False, plate_id="A", well_id="w1", oid=["a", "b", "c"], parent=["a", "b", "c"],
+                          snr=10.0, rel=1.0, in_um2=[40.0, 200.0, 60.0], f_flat=0.1, f_oth_pos=0, share=[1.0, 0.6, 1.0],
+                          d_in=0.2, rel_full=1.0, field_d2=1.0, edge=False, cells_in=[0.3, 1.3, 0.4]))
+    d = provisional_classes(F)
+    assert list(d) == ["inside", "merged", "inside"]
+    M = PreviewModel().predict(F.assign(dclass=d))
+    assert list(M.pclass) == ["cell", "merged", "cell"] and M.p_merged.iloc[1] == 1

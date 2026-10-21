@@ -277,6 +277,23 @@ class ReconstructionApp:
         self.set_store(str(r["path"]))
         self.panel.run.show_start()
 
+    def _ask_redetect(self, out: str, tag: str) -> str:
+        """Detect into a folder that already holds results: "new" (a clean slate in a new folder), "here" or
+        "cancel"."""
+        from qtpy.QtWidgets import QMessageBox
+        box = QMessageBox(self.panel)
+        box.setWindowTitle("This results folder already holds results")
+        box.setText(f"{out}\nalready holds results. Detecting here again keeps its label library, hand edits and "
+                    "test wells (they are applied again) and removes its Classify results.")
+        box.setInformativeText(f"For a clean slate (no labels, no edits, no model) detect into a new folder: "
+                               f"{self.panel.run.fresh_out(tag).name}")
+        new = box.addButton("New folder (clean slate)", QMessageBox.AcceptRole)
+        here = box.addButton("Detect here again", QMessageBox.DestructiveRole)
+        box.addButton(QMessageBox.Cancel)
+        box.setDefaultButton(new)
+        box.exec_()
+        return {new: "new", here: "here"}.get(box.clickedButton(), "cancel")
+
     def _ask_library(self, r: dict) -> str:
         """The one-time choice for an older results folder: "shared" (default), "clean" or "copy"."""
         from qtpy.QtWidgets import QMessageBox
@@ -1190,6 +1207,13 @@ class ReconstructionApp:
             if not root or not tag:
                 self.say("choose an output folder and a run")
                 return
+            if (Path(out) / "run.json").exists():               # an existing results folder: never by surprise
+                choice = self._ask_redetect(out, tag)
+                if choice == "cancel":
+                    return
+                if choice == "new":
+                    out = str(self.panel.run.fresh_out(tag))
+                    self.panel.run.out.setText(out)
             spec = dict(kind="run", root=root, run_tag=tag)
             # hand edits come from the TARGET folder's library: a new folder starts clean (no edits of the folder
             # that happens to be open)

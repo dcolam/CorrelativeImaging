@@ -12,6 +12,10 @@ Provisional class of each particle in the hole (`dclass`), first rule that appli
              from the centre), and its whole object looks like a cell next to the hole: at least 0.3 typical
              cells bright, or close to the typical field cell in brightness, size and shape. A whole object cut by
              the window edge has an unknown size, so only its brightness counts.
+  merged     its part inside the hole covers at least one cell (cells_in >= 1: in-hole area / the area of one cell
+             of that plate x channel, reference.cell_um2): a clump. On the ROMK hand labels: 19/31 merged caught,
+             26/620 cells and 1/130 neighbours wrongly (merged particles cover a median 1.07 cells inside the hole,
+             patched cells 0.28)
   inside     everything else
 
 Well preview, from the `inside` particles of the identity channels (markers excluded):
@@ -29,7 +33,8 @@ from scipy.sparse.csgraph import connected_components
 
 from .config import Config
 
-DCLASSES = ["inside", "neighbour", "debris", "noise"]
+DCLASSES = ["inside", "merged", "neighbour", "debris", "noise"]
+MERGED_CELLS = 1.0     # in-hole area of at least one cell: a clump
 NB_MIN_REL = 0.3       # whole object at least 0.3 typical cells bright
 NB_MAX_D2 = 8.0        # field-likeness distance (4 squared z-scores; ~4 = typical)
 DOMINANCE = 1.5
@@ -51,7 +56,8 @@ def provisional_classes(F: pd.DataFrame) -> pd.Series:
     noise = (F.snr < NOISE_SNR) | (F.rel < NOISE_REL)
     debris = (F.in_um2 < 5) & (F.f_flat > 0.5) & (F.f_oth_pos >= 1)
     nb = (F.share < 0.5) & (F.d_in > 0.5) & (bright | size_ok)
-    out = np.select([~pool, noise, debris, nb], [None, "noise", "debris", "neighbour"], "inside")
+    merged = (F["cells_in"] >= MERGED_CELLS) if "cells_in" in F else pd.Series(False, index=F.index)
+    out = np.select([~pool, noise, debris, nb, merged], [None, "noise", "debris", "neighbour", "merged"], "inside")
     return pd.Series(out, index=F.index, dtype=object)
 
 
@@ -67,7 +73,7 @@ def well_previews(F: pd.DataFrame, W: pd.DataFrame, identity: list, cfg: Config)
             rows.append(dict(row, preview_status="no particles", preview_dominant="", n_inside=0, n_nb=0,
                              **{f"preview_sig_{c}": 0.0 for c in identity}))
             continue
-        ins = g[(g.dclass == "inside") & g.ch.isin(identity)]
+        ins = g[g.dclass.isin(["inside", "merged"]) & g.ch.isin(identity)]
         n_nb = int((g.dclass == "neighbour").sum())
         for ch in identity:
             d = ins[ins.ch == ch]
@@ -87,7 +93,8 @@ def well_previews(F: pd.DataFrame, W: pd.DataFrame, identity: list, cfg: Config)
             n_obj = connected_components(A, directed=False)[0]
         else:
             n_obj = 0
-        status = ("one object" if n_obj == 1 else "several objects" if n_obj > 1 else
+        clump = bool((ins.dclass == "merged").any()) if len(ins) else False
+        status = ("several objects" if n_obj > 1 or clump else "one object" if n_obj == 1 else
                   "neighbours only" if n_nb else "no particles")
         top = sorted(sig.items(), key=lambda t: -t[1])
         if not top or top[0][1] <= 0:
@@ -118,7 +125,7 @@ def suggest_markers(previews: pd.DataFrame, identity: list, min_share: float = 0
 
 class PreviewModel:
     """Classify without a trained model (a clean slate): the Detect preview as the particle classes (inside -> cell,
-    neighbour, debris, noise; probability 1, never merged), so the reconstruction and the identity call run before any
+    merged, neighbour, debris, noise; probability 1), so the reconstruction and the identity call run before any
     label exists. Its output is never written to the label store."""
     spec = dict(arm="preview", classes=None, features=[], fitted="", note="Detect preview, no trained model")
 

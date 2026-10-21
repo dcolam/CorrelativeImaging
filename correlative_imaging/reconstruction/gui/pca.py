@@ -18,7 +18,7 @@ from qtpy.QtWidgets import QCheckBox, QComboBox, QHBoxLayout, QLabel, QPushButto
 from ..features import FEATURES
 from .theme import CLASS_COLORS
 
-DCOL = {"inside": "#ffd23f", "neighbour": "#9aa5b1", "debris": "#c77dff", "noise": "#5c6670"}
+DCOL = {"inside": "#ffd23f", "merged": "#ff8c42", "neighbour": "#9aa5b1", "debris": "#c77dff", "noise": "#5c6670"}
 PALETTE = ["#4fc3f7", "#f08a24", "#2bb3a3", "#e05a8a", "#a3d977", "#c77dff", "#ffd23f", "#8a929c"]
 
 

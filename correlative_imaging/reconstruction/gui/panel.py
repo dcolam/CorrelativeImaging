@@ -326,10 +326,19 @@ class RunTab(QWidget):
         if runs:
             self.run.setCurrentIndex(len(runs) - 1)
 
+    def fresh_out(self, tag) -> Path:
+        """A results folder for a new (clean) run: reconstruction_<tag>, or with today's date and time when that
+        one exists already (Detect into an existing folder re-detects it: its labels and hand edits stay)."""
+        import datetime
+        base = Path(self.root.text().strip()) / f"reconstruction_{tag}"
+        if not base.exists():
+            return base
+        return base.with_name(f"{base.name}_{datetime.datetime.now():%Y%m%d_%H%M}")
+
     def default_out(self, tag):
         if not tag or not self.root.text().strip():
             return
-        self.out.setText(str(Path(self.root.text().strip()) / f"reconstruction_{tag}"))
+        self.out.setText(str(self.fresh_out(tag)))
         chans = self.run_channels(tag)
         if not chans:
             return

@@ -32,8 +32,8 @@ from ...gui_common.contrast import contrast_rule  # noqa: F401  (the shared rule
 from .theme import CLASS_COLORS, call_color
 
 SHORT = {"cell": "C", "neighbour": "N", "merged": "M", "debris": "D", "noise": "·", "plug": "P"}
-DSHORT = {"inside": "in", "neighbour": "N?", "debris": "D?", "noise": "·?"}
-DCOLORS = {"inside": "#ffd23f", "neighbour": "#9aa5b1", "debris": "#c77dff", "noise": "#5c6670"}
+DSHORT = {"inside": "in", "merged": "M?", "neighbour": "N?", "debris": "D?", "noise": "·?"}
+DCOLORS = {"inside": "#ffd23f", "merged": "#ff8c42", "neighbour": "#9aa5b1", "debris": "#c77dff", "noise": "#5c6670"}
 
 
 def _outline(mask: np.ndarray):

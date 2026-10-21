@@ -119,7 +119,7 @@ def _p_snr(d, cfg, P, pool, cls, W, names, nc, plates, pcol, summary):
     for k, ch in enumerate(names):
         g = pool[pool.ch == ch]
         a = ax[0, k]
-        for c in ("inside", "neighbour", "debris", "noise"):
+        for c in ("inside", "merged", "neighbour", "debris", "noise"):
             _ecdf(a, _pos(g.snr[cls[g.index] == c]), c, CLASS_COLORS[c])
         _ecdf(a, _pos(g.snr), "all", "black", ls=":", lw=1)
         a.axvline(3, color="#c0392b", lw=0.8, ls="--")
@@ -140,7 +140,7 @@ def _p_brightness(d, cfg, P, pool, cls, W, names, nc, plates, pcol, summary):
     for k, ch in enumerate(names):
         g = pool[pool.ch == ch]
         a = ax[0, k]
-        for c in ("inside", "neighbour", "debris", "noise"):
+        for c in ("inside", "merged", "neighbour", "debris", "noise"):
             _ecdf(a, _pos(g.rel[cls[g.index] == c], 1e-3), c, CLASS_COLORS[c])
         a.axvline(0.05, color="#c0392b", lw=0.8, ls="--")
         a.axvline(1, color="black", lw=0.6, ls=":")
@@ -184,7 +184,7 @@ def _p_counts(d, cfg, P, pool, cls, W, names, nc, plates, pcol, summary):
     fig, ax = _fig(1, 2, w=4.6)
     keys = W[["plate_id", "well_id"]].apply(tuple, axis=1)
     a = ax[0, 0]
-    for c in ("inside", "neighbour", "debris", "noise"):
+    for c in ("inside", "merged", "neighbour", "debris", "noise"):
         n = pool[cls == c].groupby(["plate_id", "well_id"]).size().reindex(keys, fill_value=0)
         _ecdf(a, n.to_numpy(), c, CLASS_COLORS[c])
         summary.setdefault("per_well", {})[c] = dict(median=float(n.median()), share_wells_with_any=float((n > 0).mean()))
