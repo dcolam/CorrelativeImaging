@@ -133,14 +133,19 @@ class ArmModel:
 
 
 def fit_arm(arm: str, X, y, w, X_unl, rounds: int = 3, tau: float = 0.9, w_pseudo: float = 0.3,
-            weak: np.ndarray | None = None, log: list | None = None) -> ArmModel:
+            weak: np.ndarray | None = None, log: list | None = None, tick=None) -> ArmModel:
     """X, y, w: labelled features / class index / weight; X_unl: unlabelled pool (same feature columns).
-    weak: class index or -1 per unlabelled row (arm self-train+rules)."""
+    weak: class index or -1 per unlabelled row (arm self-train+rules). tick(): called after every fit (fit_units)."""
+    tick = tick or (lambda: None)
     if arm == "legacy":
         cols = [FEATURES.index(f) for f in LEGACY_FEATURES]
-        return ArmModel(arm, _legacy().fit(X[:, cols], y, logisticregression__sample_weight=w))
+        m = ArmModel(arm, _legacy().fit(X[:, cols], y, logisticregression__sample_weight=w))
+        tick()
+        return m
     if arm == "hand":
-        return ArmModel(arm, _hgb().fit(X, y, sample_weight=w))
+        m = ArmModel(arm, _hgb().fit(X, y, sample_weight=w))
+        tick()
+        return m
     emb = Embedding().fit(np.vstack([X, X_unl]) if len(X_unl) else X)
     Zl, Zu = emb.transform(X), emb.transform(X_unl) if len(X_unl) else np.zeros((0, emb.pca.n_components_))
     D = _spread(Zl, y, Zu) if len(Zu) else np.zeros((0, len(CLASSES)))
@@ -149,17 +154,21 @@ def fit_arm(arm: str, X, y, w, X_unl, rounds: int = 3, tau: float = 0.9, w_pseud
         ok = D.max(1) >= tau if len(D) else np.zeros(0, bool)
         Z = np.vstack([Zl, Zu[ok]])
         yy = np.r_[y, D[ok].argmax(1)]
-        return ArmModel(arm, KNeighborsClassifier(15, weights="distance").fit(Z, yy), emb, int(ok.sum()))
+        m = ArmModel(arm, KNeighborsClassifier(15, weights="distance").fit(Z, yy), emb, int(ok.sum()))
+        tick()
+        return m
     # self-training
     Xa, ya, wa = X, y, w
     if arm == "self-train+rules" and weak is not None:
         k = weak >= 0
         Xa, ya, wa = np.vstack([X, X_unl[k]]), np.r_[y, weak[k]], np.r_[w, np.full(k.sum(), w_pseudo)]
     est = _hgb().fit(Xa, ya, sample_weight=wa)
+    tick()
     n_ps = 0
     for r in range(rounds):
         if not len(X_unl):
-            break
+            tick()                                      # keep the count of fit_units
+            continue
         P = _proba(est, X_unl)
         take = (P.max(1) >= tau) & (P.argmax(1) == D.argmax(1))
         if arm == "self-train+rules" and weak is not None:
@@ -172,9 +181,15 @@ def fit_arm(arm: str, X, y, w, X_unl, rounds: int = 3, tau: float = 0.9, w_pseud
             k = weak >= 0
             Xa, ya, wa = np.vstack([Xa, X_unl[k]]), np.r_[ya, weak[k]], np.r_[wa, np.full(k.sum(), w_pseudo)]
         est = _hgb().fit(Xa, ya, sample_weight=wa)
+        tick()
         if log is not None:
             log.append(dict(arm=arm, round=r + 1, n_pseudo=n_ps))
     return ArmModel(arm, est, emb, n_ps)
+
+
+def fit_units(arm: str, rounds: int) -> int:
+    """Number of tick() calls of one fit_arm (for a progress bar)."""
+    return 1 + rounds if arm in ("self-train", "self-train+rules") else 1
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -217,10 +232,10 @@ def training_frame(F: pd.DataFrame, matched: pd.DataFrame) -> pd.DataFrame:
 
 def train(T: pd.DataFrame, test_groups: set, arms=ARMS, folds: int = 5, rounds: int = 3, tau: float = 0.9,
           final_arm: str | None = None, progress=None, feature_config: dict | None = None,
-          cv: bool = True) -> TrainResult:
+          cv: bool = True, tick=None) -> TrainResult:
     """T: training_frame (all pool particles of the loaded datasets, labelled or not). test_groups: group keys
     (dataset|plate|well) of the frozen test wells. Returns the final model (fitted on all non-test labels with the
-    chosen arm) + the reports."""
+    chosen arm) + the reports. tick(i, n): fits done of all fits this training makes (for a progress bar)."""
     from sklearn.model_selection import GroupKFold
     say = progress or (lambda m: None)
     g = group_key(T)
@@ -245,6 +260,15 @@ def train(T: pd.DataFrame, test_groups: set, arms=ARMS, folds: int = 5, rounds: 
     nf = min(folds, len(set(gtr)))
     splits = list(GroupKFold(nf).split(X_all[tr], y_all[tr], gtr))
     idx_tr = np.flatnonzero(tr)
+    n_fits = sum(fit_units(a, rounds) for a in arms) * ((len(splits) if cv else 0) + 1)
+    done = [0]
+
+    def one():
+        done[0] += 1
+        if tick:
+            tick(min(done[0], n_fits), n_fits)
+    if tick:
+        tick(0, n_fits)
     for arm in (arms if cv else []):                    # cv=False: the labelling loop's quick refit, no comparison
         say(f"cross-validating '{arm}'")
         fold_m = []
@@ -253,7 +277,7 @@ def train(T: pd.DataFrame, test_groups: set, arms=ARMS, folds: int = 5, rounds: 
             val_groups = set(g[val_i])
             unl = (~lab) & ~is_test & ~np.isin(g, list(val_groups))
             m = fit_arm(arm, X_all[fit_i], y_all[fit_i], w_all[fit_i], X_all[unl], rounds, tau,
-                        weak=weak_all[unl], log=rlog if k == 0 else None)
+                        weak=weak_all[unl], log=rlog if k == 0 else None, tick=one)
             fold_m.append(metrics(y_all[val_i], m.predict_proba(X_all[val_i]), w_all[val_i]))
         cvm = pd.DataFrame(fold_m).mean(numeric_only=True)
         rows.append(dict(arm=arm, **cvm.to_dict()))
@@ -266,7 +290,7 @@ def train(T: pd.DataFrame, test_groups: set, arms=ARMS, folds: int = 5, rounds: 
     test_rows, models = [], {}
     for arm in arms:
         say(f"fitting '{arm}' on all training labels")
-        m = fit_arm(arm, X_all[tr], y_all[tr], w_all[tr], X_all[unl], rounds, tau, weak=weak_all[unl])
+        m = fit_arm(arm, X_all[tr], y_all[tr], w_all[tr], X_all[unl], rounds, tau, weak=weak_all[unl], tick=one)
         models[arm] = m
         P_unl = m.predict_proba(X_all[unl]) if unl.any() else np.zeros((0, len(CLASSES)))
         cov = float((P_unl.max(1) >= 0.9).mean()) if len(P_unl) else np.nan

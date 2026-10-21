@@ -574,6 +574,7 @@ class ReconstructionApp:
         arms = [arm]
         rounds, tau = self.panel.train.rounds.value(), self.panel.train.tau.value()
         prog = lambda m: self.bus.progress.emit(0, 0, m)
+        tick = lambda i, n, m="": self.bus.progress.emit(i, n, m)
         store, out, cfg = self.store, str(self.res.dir), self.read_config()
 
         def job():
@@ -584,7 +585,8 @@ class ReconstructionApp:
             T, tg, rep = assemble(folders, store)
             if rep.attrs.get("missing_features"):
                 prog("WARNING: features missing in some results folders (detected before they existed; detect again to use them): " + ", ".join(rep.attrs["missing_features"]))
-            res = train(T, tg, arms=arms, rounds=rounds, tau=tau, progress=prog, cv=False,
+            prog("training…")
+            res = train(T, tg, arms=arms, rounds=rounds, tau=tau, progress=prog, cv=False, tick=tick,
                         feature_config=rep.attrs.get("feature_config"))
             record_job(out, "train", "finished")
             curve = learning_curve(T, tg, res.model.spec["arm"])
@@ -599,7 +601,7 @@ class ReconstructionApp:
                    labels_sha1=res.model.spec.get("labels_sha1"))
             cfg.model = name
             prog("classifying with the new model…")
-            classify_run(out, cfg, model, progress=lambda i, n, m="": None, cell_labels=self.train_cell_labels(),
+            classify_run(out, cfg, model, progress=tick, cell_labels=self.train_cell_labels(),
                          labels_path=str(store.path))
             return res, curve, model, name
 
@@ -1273,6 +1275,7 @@ class ReconstructionApp:
             if rep.attrs.get("feature_config_differs"):
                 prog("WARNING: the results folders were detected with different feature settings")
             return train(T, tg, arms=arms, rounds=rounds, tau=tau, progress=prog,
+                         tick=lambda i, n: self.bus.progress.emit(i, n, ""),
                          feature_config=rep.attrs.get("feature_config"))
 
         def done(res):

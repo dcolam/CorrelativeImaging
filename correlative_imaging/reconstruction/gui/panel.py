@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from qtpy.QtCore import Qt
+from qtpy.QtCore import Qt, QTimer
 from qtpy.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QFrame, QGridLayout,
                             QGroupBox, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit, QProgressBar, QPushButton,
                             QScrollArea, QSpinBox, QTabWidget, QToolButton, QVBoxLayout, QWidget, QSizePolicy)
@@ -1278,22 +1278,43 @@ class PanelHost(QWidget):
         v.addWidget(self.bar)
         v.addWidget(panel, 1)
         self._what = ""
+        self._phase = ""                                # the job's current part (last message), e.g. "training"
+        self._count = ""
+        self._t0 = 0.0
+        self._clock = QTimer(self)                      # elapsed time, also while the bar has no i of n
+        self._clock.setInterval(1000)
+        self._clock.timeout.connect(self._show)
 
     def busy(self, on: bool, what: str = ""):
         """Running: an indeterminate bar with the job's name until real progress (i of n) arrives."""
+        import time
         self._what = what or self._what
+        self._phase, self._count = "", ""
         self.bar.setVisible(on)
         if on:
+            self._t0 = time.monotonic()
             self.bar.setRange(0, 0)
-            self.bar.setFormat(f"{self._what}…")
+            self._clock.start()
+        else:
+            self._clock.stop()
+        self._show()
+
+    def _show(self):
+        import time
+        s = int(time.monotonic() - self._t0)
+        head = self._phase or self._what
+        self.bar.setFormat(f"{head}{': ' + self._count if self._count else '…'}  ({s // 60}:{s % 60:02d})")
 
     def progress(self, i, n, msg=""):
         if not self.bar.isVisible():
             return
+        if msg:
+            self._phase = msg.strip().rstrip("…").splitlines()[0][:60]
         if n:
             self.bar.setRange(0, n)
             self.bar.setValue(i)
-            self.bar.setFormat(f"{self._what}: {i} / {n}")
+            self._count = f"{i} / {n}"
         elif msg:
             self.bar.setRange(0, 0)
-            self.bar.setFormat(f"{self._what}: {msg[:60]}")
+            self._count = ""
+        self._show()
