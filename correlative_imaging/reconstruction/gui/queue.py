@@ -514,6 +514,9 @@ class LabelQueue(QWidget):
                 self.tiles[i].setToolTip(f"{r.plate_id} {r.well_id} · cell {r.cell_id}")
                 sug = "" if blind else (f"call: <b>{'+'.join(disp(c) for c in self._suggest(r).split('+'))}</b>"
                                         if self._suggest(r) else f"call: {getattr(r, 'call', '')}")
+                reason = getattr(r, "clump_reason", "")
+                if not blind and isinstance(reason, str) and reason:      # the measures behind "possible clump"
+                    sug += f"<br><span style='color:#e0a526'>possible clump: {reason}</span>"
             else:
                 head = f"{r.well_id} · {disp(r.ch)} · {'len.' if r.level == 'hole' else 'str.'}"
                 self.tiles[i].setToolTip(f"{r.plate_id} {r.well_id} · {disp(r.ch)} · "

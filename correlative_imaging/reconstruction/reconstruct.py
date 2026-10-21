@@ -15,7 +15,8 @@ Signal  S = max over the identity channels of the lightly smoothed image in hole
 4 joining  Adjacent cell basins without a dip join; free basins join the typed basin they connect to without a dip
            (the highest saddle wins). A cell basin and a neighbour basin never join: the classification wins where
            there is no dip, the dip wins where there is one. Cell groups whose seeds come within `cell_gap_um` of
-           each other also join (the same cell seen in two channels with a small gap).
+           each other also join, in any channel and also across a dip. This keeps a cell with dips inside it
+           (grainy signal, a bright rim) whole; it also merges the touching cells of a clump into one cell.
 5 growth   Each cell group keeps the pixels of its basins with S >= max(grow_frac x median S of its seed,
            grow_floor), within `grow_margin_um` of the hole and connected to its seed. Larger than
            `grow_max_x_hole` x the hole: the relative cut is raised in steps of 0.1.

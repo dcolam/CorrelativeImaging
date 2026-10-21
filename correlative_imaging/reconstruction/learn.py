@@ -503,6 +503,10 @@ def assemble(results_dirs: list, store, tol_um: float = 2.0, test_frac: float = 
                         pool=int(F.pool.sum()), merged_on_split_dropped=n_dropped, from_cell_labels=n_cell_weak))
     T = pd.concat(frames, ignore_index=True)
     rep = pd.DataFrame(rep)
+    missing = [f for f in FEATURES if f not in T or T[f].isna().all()]
+    for f in missing:                                  # folders detected before a feature existed: missing values
+        T[f] = T[f] if f in T else np.nan               # (the trees take NaN; detect again to fill them)
+    rep.attrs["missing_features"] = missing
     rep.attrs["feature_config"] = fcs[0] if fcs else {}
     rep.attrs["feature_config_differs"] = any(f != fcs[0] for f in fcs)
     return T, tg, rep

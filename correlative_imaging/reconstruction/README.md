@@ -183,6 +183,23 @@ label in a test well:
 
 Test wells never feed any of this. Only human decisions are stored: Detect's pre-labels and model classes never are.
 
+## Cells per particle and possible clumps
+
+- **One cell:** Detect measures the area of one cell per plate and channel: the peak of the field objects' areas.
+  Single cells pile up in a sharp peak; clumps form a tail to the right, so the peak isn't pulled up by them.
+  Diagnostics plot `9_cell_size`.
+- **Size in cells:** every particle gets its size in cells (`cells_full`, `cells_in`) and the classifier feature
+  `f_cells`: about 1 for a single cell, about 0.2 for debris, 2 and above for a clump. On the ROMK hand labels:
+  merged 2.05, neighbour 1.25, debris 0.18 (medians). A model uses it after retraining on results detected with it.
+- **Per hole, after Classify,** two measures in cells:
+  - **body:** the cell's area divided by one patched cell of that plate. That's the smaller of the field
+    single-cell size and the plate's typical body, because a small hole squeezes the patched cell.
+  - **others:** other cell-like objects of the identity channels inside the hole.
+
+  A well with body ≥ `clump_body_x` (2) or others ≥ `clump_others` (0.4) is a **possible clump**, with the reason in
+  the well list and on the cell tiles. The call does not change. Bulk: cells shows possible clumps first, so your
+  "one cell" / "several cells" verdicts can set the line. Diagnostics plot `10_clumps`.
+
 ## Diagnostics (after Detect and Classify)
 
 Written to `<results>/diagnostics/*.png` (plus `diagnostics.json`) and shown in the Diagnostics tab. A new Detect

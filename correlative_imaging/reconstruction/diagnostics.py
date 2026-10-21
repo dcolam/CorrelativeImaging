@@ -102,7 +102,7 @@ def detect_diagnostics(out_dir, cfg=None) -> list:
     plates = sorted(W.plate_id.unique())
     pcol = {p: PLATE_COLORS[i % len(PLATE_COLORS)] for i, p in enumerate(plates)}
     nc = len(names)
-    jobs = [_p_snr, _p_brightness, _p_dynamic, _p_counts, _p_background, _p_cross, _p_coloc]
+    jobs = [_p_snr, _p_brightness, _p_dynamic, _p_counts, _p_background, _p_cross, _p_coloc, _p_cell_size]
     for job in jobs:
         try:
             f = job(d, cfg, P, pool, cls, W, names, nc, plates, pcol, summary)
@@ -308,8 +308,96 @@ def _p_coloc(d, cfg, P, pool, cls, W, names, nc, plates, pcol, summary):
                                            "channel with each other channel ('inside' particles; right: median)")
 
 
+def _density(ax, v, label=None, color=None, lw=1.5, bw=0.12, grid=None):
+    """Density of log10 values as a line (never bars)."""
+    from scipy.stats import gaussian_kde
+    v = np.asarray(v, float)
+    v = v[np.isfinite(v) & (v > 0)]
+    if len(v) < 10 or np.ptp(np.log10(v)) == 0:
+        return
+    g = grid if grid is not None else np.linspace(np.log10(v.min()), np.log10(v.max()), 300)
+    ax.plot(10 ** g, gaussian_kde(np.log10(v), bw_method=bw)(g), lw=lw, color=color, label=label)
+
+
+def _p_cell_size(d, cfg, P, pool, cls, W, names, nc, plates, pcol, summary):
+    """The size of one cell per plate x channel (the peak of the field objects' areas) and what the particles in the
+    holes measure in cells (area / that size)."""
+    f_path = d.parent / "field.parquet"
+    ref_path = d.parent / "reference.csv"
+    if not f_path.exists() or not ref_path.exists():
+        return None
+    F = pd.read_parquet(f_path)
+    ref = pd.read_csv(ref_path, dtype={"plate_id": str})
+    if "cell_um2" not in ref:
+        return None
+    fig, ax = _fig(2, nc, w=3.8, h=3.1)
+    grid = np.linspace(np.log10(max(cfg.field_min_um2, 1)), 3.6, 300)
+    summary["cell_um2"] = {}
+    for j, ch in enumerate(names):
+        a = ax[0, j]
+        for pl in plates:
+            g = F[(F.ch == ch) & (F.plate_id.astype(str) == str(pl))]
+            r = ref[(ref.plate_id.astype(str) == str(pl)) & (ref.ch == ch)]
+            one = float(r.cell_um2.iloc[0]) if len(r) else np.nan
+            share2 = float((g.area_um2 >= 2 * one).mean()) if len(g) and np.isfinite(one) else np.nan
+            _density(a, g.area_um2, f"{pl}: 1 cell = {one:.0f} µm², ≥2 cells {share2:.0%}", pcol[pl], grid=grid)
+            if np.isfinite(one):
+                a.axvline(one, color=pcol[pl], ls="--", lw=0.9)
+                a.axvline(2 * one, color=pcol[pl], ls=":", lw=0.7)
+            summary["cell_um2"][f"{pl}|{ch}"] = one
+        a.set_xscale("log")
+        a.set_title(f"{_name(cfg, ch)}: field objects (area density)", fontsize=9, color=_color(cfg, ch))
+        _style(a, "area (µm², log)", "density of log10 area")
+        a.legend(fontsize=6)
+        b = ax[1, j]
+        g = pool[(pool.ch == ch) & (pool.level == "whole")] if "level" in pool else pool[pool.ch == ch]
+        if "cells_full" in g:
+            for c in sorted(set(cls[g.index].dropna())):
+                _density(b, g.cells_full[cls[g.index] == c], f"{c} (n={int((cls[g.index] == c).sum())})", None,
+                         bw=0.2, grid=np.linspace(-2.5, 1.6, 300))
+            b.axvline(1, color="grey", ls="--", lw=0.8)
+            b.axvline(2, color="grey", ls=":", lw=0.7)
+            b.set_xscale("log")
+            b.legend(fontsize=6)
+        b.set_title(f"{_name(cfg, ch)}: particles in the holes, by preview class", fontsize=9)
+        _style(b, "size in cells (area / 1 cell, log)", "density")
+    return _save(fig, d / "9_cell_size.png", "Size of one cell = the peak of the field objects' areas (dashed; dotted "
+                                               "= 2 cells). Below: particles touching a hole measured in cells "
+                                               "(whole object): ~1 one cell, < 0.3 debris-sized, ≥ 2 a clump")
+
+
+def _p_clumps(d, cfg, res) -> Path | None:
+    """10_clumps: the two clump scores of each well's best cell, per plate, with the thresholds."""
+    calls = res.calls
+    if calls is None or "body_cells" not in calls:
+        return None
+    C = calls[calls.status.astype(str) != "no cell"] if "status" in calls else calls
+    plates = sorted(C.plate_id.astype(str).unique())
+    pcol = {p: PLATE_COLORS[i % len(PLATE_COLORS)] for i, p in enumerate(plates)}
+    units = res.run.get("clump_units") or {}
+    fig, ax = _fig(1, 2, w=4.6, h=3.3)
+    for pl in plates:
+        g = C[C.plate_id.astype(str) == pl]
+        n_fl = int(g.possible_clump.sum()) if "possible_clump" in g else 0
+        _density(ax[0, 0], g.body_cells, f"{pl}: 1 cell = {units.get(pl, float('nan')):.0f} µm², flagged {n_fl}/{len(g)}",
+                 pcol[pl], bw=0.2, grid=np.linspace(-1.3, 1.0, 300))
+        _ecdf(ax[0, 1], g.others_cells, pl, pcol[pl])
+    ax[0, 0].axvline(cfg.clump_body_x, color="#c0392b", lw=0.9)
+    ax[0, 0].set_xscale("log")
+    _style(ax[0, 0], "body / one patched cell (log)", "density")
+    ax[0, 0].legend(fontsize=6)
+    ax[0, 0].set_title("Body size in cells", fontsize=9)
+    ax[0, 1].axvline(cfg.clump_others, color="#c0392b", lw=0.9)
+    _style(ax[0, 1], "other cell-like objects inside the hole (cells)")
+    ax[0, 1].legend(fontsize=6)
+    ax[0, 1].set_title("Others in the hole", fontsize=9)
+    n = int(C.possible_clump.sum()) if "possible_clump" in C else 0
+    return _save(fig, d / "10_clumps.png", f"Possible clumps: {n} of {len(C)} wells with a cell (red: the thresholds; "
+                                            "the call does not change, the wells are flagged)")
+
+
 def classify_diagnostics(out_dir, info: dict | None = None, cfg=None) -> list:
-    """After Classify: 8_identity (cells' brightness per identity channel with the calibration)."""
+    """After Classify: 8_identity (cells' brightness per identity channel with the calibration) and 10_clumps."""
     from .pipeline import Results
     res = Results(out_dir)
     cfg = cfg or res.config
@@ -318,10 +406,17 @@ def classify_diagnostics(out_dir, info: dict | None = None, cfg=None) -> list:
     C = res.cells
     if C is None or not len(C):
         return []
+    extra = []
+    try:
+        f = _p_clumps(d, cfg, res)
+        if f:
+            extra.append(f)
+    except Exception:                                   # a plot never fails Classify
+        pass
     info = info or (json.loads((res.dir / "identity.json").read_text()) if (res.dir / "identity.json").exists() else {})
     chans = [c for c in res.run.get("identity_channels") or res.channels if f"n_{c}" in C]
     if not chans:
-        return []
+        return extra
     try:
         fig, ax = _fig(1, len(chans))
         for k, ch in enumerate(chans):
@@ -346,6 +441,6 @@ def classify_diagnostics(out_dir, info: dict | None = None, cfg=None) -> list:
             _style(a, "asinh(brightness / 0.05), typical-cell units", "density")
             a.legend(fontsize=6)
         return [_save(fig, d / "8_identity.png", "Cells' brightness per identity channel with the calibration's two "
-                                                  "components (dashed) and the call's cut (red)")]
+                                                  "components (dashed) and the call's cut (red)")] + extra
     except Exception:
-        return []
+        return extra

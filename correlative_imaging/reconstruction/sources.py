@@ -121,8 +121,10 @@ def field_from_db(db: Path, plate_id: str, min_um2: float) -> pd.DataFrame:
     con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     im = pd.read_sql("select id, metadata from images", con)
     wm = {i: pad_well(json.loads(m)["well_id"]) for i, m in zip(im.id, im.metadata)}
+    cols = {r[1] for r in con.execute("pragma table_info(particle_measurements)")}
+    edge = " and cut_at_edge = 0" if "cut_at_edge" in cols else ""      # objects cut by the image edge look smaller
     pm = pd.read_sql("select image_id, channel, area_um2, mean_intensity, circularity, solidity, eccentricity "
-                     "from particle_measurements where roi_mask = 'whole_image' and area_um2 >= ?", con,
+                     f"from particle_measurements where roi_mask = 'whole_image' and area_um2 >= ?{edge}", con,
                      params=(min_um2,))
     con.close()
     pm.insert(0, "well_id", pm.image_id.map(wm))

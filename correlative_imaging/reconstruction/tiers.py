@@ -21,7 +21,8 @@ label is stored with level "any" (it applies to both threshold levels, as matche
 
 Cells (after Classify, with the preview or a model): one tile per reconstructed cell, suggested colour = the call;
 tier ask when the call is uncertain, several seeds or basins went into the cell, or a channel's probability sits
-between 0.2 and 0.8.
+between 0.2 and 0.8. Possible clumps (clumps.py) come first: up to 40 % of a training page, so the "one cell" /
+"several cells" verdicts that set the clump line are made where it matters.
 """
 from __future__ import annotations
 
@@ -175,10 +176,15 @@ def cell_page(res, store, n: int = 12, mode: str = "train", seed: int | None = N
         d = C[C.is_test]
         return d.sample(frac=1, random_state=int(rng.integers(1 << 31))).head(n).assign(blind=True)
     d = C[~C.is_test]
-    k_ask = int(round(0.6 * n))
+    first = d.iloc[0:0]
+    if "possible_clump" in d:
+        clump = d.possible_clump.fillna(False).astype(bool)
+        first = d[clump].sample(frac=1, random_state=int(rng.integers(1 << 31))).head(int(round(0.4 * n)))
+        d = d.drop(first.index)
+    k_ask = int(round(0.6 * (n - len(first))))
     a = d[d.tier == "ask"].sample(frac=1, random_state=int(rng.integers(1 << 31))).head(k_ask)
-    rest = d.drop(a.index).sample(frac=1, random_state=int(rng.integers(1 << 31))).head(n - len(a))
-    return pd.concat([a, rest]).assign(blind=False)
+    rest = d.drop(a.index).sample(frac=1, random_state=int(rng.integers(1 << 31))).head(n - len(first) - len(a))
+    return pd.concat([first.assign(tier="clump?"), a, rest]).assign(blind=False)
 
 
 def label_progress(res, store, targets: dict | None = None, m: pd.DataFrame | None = None) -> dict:

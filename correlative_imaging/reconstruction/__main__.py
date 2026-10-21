@@ -104,6 +104,8 @@ def main(argv=None):
         T, tg, rep = assemble(a.results, LabelStore(a.labels))
         print(rep.to_string(index=False))
         from .learn import ARMS
+        if rep.attrs.get("missing_features"):
+            print("WARNING: features missing in some results folders (detected before they existed; detect again to use them): " + ", ".join(rep.attrs["missing_features"]))
         if rep.attrs.get("feature_config_differs"):
             print("WARNING: the results folders were detected with different feature settings")
         res = train(T, tg, arms=a.arms or ARMS, rounds=a.rounds, final_arm=a.arm, progress=print,

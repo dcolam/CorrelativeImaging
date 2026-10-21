@@ -6182,6 +6182,12 @@ class CorrelativeImagingWidget(QWidget):
         self.setMinimumWidth(420)
 
         self._watch_layer_colormaps()
+        if napari_viewer is not None and hasattr(napari_viewer, "layers"):
+            try:
+                from correlative_imaging.gui_common.scale_bar import enable as scale_bar
+                scale_bar(napari_viewer)               # µm when the image's pixel size is known
+            except Exception:
+                log.debug("scale bar not enabled", exc_info=True)
 
         # Control view (left, tabbed with napari's Layers / Layer controls): quick plate + channel histogram
         self._control_view = None

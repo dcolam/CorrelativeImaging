@@ -380,12 +380,17 @@ def methods(out_dir, _used: set | None = None) -> str:
                   "of the lower peak; a cell basin and a neighbour basin were never joined.")
         else:
             t += " Connected bright areas were not split at signal dips."
-        t += (f" Seeds of different channels closer than {_n(C['cell_gap_um'])} µm were joined. A cell kept the "
+        t += (f" Cell groups whose seeds came within {_n(C['cell_gap_um'])} µm of each other were joined (in any "
+              "channel, also across a dip). A cell kept the "
               f"pixels of its basins with at least {_n(C['grow_frac'])} of its seed's median signal, within "
               f"{_n(C['grow_margin_um'])} µm of the hole, connected to the seed; above {_n(C['grow_max_x_hole'])} "
               "hole areas the relative cut was raised in steps until the cell fitted.")
         if markers:
             t += f" Marker channels ({', '.join(name(c) for c in markers)}) were measured but did not shape the cells."
+        t += (" A cell was marked a possible clump (the call unchanged) when its body was at least "
+              f"{_n(C['clump_body_x'])} times the area of one patched cell of that plate (the smaller of the field "
+              "cells' single-cell area and the plate's typical body), or when other cell-like objects of the identity "
+              f"channels inside the hole added up to at least {_n(C['clump_others'])} cells (field-cell units).")
         P.append(t)
 
         # colour call

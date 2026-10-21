@@ -51,11 +51,18 @@ class Config:
     split_dips: bool = True       # split at signal dips between peaks (off = every connected bright area is one cell)
     peak_h: float = 3.0           # a peak must rise this many hole-noise SDs above its surroundings
     dip_ratio: float = 0.6        # saddle / lower peak below this = two objects
-    cell_gap_um: float = 2.0      # seeds of different channels closer than this may join (if no dip between them)
+    cell_gap_um: float = 2.0      # cell groups whose seeds come closer than this join: in any channel and also
+                                  # across a dip (keeps a grainy or ring-shaped cell whole; also merges touching
+                                  # cells of a clump into one)
     grow_floor: float = 2.0       # grown pixels must be at least this many hole-noise SDs above the hole background
     grow_frac: float = 0.35       # ... and at least this fraction of the seed's median signal
     grow_margin_um: float = 1.5   # the cell may grow this far beyond the hole
     grow_max_x_hole: float = 2.0  # area cap (x hole area); the relative cut is raised in steps until it fits
+
+    # --- more than one cell in the hole? (clumps.py; flag only, the call does not change) --------------------------
+    clump_body_x: float = 2.0     # body area >= this many patched-cell areas: possible clump
+    clump_others: float = 0.4     # other cell-like objects inside the hole adding up to >= this many cells: possible
+                                  # clump (field-cell units; debris, noise, plugs and marker channels never count)
 
     # --- identity call -------------------------------------------------------------------------------------------
     p_call: float = 0.8           # P(best channel combination) needed for a call, otherwise "uncertain"

@@ -152,8 +152,8 @@ class ReconstructionApp:
         viewer.bind_key("x", lambda v: self.panel.train.b_cut.toggle(), overwrite=True)
         viewer.bind_key("n", lambda v: self.browser.step(1), overwrite=True)
         viewer.bind_key("p", lambda v: self.browser.step(-1), overwrite=True)
-        viewer.scale_bar.visible = True
-        viewer.scale_bar.unit = "um"
+        from ...gui_common.scale_bar import enable as scale_bar
+        scale_bar(viewer)                      # µm from the layers' units (ScaleBar.unit is deprecated)
         viewer.text_overlay.visible = True
         viewer.text_overlay.position = "top_left"
         viewer.text_overlay.font_size = 11
@@ -523,6 +523,8 @@ class ReconstructionApp:
             from ..workflow import record_job
             record_job(out, "train", "started")             # classify_run records its own part
             T, tg, rep = assemble(folders, store)
+            if rep.attrs.get("missing_features"):
+                prog("WARNING: features missing in some results folders (detected before they existed; detect again to use them): " + ", ".join(rep.attrs["missing_features"]))
             res = train(T, tg, arms=arms, rounds=rounds, tau=tau, progress=prog, cv=False,
                         feature_config=rep.attrs.get("feature_config"))
             record_job(out, "train", "finished")
@@ -650,7 +652,8 @@ class ReconstructionApp:
         w = W[["plate_id", "well_id"] + cols].copy()
         classified = res.calls is not None
         if classified:
-            keep = [c for c in ("status", "call", "dominant", "p_combo", "n_cells", "p_cell") if c in res.calls]
+            keep = [c for c in ("status", "call", "dominant", "p_combo", "n_cells", "p_cell", "clump_reason")
+                    if c in res.calls]
             w = w.merge(res.calls[["plate_id", "well_id"] + keep], how="left")
             w["status_shown"] = np.where(w["call"] == "uncertain", "uncertain", w["status"])
             w["dominant_shown"] = w["call"].where(~w["call"].isin(["no cell"]), "")
@@ -671,7 +674,7 @@ class ReconstructionApp:
                                                                  bool) & t.blind_test.isChecked())
         if hide.any():                                  # blind: no status, call or preview to see
             for c in ("status_shown", "dominant_shown", "call", "status", "dominant", "preview_status",
-                      "preview_dominant", "p_combo", "n_cells", "n_inside", "p_cell"):
+                      "preview_dominant", "p_combo", "n_cells", "n_inside", "p_cell", "clump_reason"):
                 if c in w:
                     w[c] = w[c].astype(object)
                     w.loc[hide, c] = "blind" if c in ("status_shown", "status") else None
@@ -684,7 +687,8 @@ class ReconstructionApp:
         w["status"] = w["status_shown"]
         extra = [c for c in (self.plate_map.columns if self.plate_map is not None else []) if c not in ("plate_id", "well_id")][:3]
         if classified:
-            show = ["plate_id", "well_id", "status", "call", "P", "n_cells", "labels", "test"] + extra
+            w["clump"] = w.get("clump_reason", pd.Series("", index=w.index)).fillna("")
+            show = ["plate_id", "well_id", "status", "call", "P", "n_cells", "clump", "labels", "test"] + extra
         else:
             w["dominant"] = w["dominant_shown"].map(lambda d: self.call_text(d) if isinstance(d, str) and d else "")
             show = ["plate_id", "well_id", "status", "dominant", "n_inside", "labels", "test"] + extra
@@ -1182,6 +1186,8 @@ class ReconstructionApp:
         def job():
             T, tg, rep = assemble(folders, store)
             prog(rep.to_string(index=False))
+            if rep.attrs.get("missing_features"):
+                prog("WARNING: features missing in some results folders (detected before they existed; detect again to use them): " + ", ".join(rep.attrs["missing_features"]))
             if rep.attrs.get("feature_config_differs"):
                 prog("WARNING: the results folders were detected with different feature settings")
             return train(T, tg, arms=arms, rounds=rounds, tau=tau, progress=prog,

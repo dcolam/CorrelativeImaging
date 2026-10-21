@@ -11,7 +11,8 @@ from qtpy.QtWidgets import QComboBox, QHBoxLayout, QLabel, QPushButton, QScrollA
 TITLES = {"1_snr": "SNR per channel", "2_brightness": "Brightness (typical-cell units)",
           "3_dynamic_range": "Dynamic range per well", "4_particles_per_well": "Particles per well",
           "5_background": "Backgrounds", "6_cross_channel": "Cross-channel brightness",
-          "7_coloc": "Colocalisation in particles", "8_identity": "Identity calibration (after Classify)"}
+          "7_coloc": "Colocalisation in particles", "8_identity": "Identity calibration (after Classify)",
+          "9_cell_size": "Size of one cell (cells per particle)", "10_clumps": "Clump scores per hole (after Classify)"}
 
 
 class DiagnosticsView(QWidget):
@@ -90,7 +91,9 @@ class DiagnosticsView(QWidget):
 
     def set_results(self, res):
         keep = self.list.currentIndex()
-        self.files = sorted((Path(res.dir) / "diagnostics").glob("*.png")) if res is not None else []
+        import re
+        num = lambda p: (int(m.group(1)) if (m := re.match(r"(\d+)", p.stem)) else 999, p.stem)   # 1, 2, … 10
+        self.files = sorted((Path(res.dir) / "diagnostics").glob("*.png"), key=num) if res is not None else []
         self.list.blockSignals(True)
         self.list.clear()
         for f in self.files:

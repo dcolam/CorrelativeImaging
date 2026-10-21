@@ -12,6 +12,10 @@ feature, so one model serves every channel and every dataset.
                  f_field_pct  where the whole object's brightness sits in the plate's field-cell distribution (0-1)
                  f_rel_ctx  log10 brightness relative to the median object of that channel in the window
   shape          f_area_in, f_area_full (log10 um2), f_area_z (vs field cells), f_circ, f_sol, f_ecc, f_peaks
+                 f_cells    log2 of the whole object's size in cells: area / the area of one cell of that plate x
+                            channel (reference.cell_um2, the peak of the field objects' areas). 0 = one cell, -2 = a
+                            quarter (debris), 1 = two cells, 2 = four (a clump). Also as columns cells_full and
+                            cells_in (the part inside the hole)
   position       f_share (logit share inside), f_fill (log coverage of the hole), f_d_in, f_d_full (hole radii),
                  f_edge, f_lenient (lenient piece), f_parent_share, f_field_d2 (log1p distance of the whole parent
                  object from the typical field cell: small = looks like a complete neighbour)
@@ -34,7 +38,7 @@ FEATURES = ["f_snr", "f_hsnr", "f_rel", "f_relmax", "f_field_pct", "f_rel_ctx",
             "f_area_in", "f_area_full", "f_area_z", "f_circ", "f_sol", "f_ecc", "f_peaks",
             "f_share", "f_fill", "f_d_in", "f_d_full", "f_edge", "f_lenient", "f_parent_share", "f_field_d2",
             "f_density",
-            "f_oth_max", "f_oth_mean", "f_oth_pos", "f_flat", "f_dom", "f_coloc"]
+            "f_oth_max", "f_oth_mean", "f_oth_pos", "f_flat", "f_dom", "f_coloc", "f_cells"]
 # the reference workflow's feature set, kept for the ablation in learn.py
 LEGACY_FEATURES = ["f_snr", "f_area_in", "f_share", "f_fill"]
 
@@ -95,6 +99,11 @@ def build_features(p: pd.DataFrame, wells: pd.DataFrame, ref: pd.DataFrame, chan
     p["f_area_in"] = np.log10(np.clip(p.in_um2.to_numpy(float), .05, None))
     p["f_area_full"] = larea_full
     p["f_area_z"] = (larea_full - rr.mu_larea.to_numpy(float)) / rr.sd_larea.to_numpy(float)
+    one = rr.cell_um2.to_numpy(float) if "cell_um2" in rr else np.full(len(p), np.nan)   # area of one cell
+    p["cell_um2"] = one
+    p["cells_full"] = p.full_um2.to_numpy(float) / one
+    p["cells_in"] = p.in_um2.to_numpy(float) / one
+    p["f_cells"] = np.log2(np.clip(p.cells_full.to_numpy(float), 1 / 64, 64))
     p["f_circ"], p["f_sol"], p["f_ecc"] = p.circ, p.solidity, p.ecc
     p["f_peaks"] = np.log1p(p.n_peaks)
     p["f_share"] = _logit(p.get("share", np.nan))

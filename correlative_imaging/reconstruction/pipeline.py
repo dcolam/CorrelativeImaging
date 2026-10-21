@@ -9,7 +9,8 @@ classify_run  model -> P(class) per particle -> neighbour-aware reconstruction -
 Output folder:
   run.json            source, dataset, config, model provenance, timings
   wells.csv           one row per well: backgrounds, thresholds, hole, window position
-  reference.csv       field reference per plate x channel
+  reference.csv       field reference per plate x channel (incl. cell_um2, the area of one cell)
+  field.parquet       area of every field object (whole-image particles), for the single-cell size plot
   particles.parquet   every particle (pool + context) with measurements, features and (after classify) P(class)
   cells.csv           reconstructed cells with body measurements, n_<ch>, p_<ch>, combination call
   calls.csv           one row per well (keyed by well_plate = B05.18T39383)
@@ -244,7 +245,11 @@ def _detect_run(src, cfg: Config, out_dir, wells: list | None = None, workers: i
     W = plate_hole_background(pd.DataFrame([r[1] for r in res]), names)
     P = pd.concat([r[0] for r in res], ignore_index=True)
     say(len(rows), len(rows), "field reference + features")
-    ref = field_reference(src.field_table(), W, names)
+    field = src.field_table()
+    ref = field_reference(field, W, names)
+    if len(field):                                       # the field objects' areas: the single-cell size plot
+        keep = [c for c in ("plate_id", "well_id", "ch", "area_um2", "solidity") if c in field]
+        _atomic(out / "field.parquet", lambda t: field[keep].to_parquet(t, index=False))
     F = build_features(P, W, ref, names)
     from .preview import provisional_classes, well_previews
     F["dclass"] = provisional_classes(F)
@@ -420,6 +425,8 @@ def _classify_run(out_dir, cfg: Config | None = None, model=None, workers: int =
             cells = cells.merge(user[["plate_id", "well_id", "cell_id", "verdict"]], how="left")
     cells, info = identify(cells, res.wells, res.reference, identity_ch, cfg, user=user)
     calls = well_calls(cells, res.wells, identity_ch)
+    from .clumps import add_clump_scores                     # more than one cell in the hole? (flag only)
+    cells, calls, clump_units = add_clump_scores(cells, calls, F, res.reference, identity_ch, cfg)
     # particle -> cell membership (for the viewer)
     mem = {(r.plate_id, r.well_id, o): r.cell_id for r in cells.itertuples() for o in str(r.members).split(";") if o} \
         if len(cells) else {}
@@ -430,7 +437,8 @@ def _classify_run(out_dir, cfg: Config | None = None, model=None, workers: int =
     (out / "identity.json").write_text(json.dumps(info, indent=2, default=float))
     run = res.run
     run.update(classified=_now(), classify_s=round(time.time() - t0, 1), model=model.spec,
-               config=json.loads(cfg.to_json()), identity_channels=identity_ch, warning=warn, edited_wells=[])
+               config=json.loads(cfg.to_json()), identity_channels=identity_ch, warning=warn, edited_wells=[],
+               clump_units=clump_units)
     (out / "run.json").write_text(json.dumps(run, indent=2, default=str))
     try:
         from .diagnostics import classify_diagnostics
@@ -508,10 +516,13 @@ def redetect_well(out_dir, plate_id: str, well_id: str, edits: dict | None, cfg:
             mem = {o: r.cell_id for r in new_cells.itertuples() for o in str(r.members).split(";") if o} \
                 if len(new_cells) else {}
             F["cell_id"] = [mem.get(o) for o in F.oid]
+            new_call = well_calls(new_cells, w_row, identity_ch)
+            from .clumps import add_clump_scores             # the run's units: no other well changes
+            new_cells, new_call, _ = add_clump_scores(new_cells, new_call, F, res.reference, identity_ch, cfg,
+                                                      units=run.get("clump_units") or None)
             cells = res.cells if res.cells is not None else pd.DataFrame()
             cells = pd.concat([cells[~((cells.plate_id == plate_id) & (cells.well_id == well_id))], new_cells],
                               ignore_index=True) if len(cells) else new_cells
-            new_call = well_calls(new_cells, w_row, identity_ch)
             calls = pd.concat([res.calls[~((res.calls.plate_id == plate_id) & (res.calls.well_id == well_id))],
                                new_call], ignore_index=True)
             _atomic(out / "cells.csv", lambda t: cells.to_csv(t, index=False))

@@ -8,6 +8,10 @@ Their signal is the object mean minus the frame background of their well. Per pl
   ref_q90         90th percentile (dynamic range)
   mu/sd_lsig      log10 signal          mu/sd_larea   log10 area (um2)
   mu/sd_circ      circularity           mu/sd_sol     solidity
+  cell_um2        the area of ONE cell: the main peak of the field objects' area distribution (density of log10
+                  area). Single cells pile up in a sharp peak, clumps form a tail to the right, so the peak is not
+                  pulled up by clumps the way a mean or median is. Every particle's area divided by it gives its size
+                  in cells (features.py: ~1 a single cell, ~0.2 debris, 2+ a clump).
 
 A plate x channel with fewer than 20 field cells falls back to the whole run for that channel (`fallback` = True).
 A channel without any field cell has no reference (NaN): its brightness features are then missing, which the
@@ -26,9 +30,26 @@ MIN_FIELD = 20
 STATS = [("lsig", "lsig"), ("larea", "larea"), ("circ", "circularity"), ("sol", "solidity")]
 
 
+def single_cell_area(area_um2) -> float:
+    """The main peak of the log10 area density (Gaussian kernel, bandwidth 0.12 of the data's SD scale): the area of
+    one typical cell. NaN with fewer than MIN_FIELD objects."""
+    a = np.asarray(area_um2, float)
+    a = a[np.isfinite(a) & (a > 0)]
+    if len(a) < MIN_FIELD:
+        return float("nan")
+    x = np.log10(a)
+    if np.ptp(x) == 0:
+        return float(a[0])
+    from scipy.stats import gaussian_kde
+    grid = np.linspace(x.min(), x.max(), 400)
+    k = gaussian_kde(x, bw_method=0.12)(grid)
+    return float(10 ** grid[np.argmax(k)])
+
+
 def _summ(d: pd.DataFrame) -> dict:
     out = dict(n_field=len(d), ref_med=float(d.sig.median()) if len(d) else np.nan,
-               ref_q90=float(d.sig.quantile(.9)) if len(d) else np.nan)
+               ref_q90=float(d.sig.quantile(.9)) if len(d) else np.nan,
+               cell_um2=single_cell_area(d.area_um2) if len(d) else np.nan)
     for name, col in STATS:
         v = d[col].astype(float)
         out[f"mu_{name}"] = float(v.mean()) if len(v) else np.nan
