@@ -169,6 +169,25 @@ class ReconstructionApp:
             tile.fg, tile.acc = QColor(t.get("text", "#f0f1f2")), QColor(t.get("current", "#4a90d9"))
             tile.update()
 
+    def set_channel_color(self, ch: str, hexc: str):
+        """A channel's display colour (right-click in the histogram): image, particle fill, switches, Run tab."""
+        from .display import _colormap, _fillmap
+        self.cfg.display.setdefault(ch, {})["color"] = hexc
+        L, P = self.display.L.get(f"img:{ch}"), self.display.L.get(f"part:{ch}")
+        if L is not None:
+            L.colormap = _colormap(hexc, ch)
+        if P is not None:
+            P.colormap = _fillmap(hexc, ch)
+        pc = self.channels.part_cb.get(ch)
+        if pc is not None:
+            pc.setStyleSheet(f"QCheckBox {{ color: {hexc}; }}")
+        row = self.panel.run.chan_rows.get(ch)
+        if row is not None:
+            col = row[2]
+            col.setProperty("hex", hexc)
+            col.setStyleSheet(f"QToolButton {{ background: {hexc}; border-radius: 3px; }}")
+        self.browser.plate.draw()
+
     # -- messages
     def say(self, msg: str):
         self.panel.run.log.appendPlainText(msg)

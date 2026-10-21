@@ -1089,6 +1089,7 @@ class PlateTab(QWidget):
     overview_requested = Signal(object, str)  # (WellInfo, projection) — BF + FL + ROI
     existing_rois_detected = Signal(list)  # list[str] distinct tags found across the scan
     load_pipeline_requested = Signal(dict)  # parsed pipeline dict, ready to apply everywhere
+    scan_finished = Signal()                 # a scan found plates (channels / pipeline are set up from it)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1430,7 +1431,14 @@ class PlateTab(QWidget):
         except Exception as exc:
             QMessageBox.critical(self, "Load failed", str(exc))
             return
+        self.last_json_path = Path(path)      # where the JSON came from (colours of older runs: its TIFs)
         self.load_pipeline_requested.emit(pl_dict)
+
+    def found_jsons(self) -> list[Path]:
+        """The pipeline JSONs the dropdown lists, newest first."""
+        out = [Path(self._json_combo.itemData(i)) for i in range(self._json_combo.count())
+               if self._json_combo.itemData(i)]
+        return sorted(out, key=lambda q: q.stat().st_mtime if q.exists() else 0, reverse=True)
 
     # ── Slots ────────────────────────────────────────────────────────
 
@@ -1596,6 +1604,7 @@ class PlateTab(QWidget):
             self.existing_rois_detected.emit(sorted(tags))
 
         self.refresh_json_dropdown(self.input_dir, self.output_dir)
+        self.scan_finished.emit()
 
     # ── Multi-plate management ────────────────────────────────────────
 
@@ -2206,10 +2215,11 @@ class BFPipelineTab(QWidget):
         self._viewer.add_labels(seg, name=f"Segmentation/{well_id}", opacity=0.45, scale=scale)
         for i, (kind, mask) in enumerate(masks.items(), start=1):
             if mask.max() > 0:
-                self._viewer.add_labels(
+                lyr = self._viewer.add_labels(
                     mask.astype("int32") * i,
-                    name=f"{kind}/{well_id}", opacity=0.5, scale=scale,
+                    name=f"{kind}/{well_id}", opacity=1.0, scale=scale,
                 )
+                lyr.contour = 2      # ROIs as outlines (the segmentation map above stays filled)
         self._log(
             f"  → napari: BF projection + segmentation map + {len(masks)} ROI(s) appended."
         )
@@ -2861,6 +2871,34 @@ def _find_pipeline_jsons(folder, max_depth: int = 3) -> list[Path]:
                         and not d.startswith(".")])
         found += [Path(dirpath) / f for f in filenames if f.endswith("_pipeline.json")]
     return sorted(found)
+
+
+def _colors_from_run_tifs(json_path, n: int) -> list[str] | None:
+    """Channel colours of a run whose pipeline JSON predates "channel_colors": read from the ImageJ LUTs of one of
+    its diagnostic TIFs (<plate output>/diagnostics/<well>_whole_channels.tif, fluorescence channels first)."""
+    import numpy as np
+    from correlative_imaging.batch import _IJ_LUT_RGB
+    try:
+        import tifffile
+        d = Path(json_path).parent / "diagnostics"
+        tif = next(iter(sorted(d.glob("*_whole_channels.tif"))), None) if d.is_dir() else None
+        if tif is None:
+            return None
+        with tifffile.TiffFile(str(tif)) as t:
+            luts = (t.imagej_metadata or {}).get("LUTs")
+        if luts is None or len(luts) < n:
+            return None
+        names = {}
+        for name, rgb in _IJ_LUT_RGB.items():
+            names.setdefault(tuple(rgb), "gray" if name in ("grey", "white") else name)
+        out = []
+        for lut in list(luts)[:n]:
+            end = tuple(int(v) for v in np.asarray(lut)[:, -1])
+            out.append(names.get(end, "gray"))
+        return out
+    except Exception:
+        log.debug("no channel colours from the run's TIFs", exc_info=True)
+        return None
 
 
 def _roi_filename_for_well(well, kind: str, ext: str = ".roi") -> str:
@@ -6085,6 +6123,8 @@ class CorrelativeImagingWidget(QWidget):
         self._bf_tab.set_roi_tab(self._roi_tab)
         self._plate_tab.existing_rois_detected.connect(self._on_existing_rois_detected)
         self._plate_tab.load_pipeline_requested.connect(self._on_load_pipeline_json)
+        self._plate_tab.scan_finished.connect(self._on_scan_finished)
+        self._pending_json = None
         self._advanced_tab._get_guided_pipeline = self.build_pipeline_dict
         self._advanced_tab._get_setup = lambda: self._plate_tab
         self._advanced_tab._make_well_pipeline_dict_fn = self.make_well_pipeline_dict_fn
@@ -6160,8 +6200,10 @@ class CorrelativeImagingWidget(QWidget):
         ch = re.sub(r" \[\d+\]$", "", ch)
         name = str(getattr(layer.colormap, "name", "")).lower()
         name = {"grey": "gray", "grays": "gray", "greys": "gray"}.get(name, name)
-        for p in self._channels_tab.get_panels():
-            if ch in (p._raw_name, p.display_name):
+        # by name, or by position in the loaded image (a loaded pipeline may have renamed the panels)
+        raw = list(getattr(self._plate_tab.image_data, "channel_names", None) or [])
+        for i, p in enumerate(self._channels_tab.get_panels()):
+            if ch in (p._raw_name, p.display_name) or (i < len(raw) and ch == raw[i]):
                 p.set_display_color(name)
                 return
 
@@ -6215,10 +6257,11 @@ class CorrelativeImagingWidget(QWidget):
             mask = _load_roi_mask(p, h, w, pixel_size_um=pixel_size_um)
             if mask is None or not mask.any():
                 continue
-            self._viewer.add_labels(
-                mask.astype(int), name=f"roi_{Path(p).stem}/{well.well_id}", opacity=0.4,
+            lyr = self._viewer.add_labels(
+                mask.astype(int), name=f"roi_{Path(p).stem}/{well.well_id}", opacity=1.0,
                 scale=scale,
             )
+            lyr.contour = 2          # the outline only: the image inside the ROI stays visible
 
     def _show_well_overview(self, well, bf_data, fl_data, projection: str) -> None:
         # "none" keeps the Z axis, so that view may legitimately stay in 3-D.
@@ -6304,6 +6347,51 @@ class CorrelativeImagingWidget(QWidget):
             self._combine_tab.auto_populate(channel_names)
         self._advanced_tab.set_channel_names(channel_names)
         self._tabs.setCurrentWidget(self._channels_tab)
+        pending, self._pending_json = self._pending_json, None
+        auto, self._auto_well = getattr(self, "_auto_well", None), None
+        if pending is not None:                       # after a scan: the project's pipeline on top of the sample
+            self._plate_tab._load_json_path(pending)
+            self._notify(f"Loaded pipeline {pending.parent.name}/{pending.name} (found in the project), "
+                         f"channels from well {auto}")
+        elif auto is not None:
+            self._notify(f"Channels taken from well {auto} (drawn at random; no pipeline JSON in the project)")
+
+    def _notify(self, msg: str) -> None:
+        """A short message: the Setup tab's status line, and a napari notification."""
+        log.info(msg)
+        try:
+            lbl = self._plate_tab._status_lbl
+            lbl.setText(lbl.text().split("  ·  ")[0] + "  ·  " + msg)
+        except Exception:
+            pass
+        try:
+            from napari.utils.notifications import show_info
+            show_info(msg)
+        except Exception:
+            pass
+
+    def _on_scan_finished(self) -> None:
+        """After a scan of a fresh session: channels from a randomly drawn well (all images of a project have the
+        same channels), then the project's newest pipeline JSON if there is one. Channels already set up are never
+        overwritten (re-scanning keeps them)."""
+        import random
+        pt = self._plate_tab
+        if self._channels_tab.get_panels():
+            return
+        wells = list(pt._wells.values())
+        if not wells:
+            return
+        pool = [w for w in wells if w.is_complete and w.fl_path] or [w for w in wells if w.fl_path or w.bf_path]
+        if not pool:
+            return
+        w = random.choice(pool)
+        jsons = pt.found_jsons()
+        self._pending_json = jsons[0] if jsons else None
+        self._auto_well = w.well_id
+        pt._grid._on_click(w.well_id)
+        pt._on_load_sample()
+        self._notify(f"reading well {w.well_id} for the channels"
+                     + (f", then pipeline {jsons[0].name}" if jsons else " (no pipeline JSON in the project)"))
 
     def _on_existing_rois_detected(self, tags: list[str]) -> None:
         """Auto-add a "well_existing" ROI & Selections entry for every
@@ -6364,6 +6452,7 @@ class CorrelativeImagingWidget(QWidget):
                 self._combine_tab.set_channels(names)
 
         self._channels_tab.populate_from_pipeline(pl_dict)
+        self._apply_channel_colors(pl_dict)
         warnings = self._roi_tab.populate_from_pipeline(pl_dict)
         self._combine_tab.populate_from_pipeline(pl_dict)
 
@@ -6379,6 +6468,31 @@ class CorrelativeImagingWidget(QWidget):
             msg += "\n\n" + "\n".join(warnings)
             QMessageBox.warning(self, "Loaded with caveats", msg)
         log.info(msg)
+
+    def _apply_channel_colors(self, pl_dict: dict) -> None:
+        """The pipeline's channel colours (its "channel_colors", or for older runs the LUTs of its diagnostic TIFs)
+        on the Channels tab and on the channel layers on screen."""
+        panels = self._channels_tab.get_panels()
+        colors = pl_dict.get("channel_colors")
+        if not colors and getattr(self._plate_tab, "last_json_path", None) is not None:
+            colors = _colors_from_run_tifs(self._plate_tab.last_json_path, len(panels))
+        if not colors:
+            return
+        img = self._plate_tab.image_data
+        raw = list(getattr(img, "channel_names", []) or [])
+        for i, (panel, c) in enumerate(zip(panels, colors)):
+            if not panel.set_display_color(str(c)):
+                continue
+            names = {panel._raw_name, panel.display_name} | ({raw[i]} if i < len(raw) else set())
+            for layer in list(self._viewer.layers) if self._viewer is not None else []:
+                group, _, ch = str(layer.name).partition("/")
+                ch = re.sub(r" \[\d+\]$", "", ch)
+                if ch in names and not group.startswith("BF") and hasattr(layer, "colormap") \
+                        and not (getattr(layer, "metadata", None) or {}).get("mask"):
+                    try:
+                        layer.colormap = str(c)
+                    except Exception:
+                        pass
 
     def build_pipeline_dict(self, well=None) -> dict:
         """
@@ -6447,6 +6561,7 @@ class CorrelativeImagingWidget(QWidget):
             # all, so loading a JSON couldn't restore either — see
             # _on_load_pipeline_json.
             "channel_names": self._channels_tab.get_channel_names(),
+            "channel_colors": self._channel_colors(),
             "bf_pipeline": self._bf_tab.get_config(),
             # Selections whose ROI file is resolved per well at run time. They
             # cannot appear in "steps" here (there is no well to resolve

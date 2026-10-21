@@ -3,6 +3,7 @@ contrast handles inside the plot.
 
   buttons    one per channel, in its colour. Click the name: adjust that channel. Click the dot: show / hide the
              channel (the napari layer's visibility, kept in sync both ways). Hidden channels are not drawn.
+             Right-click: change the channel's colour (a menu of the caller's named colours, or a colour picker).
   plot       log counts per channel, each scaled to its own peak (so a dim channel stays readable next to a bright
              one); the picked channel filled, the others outlined. Intensity axis: asinh (default, readable across
              channels whose ranges differ by orders of magnitude, copes with negative values) or linear.
@@ -150,9 +151,10 @@ class _FlowLayout(QLayout):
 
 
 class ChannelButton(QWidget):
-    """A pill in the channel's colour: dot = show / hide, name = pick for adjusting."""
+    """A pill in the channel's colour: dot = show / hide, name = pick for adjusting, right-click = colour."""
     picked = Signal(object)
     toggled = Signal(object)
+    color_requested = Signal(object, object)            # key, global position
 
     def __init__(self, key, text: str, color: str):
         super().__init__()
@@ -161,7 +163,8 @@ class ChannelButton(QWidget):
         self.setCursor(Qt.PointingHandCursor)
         self._fm = self.fontMetrics()
         self.setFixedHeight(22)
-        self.setToolTip(f"{text}: click to adjust its contrast · click the dot to show / hide it")
+        self.setToolTip(f"{text}: click to adjust its contrast · click the dot to show / hide it · right-click "
+                        "to change its colour")
         self._w = self._fm.horizontalAdvance(text) + 34
         self.setFixedWidth(self._w)
 
@@ -180,6 +183,9 @@ class ChannelButton(QWidget):
         if shown is not None:
             self.shown = shown
         self.update()
+
+    def contextMenuEvent(self, e):
+        self.color_requested.emit(self.key, e.globalPos())
 
     def mousePressEvent(self, e):
         if e.button() != Qt.LeftButton:
@@ -437,10 +443,16 @@ class ChannelHistogram(QWidget):
 
     layers_fn() -> [(key, layer)] in display order (default: every channel-like image layer of the viewer);
     name_fn(key, layer) / color_fn(key, layer): text and colour of a channel (default: layer name / colormap);
-    auto_rule(sample) -> (lo, hi)."""
+    auto_rule(sample) -> (lo, hi);
+    color_choices: {name: hex} offered on right-click (None: a free colour picker);
+    set_color(key, layer, value): applies a picked colour (a name from color_choices, or a hex); default: the
+    layer's colormap becomes black -> that colour."""
 
-    def __init__(self, viewer, layers_fn=None, name_fn=None, color_fn=None, auto_rule=None):
+    def __init__(self, viewer, layers_fn=None, name_fn=None, color_fn=None, auto_rule=None, color_choices=None,
+                 set_color=None):
         super().__init__()
+        self.color_choices = color_choices
+        self.set_color = set_color or _set_layer_color
         self.v = viewer
         self.layers_fn = layers_fn or (lambda: [(L.name, L) for L in viewer.layers if is_channel_layer(L)])
         self.name_fn = name_fn or (lambda k, L: L.name)
@@ -536,6 +548,7 @@ class ChannelHistogram(QWidget):
             b = ChannelButton(k, self.name_fn(k, L), self.color_fn(k, L))
             b.picked.connect(self.pick)
             b.toggled.connect(self._toggle)
+            b.color_requested.connect(self._color_menu)
             self.flow.addWidget(b)
             self.buttons[k] = b
             e = L.events
@@ -613,6 +626,30 @@ class ChannelHistogram(QWidget):
         L = self._layer(key)
         if L is not None:
             L.visible = not L.visible                         # napari's Layers list follows (and vice versa)
+
+    def _color_menu(self, key, pos):
+        L = self._layer(key)
+        if L is None:
+            return
+        if self.color_choices:
+            from qtpy.QtGui import QIcon, QPixmap
+            from qtpy.QtWidgets import QMenu
+            m = QMenu(self)
+            for name, hexc in self.color_choices.items():
+                pm = QPixmap(12, 12)
+                pm.fill(QColor(hexc))
+                a = m.addAction(QIcon(pm), name)
+                a.triggered.connect(lambda _=False, name=name: self._recolor(key, L, name))
+            m.exec_(pos)
+        else:
+            from qtpy.QtWidgets import QColorDialog
+            c = QColorDialog.getColor(QColor(self.color_fn(key, L)), self, f"Colour of {self.name_fn(key, L)}")
+            if c.isValid():
+                self._recolor(key, L, c.name())
+
+    def _recolor(self, key, L, value):
+        self.set_color(key, L, value)
+        self._style_changed(key)
 
     def _dragged(self, lo, hi):
         L = self._layer()
@@ -699,6 +736,17 @@ class ChannelHistogram(QWidget):
     def closeEvent(self, e):
         self._unhook()
         super().closeEvent(e)
+
+
+def _set_layer_color(key, L, value):
+    """A napari colormap name as is; a hex colour as black -> that colour."""
+    if isinstance(value, str) and value.startswith("#"):
+        from napari.utils.colormaps import Colormap
+        h = value.lstrip("#")
+        L.colormap = Colormap([[0, 0, 0, 1], [int(h[i:i + 2], 16) / 255 for i in (0, 2, 4)] + [1]],
+                              name=f"ci_{h}")
+    else:
+        L.colormap = value
 
 
 def set_limits(L, lo: float, hi: float):

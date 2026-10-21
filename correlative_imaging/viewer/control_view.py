@@ -71,7 +71,10 @@ class CIControlView(QWidget):
                                 "percentile but at least minimum + 100")
         self.auto_cb.setChecked(True)
         v.addWidget(self.auto_cb)
-        self.hist = ChannelHistogram(viewer, auto_rule=contrast_rule)
+        from correlative_imaging.diagnostics import CHANNEL_COLOR_CHOICES, CHANNEL_COLOR_RGB
+        choices = {c: "#" + "".join(f"{int(v * 255):02x}" for v in CHANNEL_COLOR_RGB[c]) for c in CHANNEL_COLOR_CHOICES}
+        # right-click: the Channels tab's colour choices (the layer's colormap; the Channels tab follows it)
+        self.hist = ChannelHistogram(viewer, auto_rule=contrast_rule, color_choices=choices)
         v.addWidget(self.hist)
         v.addStretch(1)
 

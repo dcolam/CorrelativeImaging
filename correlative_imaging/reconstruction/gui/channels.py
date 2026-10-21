@@ -66,7 +66,7 @@ class ControlView(QWidget):
         self.hist = ChannelHistogram(
             app.v, layers_fn=lambda: [(c, app.display.L.get(f"img:{c}")) for c in self.chans],
             name_fn=lambda c, L: app.cfg.display_name(c), color_fn=lambda c, L: app.cfg.color(c),
-            auto_rule=contrast_rule)
+            auto_rule=contrast_rule, set_color=lambda c, L, hexc: app.set_channel_color(c, hexc))
         v.addWidget(self.hist)
 
         # particles, overlays
