@@ -90,7 +90,7 @@ class WellBrowser(QWidget):
                 d = d[d.test == "✓"]
             elif "status" in d:
                 d = d[d.status == s]
-        self.model.set(d.drop(columns=["status_shown", "dominant_shown"], errors="ignore"))
+        self.model.set(d.drop(columns=["status_shown", "dominant_shown", "map_value"], errors="ignore"))
         self.view.proxy.setFilterFixedString(self.search.text())
         self.count.setText(f"{self.view.proxy.rowCount()} of {len(self.full)} wells")
 
@@ -738,6 +738,18 @@ class ReconstructionApp:
                 if c in w:
                     w[c] = w[c].astype(object)
                     w.loc[hide, c] = "blind" if c in ("status_shown", "status") else None
+        mcol = self.panel.results.col.currentText() if self.plate_map is not None else ""
+        if mcol in getattr(self.plate_map, "columns", []):          # the Results tab's column colours the plate
+            w = w.merge(self.plate_map[["plate_id", "well_id", mcol]].rename(columns={mcol: "map_value"})
+                        .drop_duplicates(["plate_id", "well_id"]), how="left")
+            w["map_value"] = w.map_value.astype(object)
+            w.loc[hide, "map_value"] = None                         # blind: the condition would bias the labels
+            from .plate import map_colors
+            self.browser.plate.set_map(mcol, map_colors(self.plate_map[mcol], self.res.channels, self.cfg.color,
+                                                        self.cfg.display_name))
+        else:
+            w["map_value"] = None
+            self.browser.plate.set_map("", {})
         if self.plate_map is not None:
             extra = [c for c in self.plate_map.columns if c not in ("plate_id", "well_id")][:3]
             w = w.merge(self.plate_map[["plate_id", "well_id"] + extra], how="left")
@@ -754,11 +766,20 @@ class ReconstructionApp:
             show = ["plate_id", "well_id", "status", "dominant", "n_inside", "labels", "test"] + extra
         show = [c for c in show if c in w]
         stage = "calls (after Classify)" if classified else "Detect preview (no model yet)"
-        self.browser.set(w[show].assign(status_shown=w.status_shown, dominant_shown=w.dominant_shown), stage)
+        self.browser.set(w[show].assign(status_shown=w.status_shown, dominant_shown=w.dominant_shown,
+                                        map_value=w.map_value), stage)
 
     def set_plate_map(self, m):
         self.plate_map = m
         self.panel.train.set_plate_map(m)
+        self.browser.plate.mode.setCurrentText("plate map")
+        self.refresh()
+
+    def set_map_column(self, col):
+        """The Results tab's plate-map column changed: the plate view shows it."""
+        if self.plate_map is None or not col:
+            return
+        self.browser.plate.mode.setCurrentText("plate map")
         self.refresh()
 
     # -- one well

@@ -1091,7 +1091,9 @@ class ResultsTab(QWidget):
         b.clicked.connect(self.load_map)
         h.addWidget(b)
         self.col = QComboBox()
+        self.col.setToolTip("the column shown in the crosstab below and as the plate view's colours (mode: plate map)")
         self.col.currentTextChanged.connect(self.crosstab)
+        self.col.currentTextChanged.connect(app.set_map_column)
         h.addWidget(self.col, 1)
         v.addLayout(h)
         self.ct = FrameModel()
@@ -1186,8 +1188,14 @@ class ResultsTab(QWidget):
         m = pd.read_csv(p, dtype={"plate_id": str, "well_id": str})
         m["well_id"] = m.well_id.map(lambda w: w[0] + f"{int(w[1:]):02d}")
         self.map = m
+        self.col.blockSignals(True)                     # set_plate_map redraws once, with the new column
         self.col.clear()
-        self.col.addItems([c for c in m.columns if c not in ("plate_id", "well_id")])
+        cols = [c for c in m.columns if c not in ("plate_id", "well_id")]
+        self.col.addItems(cols)
+        cond = [c for c in cols if c.lower() == "condition"]
+        if cond:
+            self.col.setCurrentText(cond[0])
+        self.col.blockSignals(False)
         self.app.set_plate_map(m)
 
     def crosstab(self, *_):
