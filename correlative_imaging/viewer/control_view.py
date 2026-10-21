@@ -3,10 +3,12 @@
   plate      a quick view of the current plate (gui_common.plate): wells with BF + FL files, BF only, a yellow
              frame where ROI files exist. Click: select the well, exactly as in the Plate tab (both stay in sync);
              double-click: view the well (the Plate tab's "View all").
-  channels   the shared channel histogram (gui_common.histogram) over the image layers on screen. With
+  channels   the shared channel histogram (gui_common.histogram) over the image layers on screen; hovering over
+             the image shows every channel's pixel value. With
              "auto-contrast on well change" on (default), every channel layer that appears (a well, a sample, a
              preview) gets the shared rule at once: minimum -> 99.9th percentile, at least minimum + 100 (as in
              Cell reconstruction). Mask layers keep their own range.
+  threshold  the threshold preview of the picked channel (viewer/threshold_preview.py).
 """
 from __future__ import annotations
 
@@ -36,9 +38,9 @@ def _hint(text):
 
 
 class CIControlView(QWidget):
-    def __init__(self, viewer, plate_tab):
+    def __init__(self, viewer, plate_tab, main=None):
         super().__init__()
-        self.v, self.pt = viewer, plate_tab
+        self.v, self.pt, self.main = viewer, plate_tab, main
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         sc = QScrollArea()
@@ -74,8 +76,17 @@ class CIControlView(QWidget):
         from correlative_imaging.diagnostics import CHANNEL_COLOR_CHOICES, CHANNEL_COLOR_RGB
         choices = {c: "#" + "".join(f"{int(v * 255):02x}" for v in CHANNEL_COLOR_RGB[c]) for c in CHANNEL_COLOR_CHOICES}
         # right-click: the Channels tab's colour choices (the layer's colormap; the Channels tab follows it)
-        self.hist = ChannelHistogram(viewer, auto_rule=contrast_rule, color_choices=choices)
+        # names without the group ("sample/", "FL/"); brightfield keeps its full name
+        short = lambda k, L: (L.name.split("/", 1)[1] if L.name.split("/", 1)[0] in ("sample", "FL")
+                              and "/" in L.name else L.name)
+        self.hist = ChannelHistogram(viewer, auto_rule=contrast_rule, color_choices=choices, name_fn=short)
         v.addWidget(self.hist)
+        self.threshold = None
+        if main is not None:
+            from correlative_imaging.viewer.threshold_preview import ThresholdPreview
+            v.addWidget(_section("Threshold preview"))
+            self.threshold = ThresholdPreview(viewer, self.hist, main)
+            v.addWidget(self.threshold)
         v.addStretch(1)
 
         self._timer = QTimer(self)

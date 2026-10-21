@@ -6147,6 +6147,8 @@ class CorrelativeImagingWidget(QWidget):
         self._plate_tab.well_selected.connect(self._on_well_selected)
         self._plate_tab.overview_requested.connect(self._on_overview_requested)
 
+        # The fluorescence image on screen (a sample or a well's overview): the threshold preview runs on it.
+        self._shown_image = None
         # (well_id, "bf"/"fl") → ImageData, so re-showing a well's overview
         # doesn't re-read the files.
         self._view_cache: dict[tuple, object] = {}
@@ -6164,7 +6166,7 @@ class CorrelativeImagingWidget(QWidget):
             try:
                 from correlative_imaging.gui_common.docks import add_control_view
                 from correlative_imaging.viewer.control_view import CIControlView
-                self._control_view = CIControlView(napari_viewer, self._plate_tab)
+                self._control_view = CIControlView(napari_viewer, self._plate_tab, main=self)
                 add_control_view(napari_viewer, self._control_view)
             except Exception:
                 log.warning("Control view not added", exc_info=True)
@@ -6278,6 +6280,7 @@ class CorrelativeImagingWidget(QWidget):
             shape_yx = bf_data.data.shape[-2:]
             pixel_size_um = bf_data.pixel_size_um
         if fl_data is not None:
+            self._shown_image = fl_data
             self._add_image_layers(fl_data, "FL", projection, colors=self._channel_colors())
             shape_yx = shape_yx or fl_data.data.shape[-2:]
             if bf_data is None:
@@ -6338,6 +6341,7 @@ class CorrelativeImagingWidget(QWidget):
                 from correlative_imaging.viewer.napari_viewer import NapariViewer
                 v = NapariViewer.__new__(NapariViewer); v._viewer = self._viewer
                 safe_clear_layers(self._viewer)
+                self._shown_image = img
                 v.show_image(img, group="sample", colors=self._channel_colors())
             except Exception:
                 pass

@@ -10,6 +10,9 @@ contrast handles inside the plot.
   handles    the picked channel's min and max as vertical lines: drag one; drag the shaded band between them to move
              both; double-click for auto. The thin curve is the display mapping (with gamma).
   bottom     the range in numbers, gamma, auto, asinh / linear.
+  readout    hovering over the image: every shown channel's pixel value under the cursor, as text in the channels'
+             colours and as a short tick in each channel's histogram.
+  markers    lines a caller pins on a channel's histogram (e.g. the threshold preview: "otsu 523").
 
 Works on any napari image layers (the caller says which): only a strided sample of at most SAMPLE pixels is read,
 so 4D stacks and dask arrays stay cheap. `auto_rule(sample) -> (lo, hi)` is the caller's auto-contrast rule.
@@ -250,6 +253,8 @@ class HistPlot(QWidget):
         self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)     # never sized by its content
         self.setMouseTracking(True)
         self.curves = {}          # key -> (counts 0..1 over BINS, colour)
+        self.marks = []           # (value, colour, text): pinned lines, e.g. a threshold
+        self.hover = []           # (value, colour): the pixel under the cursor, per shown channel
         self.active = None
         self.lim = None           # (lo, hi) of the picked channel
         self.gamma = 1.0
@@ -385,6 +390,34 @@ class HistPlot(QWidget):
             p.setBrush(fill)
             p.setPen(QPen(c, 1.6))
             p.drawPath(path_of(counts, True))
+        # pinned lines (thresholds) and the hovered pixel's ticks
+        f0 = QFont(p.font())
+        fs = QFont(f0)
+        fs.setPointSizeF(max(f0.pointSizeF() - 1.5, 7))
+        for val, color, text in self.marks:
+            c = QColor(color)
+            x = self._x(val)
+            p.setPen(QPen(c, 1.6, Qt.DashLine))
+            p.drawLine(QPointF(x, r.top() + 10), QPointF(x, r.bottom()))
+            if text:                                         # beside the line, below the handles' grips
+                p.setFont(fs)
+                fm = p.fontMetrics()
+                w, hgt = fm.horizontalAdvance(text) + 6, fm.height() + 2
+                tx = x + 4 if x + 4 + w <= self.width() else x - 4 - w
+                box = QRectF(tx, r.top() + 14, w, hgt)
+                bg = QColor(self.palette().window().color())
+                bg.setAlpha(210)
+                p.setPen(Qt.NoPen)
+                p.setBrush(bg)
+                p.drawRoundedRect(box, 3, 3)
+                p.setPen(c)
+                p.drawText(box, Qt.AlignCenter, text)
+                p.setFont(f0)
+        for val, color in self.hover:
+            c = QColor(color)
+            x = self._x(val)
+            p.setPen(QPen(c, 2.2))
+            p.drawLine(QPointF(x, r.bottom() - r.height() * 0.28), QPointF(x, r.bottom()))
         # display mapping and handles
         if self.lim is not None and self.active in self.curves:
             lo, hi = self.lim
@@ -440,6 +473,7 @@ def _fmt(v: float) -> str:
 
 class ChannelHistogram(QWidget):
     """Legend buttons + overlaid histograms + handles for a set of napari image layers.
+    picked_changed(key): another channel is picked for adjusting.
 
     layers_fn() -> [(key, layer)] in display order (default: every channel-like image layer of the viewer);
     name_fn(key, layer) / color_fn(key, layer): text and colour of a channel (default: layer name / colormap);
@@ -447,6 +481,8 @@ class ChannelHistogram(QWidget):
     color_choices: {name: hex} offered on right-click (None: a free colour picker);
     set_color(key, layer, value): applies a picked colour (a name from color_choices, or a hex); default: the
     layer's colormap becomes black -> that colour."""
+
+    picked_changed = Signal(object)
 
     def __init__(self, viewer, layers_fn=None, name_fn=None, color_fn=None, auto_rule=None, color_choices=None,
                  set_color=None):
@@ -495,6 +531,13 @@ class ChannelHistogram(QWidget):
         self.b_log.toggled.connect(lambda on: (self.b_log.setText("log" if on else "lin"), self._redraw()))
         h.addWidget(self.b_log)
         v.addLayout(h)
+        self.readout = QLabel("")
+        self.readout.setTextFormat(Qt.RichText)
+        self.readout.setWordWrap(True)
+        self.readout.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.readout.setToolTip("pixel values under the cursor, every shown channel")
+        v.addWidget(self.readout)
+        self.markers = {}         # key -> [(value, text)]
         self.entries = []         # [(key, layer)]
         self.buttons = {}
         self.cur = None
@@ -504,6 +547,11 @@ class ChannelHistogram(QWidget):
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.timeout.connect(self.rebuild)
+        self._hover_cb = lambda viewer, event: self._hovered()
+        try:
+            viewer.mouse_move_callbacks.append(self._hover_cb)
+        except Exception:
+            pass
         try:
             for ev in ("inserted", "removed", "moved", "reordered"):
                 em = getattr(viewer.layers.events, ev, None)
@@ -559,10 +607,12 @@ class ChannelHistogram(QWidget):
             self._hook(e.colormap, lambda ev, k=k: self._style_changed(k))
             self._hook(e.name, lambda ev, k=k: self._style_changed(k))
         keys = [k for k, _ in entries]
+        self.markers = {k: m for k, m in self.markers.items() if k in keys}
         if self.cur not in keys:                     # start on a shown, coloured channel (not brightfield)
             shown = [k for k, L in entries if L.visible]
             coloured = [k for k in shown if not _grey(self.color_fn(k, self._layer_of(entries, k)))]
             self.cur = (coloured or shown or keys or [None])[0]
+            QTimer.singleShot(0, lambda: self.picked_changed.emit(self.cur))
         self.btn_box.setMinimumHeight(self.flow.heightForWidth(max(self.btn_box.width(), 200)))
         self._redraw()
 
@@ -619,8 +669,11 @@ class ChannelHistogram(QWidget):
 
     # -- user actions
     def pick(self, key):
+        changed = key != self.cur
         self.cur = key
         self._redraw()
+        if changed:
+            self.picked_changed.emit(key)
 
     def _toggle(self, key):
         L = self._layer(key)
@@ -695,9 +748,10 @@ class ChannelHistogram(QWidget):
         vals = [a for a in S.values() if a.size]
         if self.cur not in S and cur_L is not None:                  # picked but hidden: its axis still counts
             vals.append(self._sample(self.cur, cur_L))
+        marks = [m for k, items in self.markers.items() if k in S for m, _ in items if np.isfinite(m)]
         if vals or lims:
-            lo = min([float(a.min()) for a in vals if a.size] + [l[0] for l in lims])
-            hi = max([float(a.max()) for a in vals if a.size] + [l[1] for l in lims])
+            lo = min([float(a.min()) for a in vals if a.size] + [l[0] for l in lims] + marks)
+            hi = max([float(a.max()) for a in vals if a.size] + [l[1] for l in lims] + marks)
         else:
             lo, hi = 0.0, 1.0
         if hi <= lo:
@@ -719,6 +773,8 @@ class ChannelHistogram(QWidget):
             active = None
         else:
             curves_draw, active = curves, self.cur
+        self.plot.marks = [(val, self.color_fn(k, self._layer(k)), text) for k, items in self.markers.items()
+                           if k in curves for val, text in items]
         self.plot.set_data(curves_draw, ax, active, tuple(cur_L.contrast_limits) if cur_L is not None else None,
                            float(cur_L.gamma) if cur_L is not None else 1.0)
         if cur_L is not None:
@@ -733,7 +789,43 @@ class ChannelHistogram(QWidget):
         super().resizeEvent(e)
         self.btn_box.setMinimumHeight(self.flow.heightForWidth(max(self.btn_box.width(), 50)))
 
+    # -- pinned lines and the readout
+    def set_markers(self, key, items):
+        """Lines on a channel's histogram: [(value, text)]; [] removes them."""
+        if items:
+            self.markers[key] = list(items)
+        else:
+            self.markers.pop(key, None)
+        self._redraw()
+
+    def _hovered(self):
+        shown = [(k, L) for k, L in self.entries if L.visible]
+        if not shown:
+            return
+        pos = self.v.cursor.position
+        vals, parts = [], []
+        for k, L in shown:
+            try:
+                val = L.get_value(pos, world=True)
+            except Exception:
+                val = None
+            if isinstance(val, tuple):                       # multiscale: (level, value)
+                val = val[-1]
+            if val is None or not np.isscalar(val) and np.ndim(val):
+                continue
+            val = float(val)
+            col = self.color_fn(k, L)
+            vals.append((val, col))
+            parts.append(f'<span style="color:{col}">■</span> {self.name_fn(k, L)} <b>{_fmt(val)}</b>')
+        self.plot.hover = vals
+        self.plot.update()
+        self.readout.setText(" &nbsp; ".join(parts) if parts else "")
+
     def closeEvent(self, e):
+        try:
+            self.v.mouse_move_callbacks.remove(self._hover_cb)
+        except Exception:
+            pass
         self._unhook()
         super().closeEvent(e)
 
