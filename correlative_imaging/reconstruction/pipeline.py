@@ -193,8 +193,12 @@ def detect_run(src, cfg: Config, out_dir, wells: list | None = None, workers: in
                labels_path: str | None = None) -> dict:
     """Stage 1 (see _detect_run), recorded in job.json and workflow.json (labels_path: the label library the hand
     edits came from)."""
+    fresh = not (Path(out_dir) / "run.json").exists()
     r = _job("detect", out_dir, lambda: _detect_run(src, cfg, out_dir, wells, workers, progress, source_spec,
                                                       edits, cancel))
+    from .library import decision, remember
+    if fresh and decision(out_dir) is None:            # a folder Detect created: its own label library
+        remember(out_dir, "own")
     from .provenance import record, sha1_obj
     record(out_dir, "detect", config=json.loads(cfg.to_json()), source=source_spec or {}, wells=wells or None,
            n_wells=int(len(r["wells"])), n_edited_wells=len(edits or {}),
@@ -342,7 +346,7 @@ def classify_run(out_dir, cfg: Config | None = None, model=None, workers: int = 
     used = Config(**{k: v for k, v in run.get("config", {}).items() if hasattr(Config(), k)})
     mfile = getattr(r.get("model"), "path", None)            # the file the model actually came from
     if mfile is None and (run.get("model") or {}).get("arm") != "preview":
-        mp = used.model_path()
+        mp = used.model_path(out_dir)
         mfile = str(mp) if (mp is not None and mp.exists()) else None
     n_cl = int(len(cell_labels)) if cell_labels is not None else 0
     record(out_dir, "classify", config=run.get("config", {}), model_file=mfile,
@@ -368,7 +372,7 @@ def _classify_run(out_dir, cfg: Config | None = None, model=None, workers: int =
     _PATH_MAP.update(cfg.path_map or {})
     t0 = time.time()
     if model is None:
-        mp = cfg.model_path()
+        mp = cfg.model_path(out)
         if mp is None or not mp.exists():
             if cfg.model:
                 raise ValueError(f"model {cfg.model} not found")
@@ -500,8 +504,8 @@ def redetect_well(out_dir, plate_id: str, well_id: str, edits: dict | None, cfg:
     if res.calls is not None:
         from .identify import apply_identity, well_calls
         from .learn import ParticleModel
-        if model is None and cfg.model_path() and cfg.model_path().exists():
-            model = ParticleModel.load(cfg.model_path())
+        if model is None and cfg.model_path(out) and cfg.model_path(out).exists():
+            model = ParticleModel.load(cfg.model_path(out))
         if model is None and (run.get("model") or {}).get("arm") == "preview":
             from .preview import PreviewModel
             model = PreviewModel()
@@ -553,6 +557,6 @@ def source_from_spec(spec: dict, cfg: Config):
 def run_all(spec: dict, cfg: Config, out_dir, wells=None, workers=8, progress=None, classify=True):
     src = source_from_spec(spec, cfg)
     r = detect_run(src, cfg, out_dir, wells, workers, progress, spec)
-    if classify and cfg.model_path() and cfg.model_path().exists():
+    if classify and cfg.model_path(out_dir) and cfg.model_path(out_dir).exists():
         r.update(classify_run(out_dir, cfg, workers=workers, progress=progress))
     return r

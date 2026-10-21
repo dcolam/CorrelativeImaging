@@ -219,16 +219,17 @@ class ReconstructionApp:
         from ..pipeline import set_path_map
         set_path_map(cfg.path_map)                     # the run's TIFs are read back through it
         self.model = None
-        if cfg.model and cfg.model_path() and cfg.model_path().exists():
+        rd = self.res.dir if self.res is not None else None
+        if cfg.model and cfg.model_path(rd) and cfg.model_path(rd).exists():
             from ..learn import ParticleModel
             try:
-                self.model = ParticleModel.load(cfg.model_path())
+                self.model = ParticleModel.load(cfg.model_path(rd))
                 self.model_file = cfg.model
             except Exception as e:
                 self.say(f"model not loaded: {e}")
         if not from_form:
             self.panel.settings.set_config(cfg)
-        self.panel.run.set_models(cfg.model)
+        self.panel.run.set_models(cfg.model, rd)
         chans = self.res.channels if self.res else list(self.panel.run.chan_rows) or cfg.channels
         if chans:
             self.panel.run.set_channels(chans, cfg)
@@ -252,6 +253,49 @@ class ReconstructionApp:
         self.panel.train.store_path.setText(str(self.store.path))
         self.refresh()
 
+    def open_library(self):
+        """The label library of the open results folder: its recorded choice; a folder without one whose dataset has
+        labels in the library beside it gets the choice once (keep that shared library, start clean, or copy this
+        dataset's rows into an own library). Libraries outside the folder are probed read-only."""
+        from .. import library as lib
+        r = lib.resolve(self.res.dir, self.res.dataset)
+        if not r["decided"]:
+            choice = self._ask_library(r)
+            if choice == "copy":
+                n = lib.copy_dataset(r["path"], lib.own_path(self.res.dir), self.res.dataset)
+                lib.remember(self.res.dir, "own")
+                self.say(f"copied this run's rows into its own library: {n}")
+                r = dict(path=lib.own_path(self.res.dir), kind="own")
+            elif choice == "clean":
+                lib.remember(self.res.dir, "own")
+                r = dict(path=lib.own_path(self.res.dir), kind="own")
+            else:
+                lib.remember(self.res.dir, "shared", r["path"])
+        elif lib.decision(self.res.dir) is None:
+            lib.remember(self.res.dir, r["kind"], r["path"] if r["kind"] == "shared" else None)
+        self.library_kind = r["kind"]
+        self.set_store(str(r["path"]))
+        self.panel.run.show_start()
+
+    def _ask_library(self, r: dict) -> str:
+        """The one-time choice for an older results folder: "shared" (default), "clean" or "copy"."""
+        from qtpy.QtWidgets import QMessageBox
+        s = r.get("shared") or {}
+        box = QMessageBox(self.panel)
+        box.setWindowTitle("Label library of this results folder")
+        held = (f"could not be read ({s['error']}): it may hold this run's labels" if "error" in s else
+                f"holds for its run: {s.get('labels', 0)} labels, {s.get('test_wells', 0)} test wells, "
+                f"{s.get('edits', 0)} hand edits, {s.get('cells', 0)} judged cells.")
+        box.setText(f"This results folder has no label library of its own. The library beside it\n{r['path']}\n{held}")
+        box.setInformativeText("Keep using it (nothing changes), start clean (no labels, no edits, no test wells), "
+                               "or copy this run's rows into a library inside the results folder.")
+        keep = box.addButton("Keep the shared library", QMessageBox.AcceptRole)
+        clean = box.addButton("Start clean", QMessageBox.DestructiveRole)
+        copy = box.addButton("Copy into this folder", QMessageBox.ActionRole)
+        box.setDefaultButton(keep)
+        box.exec_()
+        return {clean: "clean", copy: "copy"}.get(box.clickedButton(), "shared")
+
     def _last_store(self) -> str:
         from qtpy.QtCore import QSettings
         for app in ("reconstruction", "identity"):          # "identity": the tool's earlier name
@@ -270,22 +314,15 @@ class ReconstructionApp:
             return
         cfg = self.res.config
         arm = (self.res.run.get("model") or {}).get("arm")
-        if arm == "preview":
-            cfg.model = ""                              # classified without a model: never borrow one
-        elif not cfg.model and self.cfg.model and arm is None:
-            cfg.model = self.cfg.model                  # detected only: keep the model chosen for Classify
+        if arm in (None, "preview"):
+            cfg.model = ""                              # detected only / the preview: no model (never borrowed)
         if self.res.run.get("model"):
             self.say(f"classified with model arm '{self.res.run['model'].get('arm')}'")
         if self.res.run.get("warning"):
             self.say("WARNING " + self.res.run["warning"])
-        beside = Path(d).parent / "ci_labels.db"
-        if beside.exists() and (self.store is None or Path(self.store.path) != beside):
-            self.set_store(str(beside))                 # a library next to the results wins (one per project)
-        elif self.store is None:
-            self.set_store(self._last_store() or str(beside))
-        folders = self.panel.train.folders
-        if str(self.res.dir) not in folders.toPlainText():
-            folders.setPlainText((folders.toPlainText().strip() + "\n" + str(self.res.dir)).strip())
+        self.open_library()                             # this results folder's own label library (library.py)
+        # train on this results folder only (add others by hand to train across datasets)
+        self.panel.train.folders.setPlainText(str(self.res.dir))
         self.panel.run.out.setText(str(self.res.dir))
         self.say(f"opened {d}: {len(self.res.wells)} wells, dataset {self.res.dataset}")
         self.set_config(cfg)
@@ -295,8 +332,10 @@ class ReconstructionApp:
             q.set_results(self.res)
         self.panel.train.set_colour_boxes(self.res.run.get("identity_channels") or self.res.channels)
         from ..config import MODELS
+        own = sorted(p.name for p in (self.res.dir / "models").glob("*.joblib"))
         self.panel.train.cmp_models.clear()
-        self.panel.train.cmp_models.addItems(["preview"] + sorted(p.name for p in MODELS.glob("*.joblib")))
+        self.panel.train.cmp_models.addItems(["preview"] + own + sorted(p.name for p in MODELS.glob("*.joblib")
+                                                                         if p.name not in own))
         self.show_test_info()
         self.batch["particle"].update_info()
 
@@ -411,8 +450,11 @@ class ReconstructionApp:
         tw = self.store.test_wells(self.res.dataset)
         self.panel.train.test_info.setText(f"{len(tw)} test wells" if tw else "no test wells yet")
         self.panel.label.setup.btn.setChecked(not tw)      # set up: fold away
+        kind = getattr(self, "library_kind", "")
+        lib = ("own library" if kind == "own" else f"shared library {Path(self.store.path).parent.name}/"
+               f"{Path(self.store.path).name}" if kind == "shared" else "label library")
         self.panel.label.setup.btn.setText(
-            "Setup: label library and test wells" + (f"  ✓ {len(tw)} test wells" if tw else "  (freeze test wells first)"))
+            f"Setup: {lib}" + (f"  ✓ {len(tw)} test wells" if tw else "  (freeze test wells first)"))
 
     def is_blind(self, plate_id=None, well_id=None) -> bool:
         t = self.panel.train
@@ -531,8 +573,7 @@ class ReconstructionApp:
             curve = learning_curve(T, tg, res.model.spec["arm"])
             name = (f"{'_'.join(res.model.spec.get('datasets', ['model']))[:50]}_{res.model.spec['arm']}_"
                     f"n{res.model.spec['n_train']}_{datetime.datetime.now():%Y%m%d_%H%M}.joblib")
-            from ..config import MODELS
-            path = MODELS / name
+            path = Path(out) / "models" / name             # with the results it was trained on
             res.model.save(path)
             model = ParticleModel.load(path)
             from ..provenance import record, sha1_file
@@ -550,7 +591,7 @@ class ReconstructionApp:
             self.trained = res
             self.model, self.model_file = model, name
             self.cfg.model = name
-            self.panel.run.set_models(name)
+            self.panel.run.set_models(name, out)
             self.panel.train.show_result(res)
             txt = ""
             if curve is not None and len(curve) >= 2:
@@ -1127,7 +1168,7 @@ class ReconstructionApp:
                                                 Path(str(self.model_file or "")).name):
             from ..learn import ParticleModel
             try:
-                self.model = ParticleModel.load(cfg.model_path())
+                self.model = ParticleModel.load(cfg.model_path(self.panel.run.out.text().strip() or None))
                 self.model_file = cfg.model
             except Exception as e:
                 self.say(f"model not loaded: {e}")
@@ -1150,8 +1191,25 @@ class ReconstructionApp:
                 self.say("choose an output folder and a run")
                 return
             spec = dict(kind="run", root=root, run_tag=tag)
+            # hand edits come from the TARGET folder's library: a new folder starts clean (no edits of the folder
+            # that happens to be open)
+            from .. import library as L
+            same = self.res is not None and Path(out).resolve() == Path(self.res.dir).resolve()
+            if same:
+                store = self.store
+            else:
+                dec = L.decision(out) if Path(out).exists() else None
+                tgt = Path(dec["path"]) if dec and dec.get("kind") == "shared" and dec.get("path") else L.own_path(out)
+                store = LabelStore(tgt) if tgt.exists() else None
+                lib = str(tgt) if tgt.exists() else None
 
-            store = self.store
+                def cl(store=store):                         # the target's own cell judgements (none if new)
+                    if store is None:
+                        return None
+                    ds = (__import__("json").loads((Path(out) / "run.json").read_text()).get("dataset", "")
+                          if (Path(out) / "run.json").exists() else "")
+                    C, tw = store.cell_frame(ds), store.test_wells(ds)
+                    return C[[(p, w) not in tw for p, w in zip(C.plate_id, C.well_id)]] if len(C) else None
 
             def job():
                 src = source_from_spec(spec, cfg)
@@ -1219,12 +1277,13 @@ class ReconstructionApp:
             model = train(T, tg, arms=[arm], folds=2, final_arm=arm,
                           feature_config=rep.attrs.get("feature_config")).model
         name = f"{'_'.join(model.spec.get('datasets', ['model']))[:60]}_{arm}_{datetime.date.today():%Y%m%d}.joblib"
-        path = MODELS / name
+        rd = self.res.dir if self.res is not None else None
+        path = (Path(rd) / "models" / name) if rd is not None else MODELS / name   # with its results folder
         model.save(path)
         self.model = ParticleModel.load(path)
         self.model_file = name
         self.cfg.model = name
-        self.panel.run.set_models(name)
+        self.panel.run.set_models(name, rd)
         self.panel.settings.show_model_match()
         self.say(f"model saved: {path}")
         if self.res is not None:

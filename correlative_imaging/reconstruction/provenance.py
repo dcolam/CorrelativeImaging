@@ -193,7 +193,7 @@ def commands(out_dir, where: str | None = None) -> tuple[str, dict]:
                 cls += ["--model", _q(mfile)]
             else:
                 from .config import Config
-                mp = Config(model=classify_cfg.get("model", "")).model_path()
+                mp = Config(model=classify_cfg.get("model", "")).model_path(out)
                 cls += ["--model", _q(mp) if mp else "<model file>"]
                 notes.append("the model file was not recorded: the one named in the settings is used")
         if (c or {}).get("n_cell_labels"):

@@ -183,6 +183,22 @@ label in a test well:
 
 Test wells never feed any of this. Only human decisions are stored: Detect's pre-labels and model classes never are.
 
+## A clean slate: labels and model belong to the results folder
+
+- **New folders:** every results folder Detect creates gets its own label library (`ci_labels.db` inside it: labels,
+  test wells, hand edits, judged cells) and no model. Classify then uses the Detect preview until you train on that
+  folder's labels.
+  - Nothing comes along from another folder, not even from an older folder of the same run next to it.
+  - The Run tab says what the chosen folder starts with.
+- **Trained models** are saved inside the results folder (`<results>/models/`) and listed first.
+- **Training:** the training list holds only the open folder. Add others by hand to train across datasets.
+- **Presets** describe the dataset, not a classifier: in the GUI they don't pick a model. The command line still
+  takes a preset's model (`--config romk`).
+- **Older folders** without a library of their own whose run has labels in the library beside them (the earlier
+  layout `<output>/ci_labels.db`) are asked once: keep that shared library (nothing changes), start clean, or copy
+  this run's rows into the folder. The choice is kept in `library.json`; libraries outside the folder are only read
+  for this.
+
 ## Cells per particle and possible clumps
 
 - **One cell:** Detect measures the area of one cell per plate and channel: the peak of the field objects' areas.

@@ -160,7 +160,7 @@ def main(argv=None):
                 name = json.loads((Path(a.out) / "run.json").read_text()).get("config", {}).get("model") or ""
             except (OSError, ValueError):
                 name = ""
-            mp = Config(model=name).model_path() if name else None
+            mp = Config(model=name).model_path(a.out) if name else None
             model = ParticleModel.load(mp) if mp is not None and mp.exists() else None
         import sys
         if hasattr(sys.stdout, "reconfigure"):          # a Windows console cannot print every character

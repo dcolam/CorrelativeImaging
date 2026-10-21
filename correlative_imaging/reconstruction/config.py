@@ -93,11 +93,17 @@ class Config:
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2)
 
-    def model_path(self) -> Path | None:
+    def model_path(self, results_dir=None) -> Path | None:
+        """The model file: an absolute path as is; a name in <results>/models/ (models trained on that results
+        folder) before the shipped models/ folder."""
         if not self.model:
             return None
         p = Path(self.model)
-        return p if p.is_absolute() else MODELS / p
+        if p.is_absolute():
+            return p
+        if results_dir is not None and (Path(results_dir) / "models" / p).exists():
+            return Path(results_dir) / "models" / p
+        return MODELS / p
 
 
 # what a run or model saved before a feature setting existed was made with

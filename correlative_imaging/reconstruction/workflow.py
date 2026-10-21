@@ -183,7 +183,9 @@ def workflow_state(results_dir, store=None, model=None, progress: dict | None = 
             n_test = len(L) - n_train
         C = store.cell_frame(dataset)
         n_cells = len(C)
-        detail = (f"{len(test)} test wells · {n_train} training labels · {n_test} test labels · "
+        own = d is not None and Path(store.path).resolve() == (Path(d) / "ci_labels.db").resolve()
+        detail = (("own library · " if own else f"shared library {Path(store.path).parent.name}/ · ")
+                  + f"{len(test)} test wells · {n_train} training labels · {n_test} test labels · "
                   f"{n_cells} cells judged")
         facts = dict(n_train=n_train, n_test=n_test, n_cells=n_cells, n_test_wells=len(test))
         if not test:

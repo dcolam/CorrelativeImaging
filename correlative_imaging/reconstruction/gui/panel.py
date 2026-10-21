@@ -124,7 +124,13 @@ class RunTab(QWidget):
         self.preset.currentTextChanged.connect(self.load_preset)
         f.addRow("preset", self.preset)
         self.out = QLineEdit()
+        self.out.textChanged.connect(lambda *_: self.show_start())
         f.addRow("results folder", path_row(self.out, self.browse_out))
+        self.start = QLabel("")
+        self.start.setWordWrap(True)
+        self.start.setTextFormat(Qt.RichText)
+        self.start.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        f.addRow("starts with", self.start)
         self.wells = QLineEdit()
         self.wells.setPlaceholderText("optional: 18T39412_N11 18T39383_M13 …")
         f.addRow("wells", self.wells)
@@ -183,6 +189,38 @@ class RunTab(QWidget):
         scroll.setWidget(body)
         outer.addWidget(scroll)
 
+    def show_start(self):
+        """What the chosen results folder starts with: a new one is a clean slate (its own label library, no labels,
+        no hand edits, no model); an existing one names its library and model."""
+        import json
+        from .. import library as L
+        out = self.out.text().strip()
+        if not out:
+            self.start.setText("")
+            return
+        d = Path(out)
+        if not (d / "run.json").exists():
+            self.start.setText("<b>a clean slate</b>: a new results folder gets its own label library (no labels, no "
+                               "hand edits, no test wells) and no model (Classify uses the Detect preview until you "
+                               "train one on its labels)")
+            return
+        try:
+            run = json.loads((d / "run.json").read_text())
+        except (OSError, ValueError):
+            run = {}
+        r = L.resolve(d, run.get("dataset", ""))
+        info = L.probe(r["path"], run.get("dataset", ""))
+        lib = (f"{'own' if r['kind'] == 'own' else 'shared'} library {r['path'].name}"
+               + ("" if r["kind"] == "own" else f" in {r['path'].parent}")
+               + (f" ({info.get('labels', 0)} labels, {info.get('test_wells', 0)} test wells, "
+                  f"{info.get('edits', 0)} hand edits)" if info else " (empty)")
+               + ("" if r["decided"] else " — you choose once when opening it"))
+        arm = (run.get("model") or {}).get("arm")
+        mname = (run.get("config") or {}).get("model") or ""
+        model = ("no model (the Detect preview)" if arm in (None, "preview") or not mname else
+                 f"model {mname}" + (" (trained on this folder)" if (d / "models" / mname).exists() else ""))
+        self.start.setText(f"existing results: {lib}; {model}")
+
     def browse_root(self):
         d = QFileDialog.getExistingDirectory(self, "CorrelativeImaging output folder", self.root.text())
         if d:
@@ -238,10 +276,12 @@ class RunTab(QWidget):
                        for ch, (u, n, c, r) in self.chan_rows.items()}
         return cfg
 
-    def set_models(self, current: str):
+    def set_models(self, current: str, results_dir=None):
+        """"" = no model (Classify uses the Detect preview); models trained on this results folder first."""
+        own = sorted(p.name for p in (Path(results_dir) / "models").glob("*.joblib")) if results_dir else []
         self.model.blockSignals(True)
         self.model.clear()
-        self.model.addItems([""] + sorted(p.name for p in MODELS.glob("*.joblib")))
+        self.model.addItems([""] + own + sorted(p.name for p in MODELS.glob("*.joblib") if p.name not in own))
         self.model.setCurrentText(current or "")
         self.model.blockSignals(False)
 
@@ -310,7 +350,9 @@ class RunTab(QWidget):
 
     def load_preset(self, name):
         cfg = Config() if name == "(neutral)" else load_config(name)
-        cfg.model = cfg.model or self.app.cfg.model
+        # a preset describes the dataset, not a classifier: the model stays the open results folder's (none for a new
+        # one). The command line still uses a preset's model (--config romk)
+        cfg.model = self.app.cfg.model if self.app.res is not None else ""
         cfg.path_map = self.app.cfg.path_map
         self.app.set_config(cfg)
 
@@ -583,8 +625,8 @@ class TrainTab(QWidget):
         h = QHBoxLayout()
         h.addWidget(QLabel("label library"))
         self.store_path = QLineEdit()
-        self.store_path.setToolTip("one SQLite file per project; a ci_labels.db next to the results folder is opened "
-                                   "automatically")
+        self.store_path.setToolTip("each results folder has its own library (ci_labels.db inside it; older folders "
+                                   "may keep a shared one beside them). Choose another file here only on purpose")
         self.store_path.editingFinished.connect(lambda: app.set_store(self.store_path.text()))
         h.addWidget(path_row(self.store_path, self.browse_store), 1)
         v.addLayout(h)
