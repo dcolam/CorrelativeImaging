@@ -86,6 +86,9 @@ class PlateGrid(QWidget):
         self.current = None
         self.btns, self.recs = {}, {}
         self._all = []
+        self._fit_timer = QTimer(self)                     # dies with the widget (unlike QTimer.singleShot)
+        self._fit_timer.setSingleShot(True)
+        self._fit_timer.timeout.connect(self._fit)
 
     # -- data
     def set(self, df: pd.DataFrame, stage: str = "", labels: dict | None = None):
@@ -212,5 +215,5 @@ class PlateGrid(QWidget):
                 b.clicked.connect(lambda _=False, w=well: self.well_clicked.emit(pl, w))
                 b.double.connect(lambda w=well: self.well_double_clicked.emit(pl, w))
                 self.grid.addWidget(b, i + 1, j + 1)
-        QTimer.singleShot(0, self._fit)                    # once the panel has its width
+        self._fit_timer.start(0)                           # once the panel has its width
         self.legend.setText(self.legend_fn(self.mode.currentText(), d))

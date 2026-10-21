@@ -218,7 +218,8 @@ def test_stack_depth_label_never_rewrites_the_range(qapp):
     shallower sample must not silently shrink a range the user typed."""
     from correlative_imaging.viewer.gui import CorrelativeImagingWidget
 
-    ch = CorrelativeImagingWidget()._channels_tab
+    w = CorrelativeImagingWidget()               # kept: its tabs live only as long as it does
+    ch = w._channels_tab
     ch.set_stack_depth(21)
     assert ch._zdepth_lbl.text() == "of 21"
 

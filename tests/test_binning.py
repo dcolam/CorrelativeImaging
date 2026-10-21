@@ -260,7 +260,8 @@ def test_loading_another_sample_keeps_channel_settings(qapp):
     panel, silently discarding all configuration."""
     from correlative_imaging.viewer.gui import CorrelativeImagingWidget
 
-    ch = CorrelativeImagingWidget()._channels_tab
+    w = CorrelativeImagingWidget()               # kept: its tabs live only as long as it does
+    ch = w._channels_tab
     ch.set_channels(["DAPI", "GFP", "mCherry"])
     p0 = ch.get_panels()[0]
     p0._blur_sigma.setValue(7.5)
@@ -279,7 +280,8 @@ def test_loading_another_sample_keeps_channel_settings(qapp):
 def test_all_colocalization_pairs_are_ordered_and_deduped(qapp):
     from correlative_imaging.viewer.gui import CorrelativeImagingWidget
 
-    c = CorrelativeImagingWidget()._combine_tab
+    w = CorrelativeImagingWidget()
+    c = w._combine_tab
     c.set_channels(["a", "b", "c"])
     c._add_all_pairs()
     steps = c.get_coloc_steps("")

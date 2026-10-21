@@ -92,6 +92,10 @@ class CIControlView(QWidget):
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.timeout.connect(self.refresh)
+        self._pending_auto = []
+        self._auto_timer = QTimer(self)
+        self._auto_timer.setSingleShot(True)
+        self._auto_timer.timeout.connect(self._auto_pending)
         viewer.layers.events.inserted.connect(self._layer_added)
         grid = plate_tab._grid
         grid.changed.connect(lambda: self._timer.start(0))
@@ -100,9 +104,20 @@ class CIControlView(QWidget):
 
     # -- channels
     def _layer_added(self, e):
+        try:
+            on = self.auto_cb.isChecked()
+        except RuntimeError:                                   # this view is gone: stop listening
+            self.v.layers.events.inserted.disconnect(self._layer_added)
+            return
         L = e.value
-        if self.auto_cb.isChecked() and is_channel_layer(L):
-            QTimer.singleShot(0, lambda L=L: self._auto(L))     # once the layer is set up
+        if on and is_channel_layer(L):
+            self._pending_auto.append(L)                       # once the layer is set up
+            self._auto_timer.start(0)
+
+    def _auto_pending(self):
+        todo, self._pending_auto = self._pending_auto, []
+        for L in todo:
+            self._auto(L)
 
     def _auto(self, L):
         if L not in self.v.layers:

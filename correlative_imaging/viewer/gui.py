@@ -5072,6 +5072,8 @@ def _run_of_dbs(db_paths: str):
 
 
 class RunTab(QWidget):
+    run_state_changed = Signal()     # a run started or ended (the workflow strip follows)
+
     def __init__(self, get_setup, get_pipeline_dict, get_bf_config=None,
                  make_well_pipeline_dict_fn=None, napari_viewer=None,
                  get_channel_colors=None, get_roi_selections=None, parent=None):
@@ -5974,6 +5976,7 @@ class RunTab(QWidget):
             self._dashboard_dialog.reset()
             self._worker.dashboard_ready.connect(self._dashboard_dialog.add_dashboard)
         self._worker.start()
+        self.run_state_changed.emit()
 
     def _on_parallel_toggled(self, checked: bool) -> None:
         self._worker_spin.setEnabled(checked)
@@ -6015,6 +6018,7 @@ class RunTab(QWidget):
         self._log(f"Done ✓   Results → {db_path}" if db_path else "Finished (with errors).")
         self._prog_lbl.setText("Finished." if db_path else "Finished (with errors).")
         self._current_log_path = None
+        self.run_state_changed.emit()
         run = _run_of_dbs(db_path)
         if run:
             self._last_run = run
@@ -6124,7 +6128,10 @@ class CorrelativeImagingWidget(QWidget):
         self._plate_tab.existing_rois_detected.connect(self._on_existing_rois_detected)
         self._plate_tab.load_pipeline_requested.connect(self._on_load_pipeline_json)
         self._plate_tab.scan_finished.connect(self._on_scan_finished)
+        self._plate_tab.scan_finished.connect(lambda: self.update_workflow())
+        self._run_tab.run_state_changed.connect(lambda: self.update_workflow())
         self._pending_json = None
+        self._channels_source = ""
         self._advanced_tab._get_guided_pipeline = self.build_pipeline_dict
         self._advanced_tab._get_setup = lambda: self._plate_tab
         self._advanced_tab._make_well_pipeline_dict_fn = self.make_well_pipeline_dict_fn
@@ -6155,6 +6162,22 @@ class CorrelativeImagingWidget(QWidget):
         self._view_worker = None
 
         root = QVBoxLayout(self)
+        # Workflow strip (gui_common.workflow_strip; states from viewer/workflow.py)
+        self._strip = None
+        try:
+            from correlative_imaging.gui_common.workflow_strip import WorkflowStrip
+            from correlative_imaging.reconstruction.gui.theme import stylesheet, theme
+            from correlative_imaging.viewer.workflow import ACTIONS, STEPS, TITLES, next_step
+            t = theme(napari_viewer) if napari_viewer is not None else {}
+            self._strip = WorkflowStrip({k: TITLES[k] for k in STEPS}, ACTIONS, next_step, self._show_step,
+                                        self._do_step, t, busy_fn=lambda: bool(
+                                            getattr(self._run_tab, "_worker", None) is not None
+                                            and self._run_tab._worker.isRunning()), last="results")
+            if t:
+                self._strip.setStyleSheet(stylesheet(t))
+            root.addWidget(self._strip)
+        except Exception:
+            log.warning("workflow strip not added", exc_info=True)
         root.addWidget(self._tabs)
         self.setMinimumWidth(420)
 
@@ -6168,8 +6191,15 @@ class CorrelativeImagingWidget(QWidget):
                 from correlative_imaging.viewer.control_view import CIControlView
                 self._control_view = CIControlView(napari_viewer, self._plate_tab, main=self)
                 add_control_view(napari_viewer, self._control_view)
-            except Exception:
+            except Exception as exc:                 # say why (a missing file, …) instead of failing later
                 log.warning("Control view not added", exc_info=True)
+                self._control_view = None
+                try:
+                    from napari.utils.notifications import show_warning
+                    show_warning(f"Control view not added: {type(exc).__name__}: {exc}")
+                except Exception:
+                    pass
+        self.update_workflow()
 
     # ── napari colormap → Channels tab colour ────────────────────────
 
@@ -6353,12 +6383,15 @@ class CorrelativeImagingWidget(QWidget):
         self._tabs.setCurrentWidget(self._channels_tab)
         pending, self._pending_json = self._pending_json, None
         auto, self._auto_well = getattr(self, "_auto_well", None), None
+        sel = self._plate_tab.get_selected_well()
+        self._channels_source = f"well {sel.well_id}" if sel is not None else "a sample image"
         if pending is not None:                       # after a scan: the project's pipeline on top of the sample
             self._plate_tab._load_json_path(pending)
             self._notify(f"Loaded pipeline {pending.parent.name}/{pending.name} (found in the project), "
                          f"channels from well {auto}")
         elif auto is not None:
             self._notify(f"Channels taken from well {auto} (drawn at random; no pipeline JSON in the project)")
+        self.update_workflow()
 
     def _notify(self, msg: str) -> None:
         """A short message: the Setup tab's status line, and a napari notification."""
@@ -6424,6 +6457,67 @@ class CorrelativeImagingWidget(QWidget):
             self._plate_tab.refresh_json_dropdown(self._plate_tab.input_dir,
                                                   self._plate_tab.output_dir,
                                                   rescan_input=False)
+        self.update_workflow()
+
+    # ── Workflow strip ────────────────────────────────────────────────
+
+    def _workflow_snapshot(self) -> dict:
+        """What the session holds (viewer/workflow.py reads the run outputs from disk itself)."""
+        pt = self._plate_tab
+        wells = [w for e in (getattr(pt, "_plates", None) or {}).values() for w in e.wells.values()]
+        panels = self._channels_tab.get_panels()
+        sels = self._roi_tab.get_selections()
+        needs_bf = any(s.source == "well_class" for s in sels)
+        classes = [c["name"] for c in (self._bf_tab.get_config().get("classes") or [])] if needs_bf else []
+        n_roi_ok = sum(1 for w in wells if w.is_complete and all(_find_well_roi(w, c) is not None for c in classes))
+        try:
+            pipeline_now = self.build_pipeline_dict() if panels else None
+        except Exception:
+            pipeline_now = None
+        worker = getattr(self._run_tab, "_worker", None)
+        return dict(
+            input_dir=pt._folder_edit.text().strip(), output_dir=str(pt.base_output_dir),
+            n_plates=len(getattr(pt, "_plates", None) or {}), n_wells=len(wells),
+            n_complete=sum(1 for w in wells if w.is_complete),
+            channels=[p.display_name for p in panels], channel_source=getattr(self, "_channels_source", ""),
+            selections=[(s.label, s.source) for s in sels], needs_bf=needs_bf, n_roi_ok=n_roi_ok,
+            pipeline_now=pipeline_now, running=bool(worker is not None and worker.isRunning()))
+
+    def update_workflow(self) -> None:
+        if getattr(self, "_strip", None) is None:
+            return
+        from correlative_imaging.viewer.workflow import ci_workflow_state
+        try:
+            self._strip.set_state(ci_workflow_state(self._workflow_snapshot()))
+        except Exception:                                  # the strip never breaks the GUI
+            log.warning("workflow status not read", exc_info=True)
+
+    def _show_step(self, key: str) -> None:
+        page = {"scan": self._plate_tab.setup_page, "channels": self._channels_tab.channels_page,
+                "hole": self._bf_tab, "selections": self._roi_tab, "run": self._run_tab,
+                "results": self._run_tab}[key]
+        self._tabs.setCurrentWidget(page)
+
+    def _do_step(self, key: str) -> None:
+        self._show_step(key)
+        if key == "scan":
+            self._plate_tab._scan()
+        elif key == "channels" and not self._channels_tab.get_panels():
+            self._on_scan_finished()                       # a sample well (and the project's pipeline JSON)
+        elif key == "results":
+            f = (self._strip.S or {}).get("results")
+            facts = getattr(f, "facts", {}) or {}
+            if facts.get("tag"):
+                self._run_tab._open_reconstruction(facts["base"], facts["tag"])
+
+    def restyle(self) -> None:
+        """After a theme change: the strip's colours follow."""
+        if getattr(self, "_strip", None) is None:
+            return
+        from correlative_imaging.reconstruction.gui.theme import stylesheet, theme
+        t = theme(self._viewer)
+        self._strip.setStyleSheet(stylesheet(t))
+        self._strip.set_colors(t.get("text", "#f0f1f2"), t.get("current", "#4a90d9"))
 
     def _on_load_pipeline_json(self, pl_dict: dict) -> None:
         """Apply a loaded pipeline JSON to Channels, ROI & Selections,
@@ -6466,6 +6560,9 @@ class CorrelativeImagingWidget(QWidget):
             self._bf_tab.set_config(bf_cfg)
             loaded_bf = True
 
+        src = getattr(self._plate_tab, "last_json_path", None)
+        self._channels_source = f"pipeline {src.name}" if src is not None else "a pipeline JSON"
+        self.update_workflow()
         msg = f"Loaded pipeline '{pl_dict.get('name', 'pipeline')}' into Channels, ROI & Selections, Colocalization"
         msg += ", BF Pipeline." if loaded_bf else ". (No BF-pipeline config in this JSON.)"
         if warnings:
@@ -6714,9 +6811,12 @@ def launch_gui() -> None:
     viewer = napari.Viewer(title="Correlative Imaging")
     try:
         themes.apply(viewer, "ci_gui")                       # this window only (Theme menu: change, customise)
-        themes.add_menu(viewer, "ci_gui")
     except Exception:
         log.warning("theme not applied", exc_info=True)
     widget = CorrelativeImagingWidget(napari_viewer=viewer)
     viewer.window.add_dock_widget(widget, name="Correlative Imaging", area="right")
+    try:
+        themes.add_menu(viewer, "ci_gui", on_change=widget.restyle)
+    except Exception:
+        log.warning("Theme menu not added", exc_info=True)
     napari.run()

@@ -164,10 +164,7 @@ class ReconstructionApp:
         t = theme(self.v)
         for w in (self.host, self.browser, self.channels):
             w.setStyleSheet(stylesheet(t))
-        from qtpy.QtGui import QColor
-        for tile in self.strip.tiles.values():
-            tile.fg, tile.acc = QColor(t.get("text", "#f0f1f2")), QColor(t.get("current", "#4a90d9"))
-            tile.update()
+        self.strip.set_colors(t.get("text", "#f0f1f2"), t.get("current", "#4a90d9"))
 
     def set_channel_color(self, ch: str, hexc: str):
         """A channel's display colour (right-click in the histogram): image, particle fill, switches, Run tab."""

@@ -544,10 +544,23 @@ class ChannelHistogram(QWidget):
         self._samples = {}        # key -> (id(data), sample)
         self._hooks = []          # (emitter, callback) to disconnect
         self._lock = False
+        # deferred work runs on timers owned by this widget: they die with it (a bare QTimer.singleShot would fire on
+        # a deleted widget)
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.timeout.connect(self.rebuild)
-        self._hover_cb = lambda viewer, event: self._hovered()
+        self._redraw_timer = QTimer(self)
+        self._redraw_timer.setSingleShot(True)
+        self._redraw_timer.timeout.connect(self._redraw)
+        self._pick_timer = QTimer(self)
+        self._pick_timer.setSingleShot(True)
+        self._pick_timer.timeout.connect(lambda: self.picked_changed.emit(self.cur))
+        def hover(viewer, event):
+            try:
+                self._hovered()
+            except RuntimeError:                              # this widget is gone
+                self._detach()
+        self._hover_cb = hover
         try:
             viewer.mouse_move_callbacks.append(self._hover_cb)
         except Exception:
@@ -563,7 +576,24 @@ class ChannelHistogram(QWidget):
 
     # -- layer bookkeeping
     def _later(self, *_):
-        self._timer.start(0)
+        try:
+            self._timer.start(0)
+        except RuntimeError:                                  # this widget is gone: stop listening to the viewer
+            self._detach()
+
+    def _detach(self):
+        for ev in ("inserted", "removed", "moved", "reordered"):
+            em = getattr(self.v.layers.events, ev, None)
+            if em is not None:
+                try:
+                    em.disconnect(self._later)
+                except Exception:
+                    pass
+        try:
+            self.v.mouse_move_callbacks.remove(self._hover_cb)
+        except Exception:
+            pass
+        self._unhook()
 
     def _unhook(self):
         for em, cb in self._hooks:
@@ -612,7 +642,7 @@ class ChannelHistogram(QWidget):
             shown = [k for k, L in entries if L.visible]
             coloured = [k for k in shown if not _grey(self.color_fn(k, self._layer_of(entries, k)))]
             self.cur = (coloured or shown or keys or [None])[0]
-            QTimer.singleShot(0, lambda: self.picked_changed.emit(self.cur))
+            self._pick_timer.start(0)
         self.btn_box.setMinimumHeight(self.flow.heightForWidth(max(self.btn_box.width(), 200)))
         self._redraw()
 
@@ -659,7 +689,7 @@ class ChannelHistogram(QWidget):
         self._later_redraw()
 
     def _later_redraw(self):
-        QTimer.singleShot(0, self._redraw)
+        self._redraw_timer.start(0)
 
     def _style_changed(self, k):
         L = self._layer(k)

@@ -1,9 +1,12 @@
-"""Threshold preview (ci gui, Control view): what the pipeline's threshold does to the picked channel of the image on
-screen, with that channel's own settings from the Channels tab.
+"""Threshold preview (ci gui, Control view): what a threshold does to the picked channel of the image on screen.
 
-For the channel picked in the histogram it runs, on that channel alone, exactly the steps the pipeline runs before
-its threshold: binning and Z-projection (Preprocessing tab), the channel's preprocessing in its order, then
-AutoThreshold with its method, Z-projection and minimum object size. Shown:
+Two modes:
+  quick (default)    the raw channel thresholded directly with the method picked in the dropdown ("Channels tab" = the
+                     channel's own method there), with the channel's Z-projection and minimum object size. Fast.
+  preprocess first   exactly the steps the pipeline runs before its threshold, on that channel alone: binning and
+                     Z-projection (Preprocessing tab), the channel's preprocessing in its order, then AutoThreshold.
+                     Slower (e.g. background subtraction), but the threshold the run will use.
+Shown:
 
   objects    the thresholded objects as outlines in the channel's colour (layer "threshold preview: <ch>")
   image      when preprocessing changes the values, the preprocessed image the threshold was computed on (layer
@@ -66,6 +69,23 @@ class ThresholdPreview(QWidget):
                            "on the image on screen: objects as outlines, the threshold as a line in the histogram")
         self.on.toggled.connect(self._toggled)
         v.addWidget(self.on)
+        from qtpy.QtWidgets import QHBoxLayout
+        from correlative_imaging.pipeline.segment import _THRESHOLD_METHODS
+        row = QHBoxLayout()
+        row.addWidget(QLabel("method"))
+        self.method = QComboBox()
+        self.method.addItem("Channels tab", "")
+        for m in _THRESHOLD_METHODS:
+            self.method.addItem(m, m)
+        self.method.setToolTip("the threshold method; \"Channels tab\" = the channel's own method there")
+        self.method.currentIndexChanged.connect(lambda *_: self.schedule())
+        row.addWidget(self.method, 1)
+        self.pre = QCheckBox("preprocess first")
+        self.pre.setToolTip("off: the raw channel, thresholded directly (fast). On: binning, Z-projection and the "
+                            "channel's preprocessing first, exactly as the pipeline (slower)")
+        self.pre.toggled.connect(lambda *_: self.schedule())
+        row.addWidget(self.pre)
+        v.addLayout(row)
         self.info = QLabel("")
         self.info.setWordWrap(True)
         self.info.setStyleSheet("font-size: 9pt;")
@@ -93,6 +113,11 @@ class ThresholdPreview(QWidget):
 
     def _layers_changed(self, e):
         name = str(getattr(e.value, "name", ""))
+        try:
+            self.on.isChecked()
+        except RuntimeError:                                   # this view is gone: stop listening
+            self.v.layers.events.inserted.disconnect(self._layers_changed)
+            return
         if self.on.isChecked() and not name.startswith(PREFIX) and not name.endswith(PRE_SUFFIX):
             self.schedule()                                   # another image on screen
 
@@ -147,9 +172,14 @@ class ThresholdPreview(QWidget):
         if idx >= len(panels):
             return None, False
         p = panels[idx]
+        seg = dict(p.get_segment_steps()[0])                  # AutoThreshold (a watershed split does not move it)
+        self.method.setItemText(0, f"Channels tab ({seg.get('method', '')})")
+        if self.method.currentData():
+            seg["method"] = self.method.currentData()
+        if not self.pre.isChecked():                          # quick: the raw channel, thresholded directly
+            return [seg], False
         pre = [s for s in (tab.get_binning_step(), tab.get_zprojection_step()) if s]
         own = p.get_preprocess_steps()
-        seg = p.get_segment_steps()[0]                        # AutoThreshold (a watershed split does not move it)
         return pre + own + [seg], bool(own or any(s.get("type") == "Binning" for s in pre))
 
     # -- run
@@ -222,8 +252,10 @@ class ThresholdPreview(QWidget):
         self.hist.set_markers(target_key, [(t, f"{method} {t:.4g}")])
         above = float((plane > t).mean() * 100) if np.isfinite(t) else float("nan")
         self.info.setText(f"<b>{ch}</b>: {method} threshold <b>{t:.4g}</b> · {above:.1f} % of pixels above · "
-                          f"<b>{n}</b> objects (min. size applied)" +
-                          (" · on the preprocessed image" if changes_values else ""))
+                          f"<b>{n}</b> objects (min. size applied) · " +
+                          ("on the preprocessed image" if changes_values else
+                           "preprocessed first (it does not change the values)" if self.pre.isChecked() else
+                           "raw channel, no preprocessing"))
 
     # -- layers
     def _layer(self, name, kind):
