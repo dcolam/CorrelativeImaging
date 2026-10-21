@@ -198,6 +198,7 @@ class NapariViewer:
                 opacity=0.4,
                 scale=scale,
                 contrast_limits=auto_contrast_limits(data),
+                metadata={"mask": True},
             )
 
     def show_measurements(

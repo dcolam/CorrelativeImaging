@@ -27,6 +27,8 @@ import numpy as np
 import pandas as pd
 from skimage.measure import find_contours
 
+from ...gui_common.contrast import contrast_rule  # noqa: F401  (the shared rule)
+
 from .theme import CLASS_COLORS, call_color
 
 SHORT = {"cell": "C", "neighbour": "N", "merged": "M", "debris": "D", "noise": "·", "plug": "P"}
@@ -64,10 +66,6 @@ def _set_points(layer, pts: np.ndarray, features: pd.DataFrame):
     layer.refresh_text()
 
 
-def contrast_rule(a: np.ndarray, min_span: float = 100.0) -> tuple:
-    """(minimum, max(99.9th percentile, minimum + min_span))."""
-    lo = float(np.nanmin(a))
-    return lo, max(float(np.nanpercentile(a, 99.9)), lo + min_span)
 
 
 def _colormap(hex_color: str, name: str):

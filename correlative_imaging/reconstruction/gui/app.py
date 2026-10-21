@@ -141,24 +141,9 @@ class ReconstructionApp:
         self.panel.results.set_well_list(self.browser.list_widget)
         self.panel.label.add_map(self.browser.pca)
         self.channels.setStyleSheet(stylesheet(t))
-        cdw = viewer.window.add_dock_widget(self.channels, area="left", name="Control view")
+        from ...gui_common.docks import add_control_view
+        add_control_view(viewer, self.channels, right_dock=rdw)
         self.display.on_well.append(self.channels.refresh)
-        try:                                   # one tabbed column on the left: Control view first
-            mw, qv = viewer.window._qt_window, viewer.window._qt_viewer
-            for d, title in ((qv.dockLayerList, "Layers"), (qv.dockLayerControls, "Layer controls")):
-                d.setWindowTitle(title)
-                if hasattr(d, "title") and hasattr(d.title, "title_label"):
-                    d.title.title_label.setText(title)
-                mw.tabifyDockWidget(cdw, d)
-
-            def _settle():                     # after Qt has laid the docks out: Control view on top, sane widths
-                cdw.raise_()
-                mw.resizeDocks([cdw, rdw], [340, 600], Qt.Horizontal)
-            from qtpy.QtCore import QTimer as _T
-            _T.singleShot(0, _settle)
-            _T.singleShot(300, _settle)
-        except Exception:
-            pass
         viewer.mouse_drag_callbacks.append(self._on_click)
         for c in CLASSES:
             viewer.bind_key(CLASS_KEYS[c], lambda v, c=c: self.set_label(c), overwrite=True)
@@ -173,6 +158,16 @@ class ReconstructionApp:
         viewer.text_overlay.position = "top_left"
         viewer.text_overlay.font_size = 11
         self.panel.settings.set_config(self.cfg)
+
+    def restyle(self):
+        """After a theme change: the tool's own style rules and the strip's colours follow napari's theme."""
+        t = theme(self.v)
+        for w in (self.host, self.browser, self.channels):
+            w.setStyleSheet(stylesheet(t))
+        from qtpy.QtGui import QColor
+        for tile in self.strip.tiles.values():
+            tile.fg, tile.acc = QColor(t.get("text", "#f0f1f2")), QColor(t.get("current", "#4a90d9"))
+            tile.update()
 
     # -- messages
     def say(self, msg: str):
@@ -1221,8 +1216,17 @@ class ReconstructionApp:
 
 def launch(results: str | None = None, viewer=None, run: bool = True):
     import napari
+    from ...gui_common import themes
     v = viewer or napari.Viewer(title="Cell reconstruction")
+    try:
+        themes.apply(v, "ci_reconstruct")                    # this window only (Theme menu: change, customise)
+    except Exception:
+        pass
     app = ReconstructionApp(v)
+    try:
+        themes.add_menu(v, "ci_reconstruct", on_change=app.restyle)
+    except Exception:
+        pass
     v.window._ci_reconstruction = app            # keep a reference
     if results:
         app.open_results(results)

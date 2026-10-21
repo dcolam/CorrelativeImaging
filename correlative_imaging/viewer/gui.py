@@ -729,6 +729,7 @@ class _PlateGrid(QWidget):
     """16×24 clickable well grid."""
 
     well_clicked = Signal(str)   # emits well_id
+    changed = Signal()           # well statuses / ROI badges changed (the quick plate view follows)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -783,6 +784,7 @@ class _PlateGrid(QWidget):
             self._has_roi[well_id] = has_roi
             if well_id != self._selected:
                 self._btns[well_id].set_status(status, has_roi)
+            self.changed.emit()
 
     def clear_all(self) -> None:
         self._selected = None
@@ -790,6 +792,7 @@ class _PlateGrid(QWidget):
         self._has_roi.clear()
         for btn in self._btns.values():
             btn.set_status("empty")
+        self.changed.emit()
 
 
 # Where user-written naming schemes are kept, so they survive across sessions
@@ -5404,19 +5407,21 @@ class RunTab(QWidget):
                 layer.gamma = gamma
 
     def _on_auto_contrast(self) -> None:
-        """Reset every visible Image layer to a percentile-stretched
-        contrast range and reflect the (first layer's) values in the spinboxes.
+        """Reset every channel layer to the shared contrast rule (minimum ->
+        99.9th percentile, at least minimum + 100; gui_common.contrast, as in
+        Cell reconstruction) and reflect the first layer's values in the
+        spinboxes. Mask layers keep their own range.
         """
         if self._viewer is None:
             return
-        from napari.layers import Image
-        from correlative_imaging.viewer.napari_viewer import auto_contrast_limits
+        from correlative_imaging.gui_common.contrast import contrast_rule
+        from correlative_imaging.gui_common.histogram import is_channel_layer, sample, set_limits
 
         first = True
         for layer in self._viewer.layers:
-            if isinstance(layer, Image):
-                lo, hi = auto_contrast_limits(layer.data)
-                layer.contrast_limits = (lo, hi)
+            if is_channel_layer(layer):              # the shared rule; masks keep their own range
+                lo, hi = contrast_rule(sample(layer))
+                set_limits(layer, lo, hi)
                 if first:
                     self._contrast_min.setValue(lo)
                     self._contrast_max.setValue(hi)
@@ -5641,7 +5646,7 @@ class RunTab(QWidget):
                         self._viewer.add_image(
                             mask_f, name=f"{step_name}/{mk}",
                             colormap=cmap, blending="additive", opacity=0.4, scale=scale,
-                            contrast_limits=auto_contrast_limits(mask_f),
+                            contrast_limits=auto_contrast_limits(mask_f), metadata={"mask": True},
                         )
                 thr = result.info.get("threshold_value")
                 blk = result.info.get("black_level")
@@ -6113,6 +6118,17 @@ class CorrelativeImagingWidget(QWidget):
 
         self._watch_layer_colormaps()
 
+        # Control view (left, tabbed with napari's Layers / Layer controls): quick plate + channel histogram
+        self._control_view = None
+        if napari_viewer is not None and hasattr(napari_viewer, "window"):
+            try:
+                from correlative_imaging.gui_common.docks import add_control_view
+                from correlative_imaging.viewer.control_view import CIControlView
+                self._control_view = CIControlView(napari_viewer, self._plate_tab)
+                add_control_view(napari_viewer, self._control_view)
+            except Exception:
+                log.warning("Control view not added", exc_info=True)
+
     # ── napari colormap → Channels tab colour ────────────────────────
 
     def _watch_layer_colormaps(self) -> None:
@@ -6575,7 +6591,13 @@ def _set_widget(w: QWidget, wtype: str, value) -> None:
 
 def launch_gui() -> None:
     import napari
+    from correlative_imaging.gui_common import themes
     viewer = napari.Viewer(title="Correlative Imaging")
+    try:
+        themes.apply(viewer, "ci_gui")                       # this window only (Theme menu: change, customise)
+        themes.add_menu(viewer, "ci_gui")
+    except Exception:
+        log.warning("theme not applied", exc_info=True)
     widget = CorrelativeImagingWidget(napari_viewer=viewer)
     viewer.window.add_dock_widget(widget, name="Correlative Imaging", area="right")
     napari.run()
