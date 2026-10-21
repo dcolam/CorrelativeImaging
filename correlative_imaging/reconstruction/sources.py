@@ -300,6 +300,7 @@ class RunSource:
                 notes.append(f"{ch}: whole-image threshold computed (triangle){'' if on_frame else ' on the crop'}")
             if t_h is None or not np.isfinite(t_h):
                 t_h = _triangle(fluo[k][hole_f])
+                notes.append(f"{ch}: hole threshold computed (triangle)")
             thr[("whole", ch)], thr[("hole", ch)] = float(t_w), float(t_h)
             b = r.bg.get(ch)
             if b is None or not np.isfinite(b[0]):

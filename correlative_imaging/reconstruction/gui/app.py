@@ -533,9 +533,14 @@ class ReconstructionApp:
             path = MODELS / name
             res.model.save(path)
             model = ParticleModel.load(path)
+            from ..provenance import record, sha1_file
+            record(out, "train", model_file=str(path), model_sha1=sha1_file(path), arm=res.model.spec["arm"],
+                   n_train=res.model.spec.get("n_train"), labels=str(store.path), results=folders,
+                   labels_sha1=res.model.spec.get("labels_sha1"))
             cfg.model = name
             prog("classifying with the new model…")
-            classify_run(out, cfg, model, progress=lambda i, n, m="": None, cell_labels=self.train_cell_labels())
+            classify_run(out, cfg, model, progress=lambda i, n, m="": None, cell_labels=self.train_cell_labels(),
+                         labels_path=str(store.path))
             return res, curve, model, name
 
         def done(r):
@@ -1134,6 +1139,7 @@ class ReconstructionApp:
         wells = self.panel.run.wells.text().split() or None
         prog = lambda i, n, m="": self.bus.progress.emit(i, n, m)
         cl = self.train_cell_labels
+        lib = str(self.store.path) if self.store is not None else None
         if stage in ("detect", "all"):
             root, tag = self.panel.run.root.text().strip(), self.panel.run.run.currentText()
             if not root or not tag:
@@ -1146,13 +1152,13 @@ class ReconstructionApp:
             def job():
                 src = source_from_spec(spec, cfg)
                 edits = store.edits(getattr(src, "dataset", "")) if store is not None else None
-                detect_run(src, cfg, out, wells, progress=prog, source_spec=spec, edits=edits)
+                detect_run(src, cfg, out, wells, progress=prog, source_spec=spec, edits=edits, labels_path=lib)
                 if stage == "all":
-                    classify_run(out, cfg, self.model, progress=prog, cell_labels=cl())
+                    classify_run(out, cfg, self.model, progress=prog, cell_labels=cl(), labels_path=lib)
                 return out
         else:
             def job():
-                classify_run(out, cfg, self.model, progress=prog, cell_labels=cl())
+                classify_run(out, cfg, self.model, progress=prog, cell_labels=cl(), labels_path=lib)
                 return out
         self.say(f"{stage} → {out}")
         self._worker(job, lambda d: (self.say("done"), self.open_results(d)), {"detect": "detecting",
@@ -1218,6 +1224,50 @@ class ReconstructionApp:
         if self.res is not None:
             self.panel.run.out.setText(str(self.res.dir))
             self.run_stage("classify")
+
+    def show_provenance(self, kind: str):
+        """The reproduce commands or the methods text in a dialog (Copy; Save writes the reproduce folder / a .txt)."""
+        from qtpy.QtGui import QFont, QGuiApplication
+        from qtpy.QtWidgets import QDialog, QDialogButtonBox, QFileDialog, QPlainTextEdit, QVBoxLayout
+        from .. import provenance as pv
+        if self.res is None:
+            self.say("open results first")
+            return
+        try:
+            text = pv.commands(self.res.dir)[0] if kind == "commands" else pv.methods(self.res.dir)
+        except Exception as e:
+            self.say(f"cannot build the {kind}: {e}")
+            return
+        dlg = QDialog(self.panel)
+        dlg.setWindowTitle("Make these results again" if kind == "commands" else "Methods text")
+        lv = QVBoxLayout(dlg)
+        ed = QPlainTextEdit(text)
+        ed.setReadOnly(True)
+        ed.setLineWrapMode(QPlainTextEdit.NoWrap if kind == "commands" else QPlainTextEdit.WidgetWidth)
+        if kind == "commands":
+            ed.setFont(QFont("Consolas", 9))
+        lv.addWidget(ed, 1)
+        box = QDialogButtonBox(QDialogButtonBox.Close)
+        copy = box.addButton("Copy", QDialogButtonBox.ActionRole)
+        copy.clicked.connect(lambda: QGuiApplication.clipboard().setText(text))
+        save = box.addButton("Save reproduce folder" if kind == "commands" else "Save as…", QDialogButtonBox.ActionRole)
+
+        def do_save():
+            if kind == "commands":
+                d = pv.write_reproduce(self.res.dir)
+                self.say(f"saved: {d}")
+            else:
+                f, _ = QFileDialog.getSaveFileName(dlg, "Methods text", str(self.res.dir / "methods.txt"),
+                                                   "Text (*.txt)")
+                if f:
+                    Path(f).write_text(text, encoding="utf-8")
+                    self.say(f"saved: {f}")
+        save.clicked.connect(do_save)
+        box.rejected.connect(dlg.reject)
+        lv.addWidget(box)
+        dlg.resize(980 if kind == "commands" else 760, 560)
+        dlg.show()
+        self._prov_dlg = dlg
 
     def open_folder(self):
         if self.res is None:

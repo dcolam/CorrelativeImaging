@@ -341,8 +341,11 @@ class ParticleModel:
             if d["emb"] is not None:
                 emb = Embedding(d["emb"]["n"])
                 emb.med, emb.mu, emb.sd, emb.pca = d["emb"]["med"], d["emb"]["mu"], d["emb"]["sd"], d["emb"]["pca"]
-            return cls(ArmModel(d["arm"], d["est"], emb, d.get("n_pseudo", 0)), d["spec"])
-        return cls(d["model"], d["spec"])
+            m = cls(ArmModel(d["arm"], d["est"], emb, d.get("n_pseudo", 0)), d["spec"])
+        else:
+            m = cls(d["model"], d["spec"])
+        m.path = str(Path(path).resolve())                  # which file it came from (provenance)
+        return m
 
 
 def learning_curve(T: pd.DataFrame, test_groups: set, arm: str = "hand", fracs=(0.25, 0.5, 0.75, 1.0), seed: int = 0,

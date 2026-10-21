@@ -188,10 +188,18 @@ def _job(step: str, out_dir, fn):
 
 
 def detect_run(src, cfg: Config, out_dir, wells: list | None = None, workers: int = 8, progress=None,
-               source_spec: dict | None = None, edits: dict | None = None, cancel=None) -> dict:
-    """Stage 1 (see _detect_run), recorded in job.json."""
-    return _job("detect", out_dir, lambda: _detect_run(src, cfg, out_dir, wells, workers, progress, source_spec,
-                                                         edits, cancel))
+               source_spec: dict | None = None, edits: dict | None = None, cancel=None,
+               labels_path: str | None = None) -> dict:
+    """Stage 1 (see _detect_run), recorded in job.json and workflow.json (labels_path: the label library the hand
+    edits came from)."""
+    r = _job("detect", out_dir, lambda: _detect_run(src, cfg, out_dir, wells, workers, progress, source_spec,
+                                                      edits, cancel))
+    from .provenance import record, sha1_obj
+    record(out_dir, "detect", config=json.loads(cfg.to_json()), source=source_spec or {}, wells=wells or None,
+           n_wells=int(len(r["wells"])), n_edited_wells=len(edits or {}),
+           edits_sha1=sha1_obj(sorted((f"{k[0]}_{k[1]}", v) for k, v in (edits or {}).items())) if edits else None,
+           labels=str(labels_path) if labels_path else None)
+    return r
 
 
 def _detect_run(src, cfg: Config, out_dir, wells: list | None = None, workers: int = 8, progress=None,
@@ -320,9 +328,25 @@ class Results:
 
 
 def classify_run(out_dir, cfg: Config | None = None, model=None, workers: int = 8, progress=None,
-                 cell_labels: pd.DataFrame | None = None) -> dict:
-    """Stage 2 (see _classify_run), recorded in job.json."""
-    return _job("classify", out_dir, lambda: _classify_run(out_dir, cfg, model, workers, progress, cell_labels))
+                 cell_labels: pd.DataFrame | None = None, labels_path: str | None = None) -> dict:
+    """Stage 2 (see _classify_run), recorded in job.json and workflow.json (labels_path: the label library the cell
+    labels came from)."""
+    r = _job("classify", out_dir, lambda: _classify_run(out_dir, cfg, model, workers, progress, cell_labels))
+    from .provenance import record, sha1_file, sha1_obj
+    run = json.loads((Path(out_dir) / "run.json").read_text())
+    used = Config(**{k: v for k, v in run.get("config", {}).items() if hasattr(Config(), k)})
+    mfile = getattr(r.get("model"), "path", None)            # the file the model actually came from
+    if mfile is None and (run.get("model") or {}).get("arm") != "preview":
+        mp = used.model_path()
+        mfile = str(mp) if (mp is not None and mp.exists()) else None
+    n_cl = int(len(cell_labels)) if cell_labels is not None else 0
+    record(out_dir, "classify", config=run.get("config", {}), model_file=mfile,
+           model_sha1=sha1_file(mfile) if mfile else None, model_arm=(run.get("model") or {}).get("arm"),
+           model_fitted=(run.get("model") or {}).get("fitted"), labels=str(labels_path) if labels_path else None,
+           n_cell_labels=n_cl,
+           cell_labels_sha1=sha1_obj(cell_labels[[c for c in ("plate_id", "well_id", "y", "x", "verdict", "colour")
+                                                  if c in cell_labels]].to_dict("records")) if n_cl else None)
+    return r
 
 
 def _classify_run(out_dir, cfg: Config | None = None, model=None, workers: int = 8, progress=None,
@@ -413,7 +437,7 @@ def _classify_run(out_dir, cfg: Config | None = None, model=None, workers: int =
         classify_diagnostics(out, info, cfg)
     except Exception:                                   # plots never fail Classify
         pass
-    return dict(cells=cells, calls=calls, particles=F, identity=info)
+    return dict(cells=cells, calls=calls, particles=F, identity=info, model=model)
 
 
 def _classify_well(out: Path, wd, maps, g, hbg, body, cfg) -> list:
@@ -497,6 +521,9 @@ def redetect_well(out_dir, plate_id: str, well_id: str, edits: dict | None, cfg:
     _atomic(out / "particles.parquet", lambda t: P_out.to_parquet(t, index=False))
     _atomic(out / "wells.csv", lambda t: W_out.to_csv(t, index=False))
     (out / "run.json").write_text(json.dumps(run, indent=2, default=str))
+    from .provenance import record
+    record(out, "edit", well=f"{plate_id}_{well_id}", n_edits=sum(len(v) for v in (edits or {}).values()),
+           reclassified=bool(res.calls is not None))
     return dict(particles=F, well=w_row)
 
 

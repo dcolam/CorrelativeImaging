@@ -12,6 +12,8 @@
   python -m correlative_imaging.reconstruction compare --out <dir> --labels ci_labels.db --models preview a.joblib ...
         [--plate-map map.csv --check Condition=Empty]
   python -m correlative_imaging.reconstruction status --out <dir> [--labels ci_labels.db] [--model <file.joblib>]
+  python -m correlative_imaging.reconstruction commands --out <dir> [--write]     (how to make the results again)
+  python -m correlative_imaging.reconstruction methods --out <dir>                (a methods text from the results)
 
 `--config` takes a JSON file or a preset name (identity/presets/*.json).
 """
@@ -56,6 +58,11 @@ def main(argv=None):
     k.add_argument("--check", help="COLUMN=VALUE: wells where no cell is expected, e.g. Condition=Empty")
     s_ = sub.add_parser("status", help="where a results folder stands in the workflow (the GUI's strip, as text)")
     s_.add_argument("--out", required=True); s_.add_argument("--labels"); s_.add_argument("--model")
+    cm = sub.add_parser("commands", help="the command lines that make these results again (provenance.py)")
+    cm.add_argument("--out", required=True)
+    cm.add_argument("--write", action="store_true", help="save them and the files they read into <out>/reproduce/")
+    me = sub.add_parser("methods", help="a methods text built from what the results folder records")
+    me.add_argument("--out", required=True)
     i = sub.add_parser("import-labels", help="import a first labelling session (CSV)")
     i.add_argument("--csv", required=True); i.add_argument("--labels", required=True)
     i.add_argument("--dataset", required=True); i.add_argument("--names", nargs="+", required=True)
@@ -76,7 +83,7 @@ def main(argv=None):
             from .labels import LabelStore
             edits = LabelStore(a.labels).edits(getattr(src, "dataset", ""))
             print(f"{len(edits)} well(s) with hand edits")
-        r = detect_run(src, cfg, a.out, a.wells, a.workers, source_spec=spec, edits=edits)
+        r = detect_run(src, cfg, a.out, a.wells, a.workers, source_spec=spec, edits=edits, labels_path=a.labels)
         print(f"{len(r['wells'])} wells, {int(r['particles'].pool.sum())} particles in the holes -> {a.out}")
     elif a.cmd == "classify":
         from .learn import ParticleModel
@@ -89,7 +96,7 @@ def main(argv=None):
             st, ds = LabelStore(a.labels), Results(a.out).dataset
             C, tw = st.cell_frame(ds), st.test_wells(ds)
             cl = C[[(p, w) not in tw for p, w in zip(C.plate_id, C.well_id)]] if len(C) else None
-        r = classify_run(a.out, cfg, model, a.workers, cell_labels=cl)
+        r = classify_run(a.out, cfg, model, a.workers, cell_labels=cl, labels_path=a.labels)
         print(r["calls"].call.value_counts().to_string())
     elif a.cmd == "train":
         from .labels import LabelStore
@@ -109,6 +116,11 @@ def main(argv=None):
         path = Path(a.model)
         path = path if path.suffix else MODELS / f"{a.model}.joblib"
         res.model.save(path)
+        from .provenance import record, sha1_file
+        for d in a.results:                                   # each results folder trained on keeps the event
+            record(d, "train", model_file=str(path.resolve()), model_sha1=sha1_file(path), arm=res.model.spec["arm"],
+                   n_train=res.model.spec.get("n_train"), labels=str(Path(a.labels).resolve()), results=a.results,
+                   labels_sha1=res.model.spec.get("labels_sha1"))
         print(f"saved {res.model.spec['arm']} -> {path}")
     elif a.cmd == "freeze-test-wells":
         from .labels import LabelStore
@@ -152,6 +164,17 @@ def main(argv=None):
         if hasattr(sys.stdout, "reconfigure"):          # a Windows console cannot print every character
             sys.stdout.reconfigure(errors="replace")
         print(summary(workflow_state(a.out, store, model)))
+    elif a.cmd in ("commands", "methods"):
+        import sys
+        from .provenance import commands, methods, write_reproduce
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(errors="replace")
+        if a.cmd == "methods":
+            print(methods(a.out))
+        elif a.write:
+            print(f"saved to {write_reproduce(a.out)}")
+        else:
+            print(commands(a.out)[0])
     elif a.cmd == "import-labels":
         from .labels import LabelStore
         names = dict(n.split("=", 1) for n in a.names)

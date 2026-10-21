@@ -23,7 +23,8 @@ MODELS = Path(__file__).parent / "models"
 class Config:
     # --- channels -----------------------------------------------------------------------------------------------
     channels: list = field(default_factory=list)   # fluorescence channels to use; empty = all found in the run
-    markers: list = field(default_factory=list)    # measured, never identity evidence (e.g. a channel on every cell)
+    markers: list = field(default_factory=list)    # measured and reported only: they neither shape the cell nor
+                                                   # enter the colour call (default: none, every channel is identity)
     display: dict = field(default_factory=dict)    # channel -> {"name": str, "color": "#rrggbb"}; display only
 
     # --- detection (as pipeline.segment: threshold, remove_small_objects, label) --------------------------------

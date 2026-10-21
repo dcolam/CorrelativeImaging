@@ -1047,6 +1047,21 @@ class ResultsTab(QWidget):
         cv = FrameView(self.ct)
         cv.setMinimumHeight(160)
         v.addWidget(cv)
+        v.addWidget(section("Reproduce and describe"))
+        v.addWidget(hint("Built only from what this results folder records (workflow.json, run.json, wells.csv, "
+                         "identity.json): the commands that make the results again, and a methods text."))
+        h = QHBoxLayout()
+        b = QPushButton("Show as commands")
+        b.setToolTip("the command lines that make these results again from the same inputs; Save writes them and "
+                     "the settings files they read into <results>/reproduce/")
+        b.clicked.connect(lambda: app.show_provenance("commands"))
+        h.addWidget(b)
+        b = QPushButton("Methods text")
+        b.setToolTip("a methods paragraph with the settings each stage ran with, the model's provenance, the colour "
+                     "calibration and the software versions")
+        b.clicked.connect(lambda: app.show_provenance("methods"))
+        h.addWidget(b)
+        v.addLayout(h)
         h = QHBoxLayout()
         o = QPushButton("Open results folder")
         o.clicked.connect(app.open_folder)
