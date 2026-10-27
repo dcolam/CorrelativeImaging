@@ -205,7 +205,8 @@ class ParticleAnalysis(Step):
         df = pd.DataFrame(props)
         idx = df["label"].to_numpy()
         df["median_intensity"] = ndi_median(intensity, label_image, idx)
-        df["std_intensity"] = ndi_std(intensity, label_image, idx)
+        with np.errstate(invalid="ignore", divide="ignore"):    # scipy divides over every label number up to the
+            df["std_intensity"] = ndi_std(intensity, label_image, idx)   # max, also those cut away (0/0, not used)
         df["p25_intensity"] = labeled_comprehension(intensity, label_image, idx, lambda v: np.percentile(v, 25), float, np.nan)
         df["p75_intensity"] = labeled_comprehension(intensity, label_image, idx, lambda v: np.percentile(v, 75), float, np.nan)
         rs = ring_stats(intensity, full_labels, idx, foreground_mask(context, self.roi_mask, intensity.shape), px,

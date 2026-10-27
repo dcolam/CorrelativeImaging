@@ -30,7 +30,7 @@ def test_sharpest_plane_wins():
 def test_bf_worker_writes_focus_plane(tmp_path, z_range):
     stack = _focus_stack()
     src = tmp_path / "well.tif"
-    tifffile.imwrite(src, stack, imagej=True, metadata={"axes": "ZYX"})
+    tifffile.imwrite(src, stack, imagej=True, metadata={"axes": "ZYX", "unit": "um"})
     (tmp_path / "h5").mkdir(); proj = tmp_path / "proj"; proj.mkdir()
 
     _, _, _, _, err = _bf_project_one(
@@ -55,7 +55,7 @@ def test_bf_worker_writes_focus_plane(tmp_path, z_range):
 
 def test_range_excluding_focus_picks_best_inside_it(tmp_path):
     src = tmp_path / "well.tif"
-    tifffile.imwrite(src, _focus_stack(), imagej=True, metadata={"axes": "ZYX"})
+    tifffile.imwrite(src, _focus_stack(), imagej=True, metadata={"axes": "ZYX", "unit": "um"})
     (tmp_path / "h5").mkdir(); proj = tmp_path / "proj"; proj.mkdir()
     _bf_project_one((str(src), "A01-1", 0, "min", str(tmp_path / "h5"), str(proj), 7, 9))
     info = tifffile.TiffFile(proj / "A01-1_focus.tif").imagej_metadata["Info"]

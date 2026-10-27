@@ -29,7 +29,7 @@ def _write_stack(path):
     arr = np.zeros((8, 4, 4), dtype="uint16")
     for z in range(8):
         arr[z] = (z + 1) * 10
-    tifffile.imwrite(path, arr, imagej=True, metadata={"axes": "ZYX"})
+    tifffile.imwrite(path, arr, imagej=True, metadata={"axes": "ZYX", "unit": "um"})
     return path
 
 
@@ -272,7 +272,7 @@ def test_training_images_equal_the_pipeline_input(tmp_path):
     for i in range(5):
         src = tmp_path / f"w{i}.tif"
         arr = np.random.default_rng(i).integers(50, 800, (8, 6, 6)).astype("uint16")
-        tifffile.imwrite(src, arr, imagej=True, metadata={"axes": "ZYX"})
+        tifffile.imwrite(src, arr, imagej=True, metadata={"axes": "ZYX", "unit": "um"})
         wells.append((f"B{i + 1}", WellInfo(row="B", col=i + 1, field=1, bf_path=src)))
     wells.append(("C1", WellInfo(row="C", col=1, field=1)))            # no BF → never picked
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -281,7 +281,7 @@ class ResultsDB:
                 experiment,
                 n_channels,
                 pixel_size_um,
-                datetime.utcnow().isoformat(),
+                datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
                 json.dumps(metadata or {}),
                 _as_float(analysis_pixel_size_um),
                 _as_float(binning_factor),
@@ -551,7 +551,7 @@ class ResultsDB:
                 image_id,
                 pipeline_name,
                 pipeline_json,
-                datetime.utcnow().isoformat(),
+                datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
                 status,
                 error,
             ),
