@@ -52,7 +52,9 @@ from correlative_imaging.diagnostics import CHANNEL_COLOR_RGB as _CHANNEL_COLOR_
 from correlative_imaging.diagnostics import default_channel_color as _default_channel_color
 from correlative_imaging.batch import BF_FOCUS_SAVED
 from correlative_imaging.io import supported_extensions
-from correlative_imaging.pipeline.analyze import INTENSITY_METRIC_CHOICES, PARTICLE_METRIC_CHOICES
+from correlative_imaging.pipeline.analyze import (
+    INTENSITY_METRIC_CHOICES, PARTICLE_METRIC_CHOICES, resolve_particle_metrics,
+)
 from correlative_imaging.viewer.napari_viewer import (
     auto_contrast_limits, ensure_display_dims, safe_clear_layers,
 )
@@ -3292,9 +3294,14 @@ class ChannelPanel(QWidget):
         self._an_z_proj = QComboBox(); self._an_z_proj.addItems(["max", "mean", "sum"])
 
         self._particle_metrics = _build_metric_checklist(PARTICLE_METRIC_CHOICES)
+        self._particle_metrics.setFixedHeight(170)
         self._particle_metrics.setToolTip(
             "Which per-particle columns to save (unchecked ones are computed\n"
-            "for filtering above regardless, just not saved to the results table)."
+            "for filtering above regardless, just not saved to the results table).\n"
+            "median_intensity: robust to a few bright specks inside the particle.\n"
+            "std / p25 / p75_intensity: how even the particle is.\n"
+            "local_background: median, robust SD and pixel count of a ring\n"
+            "1-4 µm around the particle, without any channel's objects."
         )
 
         afl.addRow(self._particle_en)
@@ -3551,7 +3558,8 @@ class ChannelPanel(QWidget):
             self._max_area.setValue(particle.get("max_size_um2", 5000.0))
             self._min_circ.setValue(particle.get("min_circularity", 0.0))
             self._an_z_proj.setCurrentText(particle.get("z_projection", "max"))
-            _set_checked_metrics(self._particle_metrics, particle.get("metrics"))
+            # a list saved before median/spread/local background existed shows them ticked (as they run)
+            _set_checked_metrics(self._particle_metrics, resolve_particle_metrics(particle.get("metrics")))
 
         intensity = by_type.get("IntensityMeasurement")
         _set_checked_metrics(

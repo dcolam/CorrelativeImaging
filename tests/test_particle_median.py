@@ -31,6 +31,15 @@ def test_particle_median_ignores_specks_and_is_kept_with_an_old_metric_list():
     df = ParticleAnalysis(channel=0, min_size_um2=0, metrics=["area", "mean_intensity"]).process(img, _context(img)).measurements
     assert df.mean_intensity.iloc[0] > 25                       # the specks pull the mean up
     assert df.median_intensity.iloc[0] == 10.0                  # not the median
+    assert "ring_median_intensity" in df and "p75_intensity" in df
+
+
+def test_robust_metrics_are_selectable():
+    img = _image()
+    df = ParticleAnalysis(channel=0, min_size_um2=0, metrics=["area", "median_intensity"]).process(
+        img, _context(img)).measurements
+    assert "median_intensity" in df
+    assert not {"std_intensity", "p25_intensity", "ring_median_intensity", "mean_intensity"} & set(df.columns)
 
 
 def test_colocalization_median_and_database_columns(tmp_path):

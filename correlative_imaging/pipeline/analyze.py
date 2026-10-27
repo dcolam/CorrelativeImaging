@@ -35,11 +35,14 @@ _REGION_PROPS = [
 # "all of them", keeping old saved pipeline JSONs behaving identically.
 PARTICLE_METRIC_CHOICES = [
     "area", "area_um2", "perimeter", "circularity", "eccentricity", "solidity",
-    "mean_intensity", "max_intensity", "min_intensity", "centroid", "bbox",
+    "mean_intensity", "median_intensity", "max_intensity", "min_intensity",
+    "std_intensity", "p25_intensity", "p75_intensity", "local_background",
+    "centroid", "bbox",
 ]
 _PARTICLE_METRIC_COLUMNS = {
     "centroid": ["centroid_row", "centroid_col"],
     "bbox": ["bbox-0", "bbox-1", "bbox-2", "bbox-3"],
+    "local_background": ["ring_median_intensity", "ring_sd_intensity", "ring_px"],
 }
 
 # User-selectable gross/bulk metrics (Channels tab). "area_px"/"area_um2" are
@@ -61,10 +64,20 @@ PARTICLE_POSITION_COLUMNS = ["centroid_row", "centroid_col", "centroid_row_um", 
 # particle is; the ring is a band around the whole object (a gap, then
 # ``ring_width_um`` wide) without any channel's segmented objects, inside the
 # selection when there is one, so glow of a bright neighbour or uneven
-# background is measured right next to the particle. Always output, also for
-# saved pipelines whose metric list predates them.
-PARTICLE_ROBUST_COLUMNS = ["median_intensity", "std_intensity", "p25_intensity", "p75_intensity",
-                           "ring_median_intensity", "ring_sd_intensity", "ring_px"]
+# background is measured right next to the particle. Selectable like the
+# others; a saved metric list that predates them (contains none of them) gets
+# all of them, so re-running an old pipeline JSON does not silently drop them.
+PARTICLE_ROBUST_METRICS = ["median_intensity", "std_intensity", "p25_intensity", "p75_intensity",
+                           "local_background"]
+
+
+def resolve_particle_metrics(metrics: list[str] | None) -> list[str]:
+    """The particle metrics to save: None = all; an old list without any robust metric gets them added."""
+    if metrics is None:
+        return list(PARTICLE_METRIC_CHOICES)
+    if not any(m in metrics for m in PARTICLE_ROBUST_METRICS):
+        return list(metrics) + PARTICLE_ROBUST_METRICS
+    return list(metrics)
 
 
 def foreground_mask(context: PipelineContext, roi_mask: str, shape) -> np.ndarray:
@@ -239,12 +252,10 @@ class ParticleAnalysis(Step):
         # "label" are bookkeeping/identity columns and always kept. Filtering
         # above already used the full internal set (area_um2/circularity)
         # regardless of what's selected for output.
-        selected = self.metrics if self.metrics is not None else PARTICLE_METRIC_CHOICES
         keep = ["channel", "roi_mask", "roi_path", "label"]
-        for m in selected:
+        for m in resolve_particle_metrics(self.metrics):
             keep.extend(_PARTICLE_METRIC_COLUMNS.get(m, [m]))
         keep.extend(c for c in PARTICLE_POSITION_COLUMNS if c not in keep)
-        keep.extend(c for c in PARTICLE_ROBUST_COLUMNS if c not in keep)
         keep.extend(PARTICLE_EDGE_COLUMNS)
         df = df[[c for c in keep if c in df.columns]]
 

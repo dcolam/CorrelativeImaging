@@ -34,7 +34,7 @@ from .analysis import RunTable
 
 # Per-particle attributes to summarise, split into shape vs intensity groups.
 _SHAPE_ATTRS = ["area_um2", "perimeter_px", "circularity", "eccentricity", "solidity"]
-_PARTINT_ATTRS = ["mean_intensity", "max_intensity"]
+_PARTINT_ATTRS = ["mean_intensity", "median_intensity", "max_intensity"]
 _PARTICLE_STATS = ["mean", "std"]     # count is added separately
 
 
