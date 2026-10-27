@@ -5872,8 +5872,6 @@ class RunTab(QWidget):
                                 colormap=cmap, scale=scale,
                             )
                             last_preproc_layer[i] = lyr
-                if type(step_obj).__name__ == "ChannelRelation":
-                    self._show_relation_layers(step_obj, result, current_image, context, img_data, _color_for, px)
                 for mk, mask in result.masks.items():
                     if mk.startswith(RESIDUAL_PREFIX):
                         continue    # shown by _show_relation_layers
@@ -5919,6 +5917,8 @@ class RunTab(QWidget):
                     self._log(f"  ✓ {step_name}")
                 for line in _preview_details(step_obj, result):
                     self._log(f"      {line}")
+                if type(step_obj).__name__ == "ChannelRelation":
+                    self._show_relation_layers(step_obj, result, current_image, context, img_data, _color_for, px)
 
             def _on_done():
                 # Default display (#23): the last pre-threshold per-channel
