@@ -7,7 +7,9 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 from scipy.ndimage import binary_dilation, center_of_mass, distance_transform_edt
+from scipy.ndimage import labeled_comprehension, median as ndi_median, standard_deviation as ndi_std
 from skimage.measure import label as sk_label, regionprops_table
+from skimage.segmentation import expand_labels
 
 from .base import PipelineContext, Step, StepResult, register_step
 from .segment import _project, channel_mask
@@ -53,6 +55,56 @@ INTENSITY_METRIC_CHOICES = [
 # place particles on the image or a diagnostic crop.
 PARTICLE_POSITION_COLUMNS = ["centroid_row", "centroid_col", "centroid_row_um", "centroid_col_um"]
 
+# Robust intensity and spread inside the particle, and its local background:
+# the median is robust to a few very bright pixels (a speck pulls the mean up,
+# not the median); SD and the 25th/75th percentiles describe how even the
+# particle is; the ring is a band around the whole object (a gap, then
+# ``ring_width_um`` wide) without any channel's segmented objects, inside the
+# selection when there is one, so glow of a bright neighbour or uneven
+# background is measured right next to the particle. Always output, also for
+# saved pipelines whose metric list predates them.
+PARTICLE_ROBUST_COLUMNS = ["median_intensity", "std_intensity", "p25_intensity", "p75_intensity",
+                           "ring_median_intensity", "ring_sd_intensity", "ring_px"]
+
+
+def foreground_mask(context: PipelineContext, roi_mask: str, shape) -> np.ndarray:
+    """Every channel's threshold mask (this selection's own where it has per-selection thresholding)."""
+    fg = np.zeros(shape, bool)
+    for c in sorted({int(k[len("mask_ch"):]) for k in context.masks
+                     if k.startswith("mask_ch") and k[len("mask_ch"):].isdigit()}):
+        m = channel_mask(context, c, roi_mask)
+        if m is not None:
+            fg |= m.astype(bool)
+    return fg
+
+
+def ring_stats(plane: np.ndarray, labels: np.ndarray, index, fg: np.ndarray, px: float,
+               gap_um: float = 1.0, width_um: float = 3.0, within: np.ndarray | None = None) -> pd.DataFrame:
+    """Local background of each labelled object: median, robust SD (1.4826 MAD) and pixel count of a ring
+    ``gap_um`` .. ``gap_um + width_um`` around it, without ``fg`` (other objects of any channel) and, with
+    ``within``, only inside that selection. Neighbouring rings do not overlap (each pixel goes to the
+    nearest object). NaN for an object with fewer than 10 ring pixels."""
+    index = np.asarray(index, dtype=np.int64)
+    out = pd.DataFrame({"ring_median_intensity": np.nan, "ring_sd_intensity": np.nan, "ring_px": 0}, index=index)
+    if not len(index):
+        return out
+    lab = labels.astype(np.int64)
+    gap = max(int(round(gap_um / px)), 0)
+    outer = gap + max(int(round(width_um / px)), 1)
+    near = expand_labels(lab, gap) if gap > 0 else lab
+    ring = np.where((near == 0) & ~fg, expand_labels(lab, outer), 0)
+    if within is not None:
+        ring = np.where(within.astype(bool), ring, 0)
+    n = np.bincount(ring.ravel(), minlength=int(lab.max()) + 1)[index] if ring.any() else np.zeros(len(index), int)
+    out["ring_px"] = n
+    ok = index[n >= 10]
+    if len(ok):
+        med = np.asarray(ndi_median(plane, ring, ok), float)
+        mad = labeled_comprehension(plane, ring, ok, lambda v: np.median(np.abs(v - np.median(v))), float, np.nan)
+        out.loc[ok, "ring_median_intensity"] = med
+        out.loc[ok, "ring_sd_intensity"] = 1.4826 * np.asarray(mad, float)
+    return out
+
 # Where each particle sits relative to its selection, computed from the WHOLE
 # whole-image object it was cut from (not the piece inside the selection).
 # Always output — not user-selectable — so a particle cut at the selection
@@ -94,6 +146,8 @@ class ParticleAnalysis(Step):
     z_projection: str = "max"
     roi_mask: str = ""   # empty = no restriction
     metrics: list[str] | None = None   # None = all of PARTICLE_METRIC_CHOICES
+    ring_gap_um: float = 1.0           # local background: gap to the object ...
+    ring_width_um: float = 3.0         # ... and width of the ring
 
     @property
     def name(self) -> str:
@@ -136,6 +190,15 @@ class ParticleAnalysis(Step):
             label_image, intensity_image=intensity, properties=_REGION_PROPS
         )
         df = pd.DataFrame(props)
+        idx = df["label"].to_numpy()
+        df["median_intensity"] = ndi_median(intensity, label_image, idx)
+        df["std_intensity"] = ndi_std(intensity, label_image, idx)
+        df["p25_intensity"] = labeled_comprehension(intensity, label_image, idx, lambda v: np.percentile(v, 25), float, np.nan)
+        df["p75_intensity"] = labeled_comprehension(intensity, label_image, idx, lambda v: np.percentile(v, 75), float, np.nan)
+        rs = ring_stats(intensity, full_labels, idx, foreground_mask(context, self.roi_mask, intensity.shape), px,
+                        self.ring_gap_um, self.ring_width_um, within=roi)
+        for col in rs.columns:
+            df[col] = rs[col].to_numpy()
 
         # Derived metrics
         df["circularity"] = (
@@ -181,6 +244,7 @@ class ParticleAnalysis(Step):
         for m in selected:
             keep.extend(_PARTICLE_METRIC_COLUMNS.get(m, [m]))
         keep.extend(c for c in PARTICLE_POSITION_COLUMNS if c not in keep)
+        keep.extend(c for c in PARTICLE_ROBUST_COLUMNS if c not in keep)
         keep.extend(PARTICLE_EDGE_COLUMNS)
         df = df[[c for c in keep if c in df.columns]]
 
@@ -325,12 +389,7 @@ class IntensityMeasurement(Step):
         if self.outside_particles:
             # Every channel's threshold mask — this selection's own where it
             # has per-selection thresholding, else the global one.
-            fg = np.zeros(plane.shape, bool)
-            for c in sorted({int(k[len("mask_ch"):]) for k in context.masks
-                             if k.startswith("mask_ch") and k[len("mask_ch"):].isdigit()}):
-                m = channel_mask(context, c, self.roi_mask)
-                if m is not None:
-                    fg |= m.astype(bool)
+            fg = foreground_mask(context, self.roi_mask, plane.shape)
             r = int(round(self.outside_margin_um / px)) if self.outside_margin_um > 0 else 0
             if r > 0:   # iterations=0 would dilate until nothing changes
                 fg = binary_dilation(fg, iterations=r)

@@ -10,6 +10,7 @@ from scipy.ndimage import binary_dilation
 from skimage.measure import regionprops_table
 
 from .base import PipelineContext, Step, StepResult, register_step
+from .analyze import foreground_mask, ring_stats
 from .segment import _project, channel_mask
 
 _COLOC_PROPS = [
@@ -53,6 +54,8 @@ class ColocalizationAnalysis(Step):
     dilation_um: float = 0.0
     z_projection: str = "max"
     roi_mask: str = ""   # empty = whole image; matches the key used by ExtractROI/LoadROI
+    ring_gap_um: float = 1.0      # local background ring of the secondary channel (analyze.ring_stats)
+    ring_width_um: float = 3.0
 
     @property
     def name(self) -> str:
@@ -71,6 +74,7 @@ class ColocalizationAnalysis(Step):
 
         ch_p = _project(image[self.primary_channel], self.z_projection)
         ch_s = _project(image[self.secondary_channel], self.z_projection)
+        ch_s_full, labels_full = ch_s, primary_labels          # before the ROI cut: for the local background ring
 
         # Restrict to ROI when requested.
         # Manders/Pearson denominators are computed within the ROI only,
@@ -135,6 +139,12 @@ class ColocalizationAnalysis(Step):
                     if particle_mask.any() else 0.0,
                 "secondary_max_intensity": float(ch_s[particle_mask].max())
                     if particle_mask.any() else 0.0,
+                # robust to a few bright pixels (a speck) inside the particle, and the spread
+                "secondary_median_intensity": float(np.median(ch_s[particle_mask]))
+                    if particle_mask.any() else 0.0,
+                "secondary_std_intensity": float(ch_s[particle_mask].std()) if particle_mask.any() else 0.0,
+                "secondary_p25_intensity": float(np.percentile(ch_s[particle_mask], 25)) if particle_mask.any() else 0.0,
+                "secondary_p75_intensity": float(np.percentile(ch_s[particle_mask], 75)) if particle_mask.any() else 0.0,
                 "overlap_fraction": n_secondary_px / max(particle_mask.sum(), 1),
                 "mask_overlap_fraction": (
                     float((particle_mask & sec_bool).sum()) / max(particle_mask.sum(), 1)
@@ -143,6 +153,13 @@ class ColocalizationAnalysis(Step):
             })
 
         df = pd.DataFrame(rows)
+        if len(df):
+            # the secondary channel's local background around each primary particle (see analyze.ring_stats)
+            rs = ring_stats(ch_s_full, labels_full, df["primary_label"].to_numpy(),
+                            foreground_mask(context, self.roi_mask, ch_s_full.shape), px,
+                            self.ring_gap_um, self.ring_width_um, within=roi)
+            df["secondary_ring_median_intensity"] = rs["ring_median_intensity"].to_numpy()
+            df["secondary_ring_sd_intensity"] = rs["ring_sd_intensity"].to_numpy()
         ch_names = context.channel_names
         p_name = ch_names[self.primary_channel] if self.primary_channel < len(ch_names) else f"ch{self.primary_channel}"
         s_name = ch_names[self.secondary_channel] if self.secondary_channel < len(ch_names) else f"ch{self.secondary_channel}"

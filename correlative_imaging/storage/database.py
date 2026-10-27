@@ -72,7 +72,16 @@ CREATE TABLE IF NOT EXISTS particle_measurements (
     centroid_row_um REAL,   -- absolute, µm from the frame's top-left corner
     centroid_col_um REAL,
     crop_row        REAL,   -- position in this selection's diagnostic crop
-    crop_col        REAL    -- (crop pixels); NULL if no crop was written
+    crop_col        REAL,   -- (crop pixels); NULL if no crop was written
+    -- robust intensity, spread and local background (ring around the object);
+    -- NULL = run from before they were measured
+    median_intensity REAL,
+    std_intensity   REAL,
+    p25_intensity   REAL,
+    p75_intensity   REAL,
+    ring_median_intensity REAL,
+    ring_sd_intensity REAL,
+    ring_px         INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS colocalization_results (
@@ -102,7 +111,14 @@ CREATE TABLE IF NOT EXISTS colocalization_per_particle (
     secondary_mean_intensity REAL,
     secondary_max_intensity REAL,
     overlap_fraction        REAL,
-    mask_overlap_fraction   REAL
+    mask_overlap_fraction   REAL,
+    -- NULL = run from before they were measured
+    secondary_median_intensity REAL,
+    secondary_std_intensity REAL,
+    secondary_p25_intensity REAL,
+    secondary_p75_intensity REAL,
+    secondary_ring_median_intensity REAL,
+    secondary_ring_sd_intensity REAL
 );
 
 CREATE TABLE IF NOT EXISTS intensity_measurements (
@@ -216,6 +232,19 @@ class ResultsDB:
             ("particle_measurements",       "centroid_col_um REAL"),
             ("particle_measurements",       "crop_row REAL"),
             ("particle_measurements",       "crop_col REAL"),
+            ("particle_measurements",       "median_intensity REAL"),
+            ("colocalization_per_particle", "secondary_median_intensity REAL"),
+            ("particle_measurements",       "std_intensity REAL"),
+            ("particle_measurements",       "p25_intensity REAL"),
+            ("particle_measurements",       "p75_intensity REAL"),
+            ("particle_measurements",       "ring_median_intensity REAL"),
+            ("particle_measurements",       "ring_sd_intensity REAL"),
+            ("particle_measurements",       "ring_px INTEGER"),
+            ("colocalization_per_particle", "secondary_std_intensity REAL"),
+            ("colocalization_per_particle", "secondary_p25_intensity REAL"),
+            ("colocalization_per_particle", "secondary_p75_intensity REAL"),
+            ("colocalization_per_particle", "secondary_ring_median_intensity REAL"),
+            ("colocalization_per_particle", "secondary_ring_sd_intensity REAL"),
         ]
         for table, col_def in new_columns:
             try:
@@ -341,6 +370,13 @@ class ResultsDB:
                     _as_float(r.get("centroid_col_um")),
                     _as_float(r.get("crop_row")),
                     _as_float(r.get("crop_col")),
+                    _as_float(r.get("median_intensity")),
+                    _as_float(r.get("std_intensity")),
+                    _as_float(r.get("p25_intensity")),
+                    _as_float(r.get("p75_intensity")),
+                    _as_float(r.get("ring_median_intensity")),
+                    _as_float(r.get("ring_sd_intensity")),
+                    _as_int(r.get("ring_px")),
                 )
             )
         self._con.executemany(
@@ -351,9 +387,11 @@ class ResultsDB:
                  max_intensity, min_intensity, centroid_row, centroid_col,
                  area_full_um2, cut_at_edge, share_inside,
                  dist_centre_um, dist_centre_rel, dist_rim_um,
-                 centroid_row_um, centroid_col_um, crop_row, crop_col)
+                 centroid_row_um, centroid_col_um, crop_row, crop_col, median_intensity,
+                 std_intensity, p25_intensity, p75_intensity,
+                 ring_median_intensity, ring_sd_intensity, ring_px)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?)
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             rows,
         )
@@ -466,6 +504,12 @@ class ResultsDB:
                 float(r.get("secondary_max_intensity", 0)),
                 float(r.get("overlap_fraction", 0)),
                 _as_float(r.get("mask_overlap_fraction")),
+                _as_float(r.get("secondary_median_intensity")),
+                _as_float(r.get("secondary_std_intensity")),
+                _as_float(r.get("secondary_p25_intensity")),
+                _as_float(r.get("secondary_p75_intensity")),
+                _as_float(r.get("secondary_ring_median_intensity")),
+                _as_float(r.get("secondary_ring_sd_intensity")),
             )
             for _, r in per_particle_df.iterrows()
         ]
@@ -474,8 +518,11 @@ class ResultsDB:
             INSERT INTO colocalization_per_particle
                 (image_id, primary_channel, secondary_channel, roi_mask, primary_label,
                  primary_area_um2, n_secondary_pixels, secondary_mean_intensity,
-                 secondary_max_intensity, overlap_fraction, mask_overlap_fraction)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 secondary_max_intensity, overlap_fraction, mask_overlap_fraction,
+                 secondary_median_intensity, secondary_std_intensity,
+                 secondary_p25_intensity, secondary_p75_intensity,
+                 secondary_ring_median_intensity, secondary_ring_sd_intensity)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             rows,
         )
