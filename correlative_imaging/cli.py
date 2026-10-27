@@ -95,6 +95,7 @@ def run(
     from correlative_imaging.pipeline.base import PipelineContext
     from correlative_imaging.pipeline.analyze import ParticleAnalysis, IntensityMeasurement
     from correlative_imaging.pipeline.colocalize import ColocalizationAnalysis
+    from correlative_imaging.pipeline.relations import ChannelRelation
     from correlative_imaging.batch import _save_channel_levels, _selection_names, _selection_rows
     from correlative_imaging.storage import ResultsDB
 
@@ -138,6 +139,8 @@ def run(
                         f"  [green]✓[/green] {step.name}: "
                         f"mean={result.info.get('mean_intensity', 0):.1f}"
                     )
+                elif isinstance(step, ChannelRelation):
+                    db.save_channel_relations(image_id, result.measurements)
                 elif isinstance(step, ColocalizationAnalysis):
                     db.save_colocalization(
                         image_id,

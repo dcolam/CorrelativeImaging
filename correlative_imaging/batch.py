@@ -25,6 +25,7 @@ from correlative_imaging.io.plate import WellInfo
 from correlative_imaging.pipeline.base import Pipeline, PipelineContext, Step
 from correlative_imaging.pipeline.analyze import IntensityMeasurement, ParticleAnalysis
 from correlative_imaging.pipeline.colocalize import ColocalizationAnalysis
+from correlative_imaging.pipeline.relations import ChannelRelation
 from correlative_imaging.pipeline.preprocess import BlackLevelNormalization
 from correlative_imaging.pipeline.segment import AutoThreshold
 from correlative_imaging.storage import ResultsDB
@@ -142,6 +143,8 @@ class BatchRunner:
                                 db.save_particle_measurements(image_id, result.measurements)
                             elif isinstance(step, IntensityMeasurement):
                                 db.save_intensity_measurements(image_id, result.measurements)
+                            elif isinstance(step, ChannelRelation):
+                                db.save_channel_relations(image_id, result.measurements)
                             elif isinstance(step, ColocalizationAnalysis):
                                 db.save_colocalization(
                                     image_id,
@@ -530,6 +533,8 @@ def _save_well_diagnostics(
                     colors=colors, pixel_size_um=px_an, info=info,
                 )
                 files.append(f"{stem}_channels.tif")
+            files.extend(_save_relation_crop(context, roi_name, mask, bbox, cropped_planes, channel_names, colors,
+                                             px_an, info, out_dir, stem, well.well_id))
             if zstack and raw_stack is not None:
                 if _save_zstack_crop(
                     raw_stack, bbox, bin_factor, bin_method, channel_names, colors,
@@ -549,6 +554,36 @@ def _save_well_diagnostics(
                 tifffile.imwrite(str(out_dir / f"{well.well_id}_{key}.tif"), mask.astype("uint16"))
 
     return crops
+
+
+def _save_relation_crop(context, roi_name, mask, bbox, cropped_planes, channel_names, colors, px_an, info,
+                        out_dir, stem, well_id) -> list[str]:
+    """ChannelRelation's residuals for this selection (if it ran): ``<stem>_residual.tif`` (float32, one channel
+    per fluorescence channel, SNR) and ``<stem>_relations.png`` (topography + residual per channel). Kept apart from
+    ``_channels.tif``, whose layout other tools read."""
+    import numpy as np
+
+    from correlative_imaging.diagnostics import save_relation_figure
+    from correlative_imaging.pipeline.relations import SUMMARY_KEY, residual_key
+
+    r0, r1, c0, c1 = bbox
+    res = {c: context.masks[residual_key(c, roi_name)][r0:r1, c0:c1]
+           for c in range(len(cropped_planes)) if residual_key(c, roi_name) in context.masks}
+    if not res:
+        return []
+    chans = sorted(res)
+    _save_multichannel_tif([res[c] for c in chans], [f"own {channel_names[c]}" if c < len(channel_names) else f"own ch{c}"
+                                                     for c in chans], None, out_dir / f"{stem}_residual.tif",
+                           colors=[colors[c] for c in chans if c < len(colors)] or None, pixel_size_um=px_an, info=info)
+    sat = None
+    for k, m in context.masks.items():
+        if k.startswith("saturated_ch") and m is not None and m.shape == mask.shape:
+            sat = m.astype(bool) if sat is None else (sat | m.astype(bool))
+    save_relation_figure(cropped_planes, res, mask[r0:r1, c0:c1].astype(bool),
+                         sat[r0:r1, c0:c1] if sat is not None else None, channel_names, colors,
+                         context.metadata.get(SUMMARY_KEY, {}).get(roi_name, {}),
+                         out_dir / f"{stem}_relations.png", title=f"{well_id} {roi_name}")
+    return [f"{stem}_residual.tif", f"{stem}_relations.png"]
 
 
 def _selection_names(steps) -> list[str]:
@@ -968,6 +1003,8 @@ class WellBatchRunner:
                 n_particles += step_result.info.get("n_particles", 0)
             elif isinstance(step, IntensityMeasurement):
                 db.save_intensity_measurements(image_id, step_result.measurements)
+            elif isinstance(step, ChannelRelation):
+                db.save_channel_relations(image_id, step_result.measurements)
             elif isinstance(step, ColocalizationAnalysis):
                 db.save_colocalization(
                     image_id, step_result.measurements,

@@ -214,6 +214,8 @@ class ParticleAnalysis(Step):
         # each piece was cut from (see _edge_columns).
         full_labels = label_image
         roi = context.masks.get(self.roi_mask) if self.roi_mask else None
+        # which selection particles_ch{c} belongs to now (ChannelRelation measures only its own selection's)
+        context.metadata.setdefault("particles_roi", {})[self.channel] = self.roi_mask
         if roi is not None:
             label_image = label_image * roi.astype(label_image.dtype)
 

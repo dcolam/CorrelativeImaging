@@ -186,6 +186,32 @@ CREATE TABLE IF NOT EXISTS selections (
     crop_files      TEXT    -- JSON list of the crop files written
 );
 
+-- How the channels relate inside a selection (ChannelRelation): per object (the selection itself = label 0, or a
+-- particle of object_channel with ParticleAnalysis' label) x channel x other channel. copy_fraction = the bounded copy
+-- of other_channel fitted over the selection (raw intensity ratio); residual_* = the channel's own signal beyond the
+-- copy of all other channels, in SNR units ((value - background) / noise).
+CREATE TABLE IF NOT EXISTS channel_relations (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    image_id            INTEGER NOT NULL REFERENCES images(id),
+    roi_mask            TEXT,
+    object_channel      TEXT,
+    object_label        INTEGER,
+    channel             TEXT,
+    other_channel       TEXT,
+    n_px                INTEGER,
+    copy_fraction       REAL,
+    slope               REAL,
+    pearson_r           REAL,
+    texture_r           REAL,
+    explained_fraction  REAL,
+    residual_median_snr REAL,
+    residual_p75_snr    REAL,
+    median_snr          REAL,
+    background          REAL,
+    background_source   TEXT,
+    noise               REAL
+);
+
 CREATE TABLE IF NOT EXISTS pipeline_runs (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     image_id        INTEGER REFERENCES images(id),
@@ -552,6 +578,29 @@ class ResultsDB:
         self._con.commit()
 
     # ------------------------------------------------------------------
+    # Channel relations (own signal vs copy of the other channels)
+    # ------------------------------------------------------------------
+
+    _RELATION_COLS = ["roi_mask", "object_channel", "object_label", "channel", "other_channel", "n_px",
+                      "copy_fraction", "slope", "pearson_r", "texture_r", "explained_fraction",
+                      "residual_median_snr", "residual_p75_snr", "median_snr", "background",
+                      "background_source", "noise"]
+
+    def save_channel_relations(self, image_id: int, df: pd.DataFrame) -> None:
+        if df is None or df.empty:
+            return
+        cols = self._RELATION_COLS
+        rows = [(image_id, *(None if pd.isna(v) else (v.item() if hasattr(v, "item") else v)
+                             for v in (r.get(c) for c in cols)))
+                for _, r in df.iterrows()]
+        self._con.executemany(
+            f"INSERT INTO channel_relations (image_id, {', '.join(cols)}) "  # noqa: S608
+            f"VALUES ({', '.join('?' * (len(cols) + 1))})",
+            rows,
+        )
+        self._con.commit()
+
+    # ------------------------------------------------------------------
     # Pipeline run log
     # ------------------------------------------------------------------
 
@@ -618,7 +667,7 @@ class ResultsDB:
             for table in (
                 "particle_measurements", "intensity_measurements",
                 "colocalization_results", "colocalization_per_particle",
-                "channel_levels", "selections", "pipeline_runs",
+                "channel_levels", "selections", "channel_relations", "pipeline_runs",
             ):
                 cols = [c[1] for c in src.execute(f"PRAGMA table_info({table})") if c[1] != "id"]
                 if not cols:
@@ -655,6 +704,7 @@ class ResultsDB:
             "colocalization_per_particle",
             "channel_levels",
             "selections",
+            "channel_relations",
         ]
         for table in tables:
             df = pd.read_sql_query(f"SELECT * FROM {table}", self._con)  # noqa: S608

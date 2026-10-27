@@ -49,6 +49,7 @@ from qtpy.QtWidgets import (
 
 from correlative_imaging.diagnostics import CHANNEL_COLOR_CHOICES as _CHANNEL_COLOR_CHOICES
 from correlative_imaging.diagnostics import CHANNEL_COLOR_RGB as _CHANNEL_COLOR_RGB
+from correlative_imaging.pipeline.relations import RESIDUAL_PREFIX, parse_residual_key, topography_contours
 from correlative_imaging.diagnostics import default_channel_color as _default_channel_color
 from correlative_imaging.batch import BF_FOCUS_SAVED
 from correlative_imaging.io import supported_extensions
@@ -4391,14 +4392,16 @@ class CombineTab(QWidget):
 
     def set_channels(self, names: list[str]) -> None:
         self._channel_names = names
-        for row in range(self._table.rowCount()):
-            for col in [0, 1]:
-                combo = self._table.cellWidget(row, col)
-                if isinstance(combo, QComboBox):
-                    prev = combo.currentIndex()
-                    combo.clear()
-                    combo.addItems([f"{i}: {n}" for i, n in enumerate(names)])
-                    combo.setCurrentIndex(min(prev, len(names) - 1))
+        labels = [f"{i}: {n}" for i, n in enumerate(names)]
+        for table in (self._table, self._rel_pairs):
+            for row in range(table.rowCount()):
+                for col in [0, 1]:
+                    combo = table.cellWidget(row, col)
+                    if isinstance(combo, QComboBox):
+                        prev = combo.currentIndex()
+                        combo.clear()
+                        combo.addItems(labels)
+                        combo.setCurrentIndex(min(prev, len(names) - 1))
 
     def _build(self) -> None:
         lay = QVBoxLayout(self)
@@ -4430,6 +4433,7 @@ class CombineTab(QWidget):
         btn_row.addWidget(clear_btn)
         cl.addLayout(btn_row)
         lay.addWidget(box)
+        lay.addWidget(self._build_relations_box())
 
         note = QLabel(
             "Each pair computes Manders M1 & M2, Pearson r, 90° rotation control, "
@@ -4440,6 +4444,103 @@ class CombineTab(QWidget):
         note.setWordWrap(True)
         lay.addWidget(note)
         lay.addStretch()
+
+    def _build_relations_box(self) -> QGroupBox:
+        """In-cell channel relations (ChannelRelation): per selection, each channel's own signal beyond a bounded
+        copy of the other channels (bleed-through), plus pixel correlations per particle."""
+        box = QGroupBox("In-cell channel relations: own signal vs copy of the other channels")
+        v = QVBoxLayout(box)
+        self._rel_cb = QCheckBox("Measure per ROI selection (not for the whole image)")
+        self._rel_cb.setChecked(True)
+        self._rel_cb.setToolTip(
+            "Inside each selection (e.g. the hole) every channel is put on an SNR scale\n"
+            "((value - background band around the selection) / noise of the whole image outside particles)\n"
+            "and fitted as a non-negative copy of the other channels, each copy at most the limit below.\n"
+            "What the copy does not explain is the channel's own signal: the residual (saved per selection\n"
+            "and per particle in the table channel_relations, shown as residual/<channel> layers in the preview,\n"
+            "and written as <well>_<roi>_crop_residual.tif + _relations.png with the diagnostic crops).\n"
+            "A bleed-through mirrors the other channel 1:1 and leaves ~0; a cell of its own leaves a positive residual.")
+        v.addWidget(self._rel_cb)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Max copy of another channel:"))
+        self._rel_max = QDoubleSpinBox(); self._rel_max.setRange(0, 100); self._rel_max.setDecimals(1)
+        self._rel_max.setValue(5.0); self._rel_max.setSuffix(" %")
+        self._rel_max.setToolTip("Upper bound of any copy, as % of the other channel's raw intensity\n"
+                                 "(above background). Larger = more of a channel may be called bleed-through.")
+        row.addWidget(self._rel_max)
+        row.addWidget(QLabel("Background band:"))
+        self._rel_band_in = QDoubleSpinBox(); self._rel_band_in.setRange(0, 100); self._rel_band_in.setValue(2.0)
+        self._rel_band_in.setSuffix(" µm")
+        self._rel_band_out = QDoubleSpinBox(); self._rel_band_out.setRange(0.5, 200); self._rel_band_out.setValue(6.0)
+        self._rel_band_out.setSuffix(" µm")
+        for w in (self._rel_band_in, self._rel_band_out):
+            w.setToolTip("Background = median of this band outside the selection, outside all particles\n"
+                         "(twice as wide, then the whole image, when fewer than 50 pixels are left).")
+        row.addWidget(self._rel_band_in); row.addWidget(QLabel("to")); row.addWidget(self._rel_band_out)
+        row.addWidget(QLabel("Texture σ:"))
+        self._rel_sigma = QDoubleSpinBox(); self._rel_sigma.setRange(0.1, 20); self._rel_sigma.setValue(1.0)
+        self._rel_sigma.setSuffix(" µm")
+        self._rel_sigma.setToolTip("texture_r: the pixel correlation after removing the smooth part (Gaussian of this\n"
+                                   "size) - do specks and edges coincide, as in a mirror?")
+        row.addWidget(self._rel_sigma); row.addStretch()
+        v.addLayout(row)
+        v.addWidget(QLabel("Limits per pair (override the max copy):"))
+        self._rel_pairs = QTableWidget(0, 3)
+        self._rel_pairs.setHorizontalHeaderLabels(["Channel …", "… holds at most this much of", "Max copy"])
+        self._rel_pairs.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self._rel_pairs.setMaximumHeight(110)
+        self._rel_pairs.setToolTip("E.g. GFP holds at most 2 % of mCherry: a tighter bound where the crosstalk is\n"
+                                   "known to be small, so real GFP is not explained away as a copy of mCherry.")
+        v.addWidget(self._rel_pairs)
+        b = QHBoxLayout()
+        add = QPushButton("+ Add limit"); add.clicked.connect(lambda: self._add_rel_pair())
+        rm = QPushButton("− Remove selected")
+        rm.clicked.connect(lambda: self._rel_pairs.removeRow(self._rel_pairs.currentRow())
+                           if self._rel_pairs.currentRow() >= 0 else None)
+        b.addWidget(add); b.addWidget(rm); b.addStretch()
+        v.addLayout(b)
+        for w in (self._rel_max, self._rel_band_in, self._rel_band_out, self._rel_sigma, self._rel_pairs, add, rm):
+            self._rel_cb.toggled.connect(w.setEnabled)
+        return box
+
+    def _add_rel_pair(self, into: int = 0, frm: int = 1, pct: float = 2.0) -> None:
+        r = self._rel_pairs.rowCount()
+        labels = [f"{i}: {n}" for i, n in enumerate(self._channel_names)] or ["0", "1"]
+        self._rel_pairs.insertRow(r)
+        a = QComboBox(); a.addItems(labels); a.setCurrentIndex(min(into, len(labels) - 1))
+        f = QComboBox(); f.addItems(labels); f.setCurrentIndex(min(frm, len(labels) - 1))
+        m = QDoubleSpinBox(); m.setRange(0, 100); m.setDecimals(2); m.setValue(pct); m.setSuffix(" %")
+        self._rel_pairs.setCellWidget(r, 0, a)
+        self._rel_pairs.setCellWidget(r, 1, f)
+        self._rel_pairs.setCellWidget(r, 2, m)
+
+    def get_relation_step(self, roi_mask_key: str = "") -> list[dict]:
+        """The ChannelRelation step for one selection ([] when off or for the whole image)."""
+        if not self._rel_cb.isChecked() or not roi_mask_key:
+            return []
+        pairs = []
+        for r in range(self._rel_pairs.rowCount()):
+            a, f, m = (self._rel_pairs.cellWidget(r, c) for c in range(3))
+            if isinstance(a, QComboBox) and isinstance(f, QComboBox) and a.currentIndex() != f.currentIndex():
+                pairs.append([a.currentIndex(), f.currentIndex(), m.value() / 100.0])
+        return [{"type": "ChannelRelation", "roi_mask": roi_mask_key, "channels": None,
+                 "max_copy": self._rel_max.value() / 100.0, "max_copy_pairs": pairs,
+                 "band_um": [self._rel_band_in.value(), self._rel_band_out.value()],
+                 "margin_um": 1.0, "texture_sigma_um": self._rel_sigma.value(), "z_projection": "max"}]
+
+    def set_relations(self, pl_dict: dict) -> None:
+        """Restore from a loaded pipeline; one without the step shows it off (old pipelines stay unchanged)."""
+        s = next((x for x in pl_dict.get("steps", []) if x.get("type") == "ChannelRelation"), None)
+        self._rel_cb.setChecked(s is not None)
+        self._rel_pairs.setRowCount(0)
+        if s is None:
+            return
+        self._rel_max.setValue(100.0 * float(s.get("max_copy", 0.05)))
+        bi, bo = (s.get("band_um") or [2.0, 6.0])[:2]
+        self._rel_band_in.setValue(float(bi)); self._rel_band_out.setValue(float(bo))
+        self._rel_sigma.setValue(float(s.get("texture_sigma_um", 1.0)))
+        for into, frm, mx in s.get("max_copy_pairs") or []:
+            self._add_rel_pair(int(into), int(frm), 100.0 * float(mx))
 
     def _add_pair(self) -> None:
         r      = self._table.rowCount()
@@ -4536,6 +4637,7 @@ class CombineTab(QWidget):
         the flat step list) since primary/secondary/dilation/z-projection
         are shared config, not per-selection."""
         steps = pl_dict.get("steps", [])
+        self.set_relations(pl_dict)
         self._table.setRowCount(0)
         seen: set[tuple] = set()
         for s in steps:
@@ -4615,6 +4717,12 @@ def _preview_details(step, result) -> list[str]:
             msg += (f"; vs whole-image threshold: {int((iou >= 0.5).sum())} match (IoU >= 0.5), "
                     f"{int(((iou > 0) & (iou < 0.5)).sum())} partly, {int((iou == 0).sum())} not found there")
         out.append(msg)
+    elif t == "ChannelRelation" and info.get("summary"):
+        out.append(f"background: {info.get('background_source')}; {info.get('n_objects', 0) - 1} particles related")
+        for ch, d in info["summary"].items():
+            copy = ", ".join(f"{100 * v:.2f}% of {o}" for o, v in d["copy"].items())
+            out.append(f"{ch}: copy {copy}; explains {100 * d['explained_fraction']:.0f}%; own signal (residual "
+                       f"median) {d['residual_median_snr']:+.1f} SNR  [bg {d['background']:.4g}, noise {d['noise']:.4g}]")
     return out
 
 
@@ -4657,6 +4765,11 @@ def _step_repr(s: dict) -> str:
               if s.get("outside_particles") else "")
         return (f"IntensityMeasurement(ch{s.get('channel')}, {s.get('z_projection')}"
                 f"{_metrics_suffix(s.get('metrics'), INTENSITY_METRIC_CHOICES)}{bg})")
+    if t == "ChannelRelation":
+        pairs = "".join(f", ch{int(a)}≤{100 * float(m):g}% of ch{int(b)}" for a, b, m in s.get("max_copy_pairs") or [])
+        band = s.get("band_um") or [2.0, 6.0]
+        return (f"ChannelRelation(own signal vs copy of the other channels, copy ≤{100 * float(s.get('max_copy', 0.05)):g}%"
+                f"{pairs}, background band {band[0]:g}-{band[1]:g} µm)")
     if t == "ColocalizationAnalysis":
         return (f"ColocalizationAnalysis(ch{s.get('primary_channel')}↔ch{s.get('secondary_channel')}, "
                 f"dilation={s.get('dilation_um')}µm, {s.get('z_projection')})")
@@ -5759,7 +5872,11 @@ class RunTab(QWidget):
                                 colormap=cmap, scale=scale,
                             )
                             last_preproc_layer[i] = lyr
+                if type(step_obj).__name__ == "ChannelRelation":
+                    self._show_relation_layers(step_obj, result, current_image, context, img_data, _color_for)
                 for mk, mask in result.masks.items():
+                    if mk.startswith(RESIDUAL_PREFIX):
+                        continue    # shown by _show_relation_layers
                     if mk.startswith("saturated_ch"):
                         # clipped pixels: one magenta layer per channel, replaced when a later step moves them to a
                         # new grid (binning / Z-projection); shown only if the channel has any
@@ -5833,6 +5950,52 @@ class RunTab(QWidget):
             self._log(traceback.format_exc())
             self._preview_btn.setEnabled(True)
             self._preview_btn.setText("Run pipeline on sample image (shows in napari)")
+
+    def _show_relation_layers(self, step, result, current_image, context, img_data, color_for) -> None:
+        """ChannelRelation in the preview: per channel the residual (own signal beyond the copy of the other channels,
+        SNR; black = nothing beyond the copy, the channel's colour = more, violet = less) and the topography (contour
+        lines of the channel inside the selection on its own range). Hidden; tick them in the layer list."""
+        import numpy as np
+        from napari.utils.colormaps import Colormap
+
+        px = context.pixel_size_um
+        scale = [px, px]
+        roi_key = step.roi_mask
+        sel = context.masks.get(roi_key) if roi_key else None
+        mip = current_image.max(axis=1) if current_image.ndim == 4 else current_image
+        names = img_data.channel_names
+        for mk, res in result.masks.items():
+            parsed = parse_residual_key(mk)
+            if parsed is None:
+                continue
+            c, roi_name = parsed
+            ch = names[c] if c < len(names) else f"ch{c}"
+            col = _CHANNEL_COLOR_RGB.get(color_for(c), (1.0, 1.0, 1.0))
+            neg = (0.0, 0.8, 0.8) if col == (1.0, 0.0, 1.0) else (0.85, 0.3, 0.85)
+            cmap = Colormap([[*neg, 1.0], [0, 0, 0, 1.0], [*col, 1.0]], controls=[0.0, 0.5, 1.0],
+                            name=f"residual_{ch}")
+            vals = res[sel.astype(bool)] if sel is not None else res.ravel()
+            top = float(np.percentile(np.abs(vals), 99)) if vals.size else 1.0
+            top = max(top, 3.0)
+            name = f"residual/{ch}@{roi_name}"
+            if name in self._viewer.layers:
+                self._viewer.layers.remove(name)
+            self._viewer.add_image(res, name=name, colormap=cmap, contrast_limits=(-top, top), scale=scale,
+                                   blending="additive", visible=False)
+            self._log(f"      layer {name}: ±{top:.3g} SNR (99th percentile of |residual| in the selection)")
+            if sel is None:
+                continue
+            sat = context.masks.get(f"saturated_ch{c}")
+            lines = topography_contours(mip[c], sel, 7, exclude=sat.astype(bool) if sat is not None else None)
+            if not lines:
+                continue
+            tname = f"topography/{ch}@{roi_name}"
+            if tname in self._viewer.layers:
+                self._viewer.layers.remove(tname)
+            widths = [0.3 + 0.9 * lv for lv, _ in lines]
+            self._viewer.add_shapes([pts for _, pts in lines], shape_type="path", name=tname,
+                                    edge_color=[(*col, 0.35 + 0.65 * lv) for lv, _ in lines],
+                                    edge_width=widths, scale=scale, visible=False)
 
     def _open_diag_dialog(self) -> None:
         self._diag_dialog.exec_() if hasattr(self._diag_dialog, "exec_") else self._diag_dialog.exec()
@@ -6768,6 +6931,7 @@ class CorrelativeImagingWidget(QWidget):
                 steps.extend(p.get_analysis_steps(sel.mask_key))
             for coloc in self._combine_tab.get_coloc_steps(sel.mask_key):
                 steps.append(coloc)
+            steps.extend(self._combine_tab.get_relation_step(sel.mask_key))
 
         return {
             "name": "pipeline",
@@ -6843,6 +7007,7 @@ class CorrelativeImagingWidget(QWidget):
             for p in panels:
                 tail.extend(p.get_analysis_steps(sel.mask_key))
             tail.extend(self._combine_tab.get_coloc_steps(sel.mask_key))
+            tail.extend(self._combine_tab.get_relation_step(sel.mask_key))
             per_sel_tail.append((sel, tail))
 
         def _fn(well) -> tuple[dict, list[str]]:

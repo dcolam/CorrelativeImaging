@@ -10,6 +10,7 @@ from .preprocess import (
 from .segment import AutoThreshold, ExtractROI, WatershedSplit
 from .analyze import ParticleAnalysis
 from .colocalize import ColocalizationAnalysis
+from .relations import ChannelRelation
 from .ilastik import ZProjection, IlastikROI
 from .saturation import SaturationMask
 
@@ -35,6 +36,7 @@ __all__ = [
     # Analysis
     "ParticleAnalysis",
     "ColocalizationAnalysis",
+    "ChannelRelation",
     # BF / Ilastik
     "ZProjection",
     "IlastikROI",

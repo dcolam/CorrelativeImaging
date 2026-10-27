@@ -185,3 +185,60 @@ def bbox_from_mask(mask: np.ndarray, pad_px: int = 0):
     c0 = max(0, int(xs.min()) - pad_px)
     c1 = min(w, int(xs.max()) + 1 + pad_px)
     return r0, r1, c0, c1
+
+
+def save_relation_figure(planes, residuals: dict, sel: np.ndarray, exclude, channel_names, colors, summary: dict,
+                         path, title: str = "") -> None:
+    """One row per channel inside a selection crop (ChannelRelation): its topography (filled contours on its own
+    2nd-98th percentile range inside the selection) and its residual = own signal beyond the copy of the other
+    channels (SNR, compressed: linear to ~3, logarithmic beyond; black = nothing beyond the copy, the channel's
+    colour = more, violet = less). Row 0 of the image at the top, as in the crops. Agg canvas only (no pyplot), so
+    it runs in batch worker threads/processes."""
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.colors import LinearSegmentedColormap
+    from matplotlib.figure import Figure
+    from skimage.segmentation import find_boundaries
+
+    sel = sel.astype(bool)
+    use = sel & ~exclude if exclude is not None else sel
+    chans = [c for c in range(len(planes)) if c in residuals]
+    if not chans or not use.any():
+        return
+    edge = np.nonzero(find_boundaries(sel))
+    fig = Figure(figsize=(6.2, 2.5 * len(chans) + 0.5), facecolor="black")
+    FigureCanvasAgg(fig)
+    axes = fig.subplots(len(chans), 2, squeeze=False)
+    for i, c in enumerate(chans):
+        name = channel_names[c] if c < len(channel_names) else f"ch{c}"
+        col = hex_to_rgb01(colors[c]) if c < len(colors) and str(colors[c]).startswith("#") else \
+            CHANNEL_COLOR_RGB.get(colors[c] if c < len(colors) else default_channel_color(c), (1.0, 1.0, 1.0))
+        neg = (0.0, 0.8, 0.8) if tuple(col) == (1.0, 0.0, 1.0) else (0.85, 0.3, 0.85)
+        p = np.asarray(planes[c], float)
+        lo, hi = np.percentile(p[use], [2, 98])
+        a = np.where(use, np.clip((p - lo) / max(hi - lo, 1e-9), 0, 1), np.nan)
+        ax = axes[i, 0]
+        ax.set_facecolor("black")
+        ax.contourf(a, levels=np.linspace(0, 1, 9), cmap=LinearSegmentedColormap.from_list("t", [(0, 0, 0), col]))
+        ax.contour(a, levels=np.linspace(0.125, 0.875, 7), colors="white", linewidths=0.3, alpha=0.5)
+        ax.plot(edge[1], edge[0], ",", color="yellow")
+        ax.set_xlim(-0.5, a.shape[1] - 0.5); ax.set_ylim(a.shape[0] - 0.5, -0.5); ax.set_aspect("equal")
+        ax.set_title(f"{name}: topography ({lo:.4g}-{hi:.4g})", fontsize=7, color="white")
+        r = np.asarray(residuals[c], float)
+        top = max(float(np.percentile(np.abs(r[use]), 99)), 3.0)
+        disp = np.where(sel, np.arcsinh(r / 3) / np.arcsinh(top / 3), np.nan)
+        ax = axes[i, 1]
+        ax.set_facecolor("black")
+        ax.imshow(disp, cmap=LinearSegmentedColormap.from_list("r", [neg, (0, 0, 0), col]), vmin=-1, vmax=1,
+                  interpolation="nearest")
+        ax.plot(edge[1], edge[0], ",", color="yellow")
+        d = summary.get(name, {})
+        copy = ", ".join(f"{100 * v:.1f}% {o}" for o, v in d.get("copy", {}).items())
+        ax.set_title(f"own signal (±{top:.3g} SNR); median {d.get('residual_median_snr', float('nan')):+.1f}\n"
+                     f"copy {copy}; explains {100 * d.get('explained_fraction', float('nan')):.0f}%",
+                     fontsize=6.5, color="white")
+        for ax in axes[i]:
+            ax.set_xticks([]); ax.set_yticks([])
+    if title:
+        fig.suptitle(title, fontsize=7.5, color="white")
+    fig.tight_layout()
+    fig.savefig(str(path), dpi=110, facecolor="black")
