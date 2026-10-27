@@ -191,8 +191,8 @@ def save_relation_figure(planes, residuals: dict, sel: np.ndarray, exclude, chan
                          path, title: str = "") -> None:
     """One row per channel inside a selection crop (ChannelRelation): its topography (filled contours on its own
     2nd-98th percentile range inside the selection) and its residual = own signal beyond the copy of the other
-    channels (SNR, compressed: linear to ~3, logarithmic beyond; black = nothing beyond the copy, the channel's
-    colour = more, violet = less). Row 0 of the image at the top, as in the crops. Agg canvas only (no pyplot), so
+    channels (SNR; square-root display from 3 SNR (below = black, noise) to the 99th percentile of the selection;
+    the channel's colour = more than the copy explains, violet = less). Row 0 of the image at the top, as in the crops. Agg canvas only (no pyplot), so
     it runs in batch worker threads/processes."""
     from matplotlib.backends.backend_agg import FigureCanvasAgg
     from matplotlib.colors import LinearSegmentedColormap
@@ -204,10 +204,15 @@ def save_relation_figure(planes, residuals: dict, sel: np.ndarray, exclude, chan
     chans = [c for c in range(len(planes)) if c in residuals]
     if not chans or not use.any():
         return
+    ys, xs = np.nonzero(sel)                 # the selection itself (+2 px), not the padded crop
+    box = (slice(max(ys.min() - 2, 0), ys.max() + 3), slice(max(xs.min() - 2, 0), xs.max() + 3))
+    sel, use = sel[box], use[box]
+    planes = [np.asarray(p)[box] for p in planes]
+    residuals = {c: np.asarray(r)[box] for c, r in residuals.items()}
     edge = np.nonzero(find_boundaries(sel))
-    fig = Figure(figsize=(6.2, 2.5 * len(chans) + 0.5), facecolor="black")
+    fig = Figure(figsize=(2.6 * len(chans), 5.6), facecolor="black")
     FigureCanvasAgg(fig)
-    axes = fig.subplots(len(chans), 2, squeeze=False)
+    axes = fig.subplots(2, len(chans), squeeze=False).T      # axes[i] = (topography, residual) of channel i
     for i, c in enumerate(chans):
         name = channel_names[c] if c < len(channel_names) else f"ch{c}"
         col = hex_to_rgb01(colors[c]) if c < len(colors) and str(colors[c]).startswith("#") else \
@@ -222,10 +227,10 @@ def save_relation_figure(planes, residuals: dict, sel: np.ndarray, exclude, chan
         ax.contour(a, levels=np.linspace(0.125, 0.875, 7), colors="white", linewidths=0.3, alpha=0.5)
         ax.plot(edge[1], edge[0], ",", color="yellow")
         ax.set_xlim(-0.5, a.shape[1] - 0.5); ax.set_ylim(a.shape[0] - 0.5, -0.5); ax.set_aspect("equal")
-        ax.set_title(f"{name}: topography ({lo:.4g}-{hi:.4g})", fontsize=7, color="white")
+        ax.set_title(f"{name} topography\n({lo:.4g}-{hi:.4g})", fontsize=7, color="white")
         r = np.asarray(residuals[c], float)
-        top = max(float(np.percentile(np.abs(r[use]), 99)), 3.0)
-        disp = np.where(sel, np.arcsinh(r / 3) / np.arcsinh(top / 3), np.nan)
+        top = max(float(np.percentile(np.abs(r[use]), 99)), 6.0)
+        disp = np.where(sel, np.sign(r) * np.sqrt(np.clip((np.abs(r) - 3.0) / (top - 3.0), 0, 1)), np.nan)
         ax = axes[i, 1]
         ax.set_facecolor("black")
         ax.imshow(disp, cmap=LinearSegmentedColormap.from_list("r", [neg, (0, 0, 0), col]), vmin=-1, vmax=1,
@@ -233,9 +238,9 @@ def save_relation_figure(planes, residuals: dict, sel: np.ndarray, exclude, chan
         ax.plot(edge[1], edge[0], ",", color="yellow")
         d = summary.get(name, {})
         copy = ", ".join(f"{100 * v:.1f}% {o}" for o, v in d.get("copy", {}).items())
-        ax.set_title(f"own signal (±{top:.3g} SNR); median {d.get('residual_median_snr', float('nan')):+.1f}\n"
-                     f"copy {copy}; explains {100 * d.get('explained_fraction', float('nan')):.0f}%",
-                     fontsize=6.5, color="white")
+        ax.set_title(f"own {name} (3-{top:.3g} SNR, sqrt)\nmedian {d.get('residual_median_snr', float('nan')):+.1f} SNR; "
+                     f"explains {100 * d.get('explained_fraction', float('nan')):.0f}%\ncopy {copy}",
+                     fontsize=6, color="white")
         for ax in axes[i]:
             ax.set_xticks([]); ax.set_yticks([])
     if title:

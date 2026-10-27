@@ -5838,12 +5838,12 @@ class RunTab(QWidget):
                     result = step.process(current, context)
                     if result.image is not None: current = result.image.copy()
                     context.masks.update(result.masks)
-                    yield step.name, step, result, current.copy()
+                    # the grid this step's output is on (Binning scales it): read here, the GUI may lag behind
+                    yield step.name, step, result, current.copy(), context.pixel_size_um
 
             def _on_step(args):
-                step_name, step_obj, result, current_image = args
+                step_name, step_obj, result, current_image, px = args
                 if self._viewer is None: return
-                px   = img_data.pixel_size_um
                 scale = [px, px]
                 cmap  = _STEP_COLORMAPS[step_counter[0] % len(_STEP_COLORMAPS)]
                 step_counter[0] += 1
@@ -5873,7 +5873,7 @@ class RunTab(QWidget):
                             )
                             last_preproc_layer[i] = lyr
                 if type(step_obj).__name__ == "ChannelRelation":
-                    self._show_relation_layers(step_obj, result, current_image, context, img_data, _color_for)
+                    self._show_relation_layers(step_obj, result, current_image, context, img_data, _color_for, px)
                 for mk, mask in result.masks.items():
                     if mk.startswith(RESIDUAL_PREFIX):
                         continue    # shown by _show_relation_layers
@@ -5951,14 +5951,13 @@ class RunTab(QWidget):
             self._preview_btn.setEnabled(True)
             self._preview_btn.setText("Run pipeline on sample image (shows in napari)")
 
-    def _show_relation_layers(self, step, result, current_image, context, img_data, color_for) -> None:
+    def _show_relation_layers(self, step, result, current_image, context, img_data, color_for, px) -> None:
         """ChannelRelation in the preview: per channel the residual (own signal beyond the copy of the other channels,
         SNR; black = nothing beyond the copy, the channel's colour = more, violet = less) and the topography (contour
         lines of the channel inside the selection on its own range). Hidden; tick them in the layer list."""
         import numpy as np
         from napari.utils.colormaps import Colormap
 
-        px = context.pixel_size_um
         scale = [px, px]
         roi_key = step.roi_mask
         sel = context.masks.get(roi_key) if roi_key else None
