@@ -3681,6 +3681,31 @@ class ChannelsTab(QWidget):
             "Per-channel steps (background subtraction, blur, scaling) stay in the "
             "<b>Channels</b> tab, since each channel can be set up differently."
         ))
+        sat_box = QGroupBox("0. Saturation")
+        sat_lay = QHBoxLayout(sat_box)
+        self._sat_cb = QCheckBox("Leave clipped pixels out of thresholds and measurements")
+        self._sat_cb.setChecked(True)
+        self._sat_cb.setToolTip(
+            "Finds pixels at the camera's maximum on the raw image (any plane of the Z range),\n"
+            "before binning. Their true value is unknown, so they do not set thresholds and are\n"
+            "left out of every mean, median, spread and background (max and sum keep them).\n"
+            "They stay part of their object. Counts are saved per particle and selection\n"
+            "(saturated_px); the masks show in the single-image preview as saturated_ch*."
+        )
+        self._sat_level = QDoubleSpinBox(); self._sat_level.setRange(0, 1e9); self._sat_level.setDecimals(0)
+        self._sat_level.setSpecialValueText("detector max")
+        self._sat_level.setToolTip("Value at which a pixel counts as clipped; 'detector max' = 65535 for 16-bit data.")
+        self._sat_grow = QSpinBox(); self._sat_grow.setRange(0, 20); self._sat_grow.setValue(2); self._sat_grow.setSuffix(" px")
+        self._sat_grow.setToolTip("Grow the clipped area by this many pixels (on the analysis grid) to cover the blur halo.")
+        for w in (self._sat_level, self._sat_grow):
+            self._sat_cb.toggled.connect(w.setEnabled)
+        sat_lay.addWidget(self._sat_cb)
+        sat_lay.addWidget(QLabel("at"))
+        sat_lay.addWidget(self._sat_level)
+        sat_lay.addWidget(QLabel("grow by"))
+        sat_lay.addWidget(self._sat_grow)
+        sat_lay.addStretch()
+
         bin_box = QGroupBox("1. Binning")
         bin_lay = QHBoxLayout(bin_box)
         zbox = QGroupBox("2. Z-projection")
@@ -3740,6 +3765,7 @@ class ChannelsTab(QWidget):
         for w in (self._zproj_from, self._zproj_to):
             w.valueChanged.connect(self._update_zdepth_label)
         top_row.addStretch()
+        pre_lay.addWidget(sat_box)
         pre_lay.addWidget(bin_box)
         pre_lay.addWidget(zbox)
         pre_lay.addStretch()
@@ -3757,6 +3783,19 @@ class ChannelsTab(QWidget):
             return int(self._bin_combo.currentText().split("×")[0])
         except ValueError:
             return 1
+
+    def get_saturation_step(self) -> dict | None:
+        """The saturation step to put before everything else (on the raw image), or None when it is off."""
+        if not self._sat_cb.isChecked():
+            return None
+        return {"type": "SaturationMask", "level": float(self._sat_level.value()), "grow_px": int(self._sat_grow.value())}
+
+    def set_saturation(self, step: dict | None) -> None:
+        """Pipelines saved before the option existed have no such step: shown off, so they run as they did."""
+        self._sat_cb.setChecked(step is not None)
+        if step:
+            self._sat_level.setValue(float(step.get("level", 0.0) or 0.0))
+            self._sat_grow.setValue(int(step.get("grow_px", 2)))
 
     def get_binning_step(self) -> dict | None:
         """The whole-image binning step to put first in the pipeline, or None
@@ -3910,6 +3949,7 @@ class ChannelsTab(QWidget):
         sample image already loaded, so channel count/names are known)."""
         steps = pl_dict.get("steps", [])
         # Whole-image Z-projection (channel == -1), if present.
+        self.set_saturation(next((s for s in steps if s.get("type") == "SaturationMask"), None))
         self.set_binning(next((s for s in steps if s.get("type") == "Binning"), None))
         zproj = next((s for s in steps if s.get("type") == "ZProjection"), None)
         self.set_zprojection(zproj)
@@ -4542,9 +4582,49 @@ def _metrics_suffix(selected: list[str] | None, all_choices: list[str]) -> str:
     return f", metrics={','.join(selected)}"
 
 
+def _preview_details(step, result) -> list[str]:
+    """Short readout of what a step measured, for the single-image preview log: clipped pixels, background SD vs
+    robust SD, and per particle the clipped pixels and the link to the whole-image threshold."""
+    t = type(step).__name__
+    info, df = result.info, result.measurements
+    out: list[str] = []
+    if t == "SaturationMask":
+        lvl = info.get("saturation_level")
+        counts = info.get("saturated_raw_px", {})
+        out.append("clipped raw pixels (all planes): " + ", ".join(f"{k} {v}" for k, v in counts.items())
+                   + (f"  at {lvl:.0f}" if lvl is not None else "  (level undetermined: float data above 16 bit)"))
+    elif df is not None and not df.empty and t == "IntensityMeasurement":
+        for _, r in df.iterrows():
+            parts = [f"{r['roi_mask']}:"]
+            if "median_intensity" in r:
+                parts.append(f"median {r['median_intensity']:.4g}")
+            if "std_intensity" in r:
+                parts.append(f"SD {r['std_intensity']:.4g}")
+            if "robust_sd_intensity" in r:
+                parts.append(f"robust SD {r['robust_sd_intensity']:.4g}")
+            if r.get("saturated_px"):
+                parts.append(f"{int(r['saturated_px'])} clipped px left out")
+            out.append(" ".join(parts))
+    elif df is not None and not df.empty and t == "ParticleAnalysis":
+        n_sat = int(df["saturated_px"].fillna(0).sum()) if "saturated_px" in df else 0
+        msg = f"{len(df)} particles"
+        if n_sat:
+            msg += f", {int((df['saturated_px'] > 0).sum())} with clipped px ({n_sat} px)"
+        if "whole_image_iou" in df and df["whole_image_iou"].notna().any():
+            iou = df["whole_image_iou"]
+            msg += (f"; vs whole-image threshold: {int((iou >= 0.5).sum())} match (IoU >= 0.5), "
+                    f"{int(((iou > 0) & (iou < 0.5)).sum())} partly, {int((iou == 0).sum())} not found there")
+        out.append(msg)
+    return out
+
+
 def _step_repr(s: dict) -> str:
     """One-line human-readable summary of a single pipeline step dict."""
     t = s.get("type", "?")
+    if t == "SaturationMask":
+        lvl = s.get("level") or "detector maximum"
+        return (f"SaturationMask(clipped at {lvl}, grown {s.get('grow_px', 2)} px; left out of thresholds "
+                f"and measurements)")
     if t == "Binning":
         return (f"Binning({s.get('factor')}×, {s.get('method')}, all channels, "
                 f"pixel size scaled)")
@@ -4607,7 +4687,7 @@ def _format_pipeline_summary(pl_dict: dict, well=None, bf_cfg: dict | None = Non
     # Whole-image steps run once, before anything per-channel. Binning used to
     # fall through to the ROI grouping below and appear under "[whole image]",
     # which read as if it were an ROI-restricted step.
-    global_types = {"Binning", "ZProjection"}
+    global_types = {"SaturationMask", "Binning", "ZProjection"}
     per_ch_types = {"BackgroundSubtraction", "GaussianBlur", "Normalize",
                     "BlackLevelNormalization", "AutoThreshold", "WatershedSplit"}
     global_steps = [s for s in steps if s["type"] in global_types]
@@ -5680,6 +5760,20 @@ class RunTab(QWidget):
                             )
                             last_preproc_layer[i] = lyr
                 for mk, mask in result.masks.items():
+                    if mk.startswith("saturated_ch"):
+                        # clipped pixels: one magenta layer per channel, replaced when a later step moves them to a
+                        # new grid (binning / Z-projection); shown only if the channel has any
+                        ci = int(mk[len("saturated_ch"):])
+                        ch = img_data.channel_names[ci] if ci < len(img_data.channel_names) else mk
+                        name = f"saturated/{ch}"
+                        if name in self._viewer.layers:
+                            self._viewer.layers.remove(name)
+                        self._viewer.add_image(
+                            mask.astype(float), name=name, colormap="magenta", blending="additive",
+                            opacity=0.6, scale=scale, contrast_limits=(0, 1), visible=bool(mask.any()),
+                            metadata={"mask": True},
+                        )
+                        continue
                     if int(mask.max()) > 1:
                         self._viewer.add_labels(
                             mask.astype(int), name=f"{step_name}/{mk}", scale=scale,
@@ -5699,11 +5793,15 @@ class RunTab(QWidget):
                 thr = result.info.get("threshold_value")
                 blk = result.info.get("black_level")
                 if thr is not None:
-                    self._log(f"  ✓ {step_name}  (threshold = {thr:.4g})")
+                    n_sat = result.info.get("saturated_px", 0)
+                    self._log(f"  ✓ {step_name}  (threshold = {thr:.4g}"
+                              + (f"; {n_sat} clipped px left out of it" if n_sat else "") + ")")
                 elif blk is not None:
                     self._log(f"  ✓ {step_name}  (black level = {blk:.4g})")
                 else:
                     self._log(f"  ✓ {step_name}")
+                for line in _preview_details(step_obj, result):
+                    self._log(f"      {line}")
 
             def _on_done():
                 # Default display (#23): the last pre-threshold per-channel
@@ -6632,6 +6730,11 @@ class CorrelativeImagingWidget(QWidget):
         sels   = self._roi_tab.get_selections()
         steps: list[dict] = []
 
+        # ── 0. Saturation flags on the raw image (first: binning would hide them) ──
+        sat = self._channels_tab.get_saturation_step()
+        if sat:
+            steps.append(sat)
+
         # ── 0a. Binning (whole image, first — everything after works on the
         # smaller array; context.pixel_size_um is scaled so µm stay correct) ──
         binning = self._channels_tab.get_binning_step()
@@ -6718,6 +6821,7 @@ class CorrelativeImagingWidget(QWidget):
         dataclasses, which are safe to read from any thread.
         """
         panels = self._channels_tab.get_panels()
+        sat = self._channels_tab.get_saturation_step()      # raw image, before binning
         binning = self._channels_tab.get_binning_step()     # whole-image, first
         zproj = self._channels_tab.get_zprojection_step()   # whole-image, once
         preprocess_steps: list[dict] = []
@@ -6742,7 +6846,7 @@ class CorrelativeImagingWidget(QWidget):
             per_sel_tail.append((sel, tail))
 
         def _fn(well) -> tuple[dict, list[str]]:
-            steps = (([binning] if binning else []) + ([zproj] if zproj else [])
+            steps = (([sat] if sat else []) + ([binning] if binning else []) + ([zproj] if zproj else [])
                      + list(preprocess_steps) + list(segment_steps))
             missing: list[str] = []
             for sel, tail in per_sel_tail:

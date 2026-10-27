@@ -13,6 +13,7 @@ from pathlib import Path
 import numpy as np
 
 from .base import PipelineContext, Step, StepResult, register_step
+from .saturation import RAW_KEY, emit_masks
 
 log = logging.getLogger(__name__)
 
@@ -103,7 +104,13 @@ class ZProjection(Step):
         # mixed-rank array.)
         sub = select_z_range(image, self.z_start, self.z_stop, axis=1)
         out = fn(sub, axis=1)
-        return StepResult(image=out.astype(image.dtype, copy=False))
+        # Saturation flags: clipped in any plane of the projected range (same range as the image).
+        sat_masks = {}
+        raw = context.metadata.get(RAW_KEY)
+        if raw is not None and raw.ndim == 4:
+            context.metadata[RAW_KEY] = select_z_range(raw, self.z_start, self.z_stop, axis=1).any(axis=1)
+            sat_masks = emit_masks(context)
+        return StepResult(image=out.astype(image.dtype, copy=False), masks=sat_masks)
 
 
 # ──────────────────────────────────────────────────────────────────────────────

@@ -9,6 +9,7 @@ import numpy as np
 from scipy.ndimage import gaussian_filter
 
 from .base import PipelineContext, Step, StepResult, register_step
+from .saturation import RAW_KEY, bin_any, emit_masks
 
 log = logging.getLogger(__name__)
 
@@ -104,8 +105,14 @@ class Binning(Step):
         context.metadata["binning_factor"] = (
             float(context.metadata.get("binning_factor", 1.0)) * f
         )
+        # The saturation flags follow the image onto the binned grid: a bin is clipped if any of its pixels is.
+        sat_masks = {}
+        if context.metadata.get(RAW_KEY) is not None:
+            context.metadata[RAW_KEY] = bin_any(context.metadata[RAW_KEY], f)
+            sat_masks = emit_masks(context)
         return StepResult(
             image=binned,
+            masks=sat_masks,
             info={"factor": f, "method": self.method,
                   "shape": list(binned.shape),
                   "pixel_size_um": context.pixel_size_um},

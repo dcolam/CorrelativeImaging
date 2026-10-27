@@ -247,9 +247,17 @@ def test_whole_image_controls_still_drive_the_pipeline(qapp):
     ch._zproj_to.setValue(9)
 
     steps = w.build_pipeline_dict()["steps"]
-    assert [s["type"] for s in steps[:2]] == ["Binning", "ZProjection"]
-    assert steps[0]["factor"] == 4
-    assert (steps[1]["z_start"], steps[1]["z_stop"]) == (2, 9)
+    # the saturation flags come first: they must see the raw pixels, before binning averages them away
+    assert [s["type"] for s in steps[:3]] == ["SaturationMask", "Binning", "ZProjection"]
+    assert steps[1]["factor"] == 4
+    assert (steps[2]["z_start"], steps[2]["z_stop"]) == (2, 9)
+    # off -> gone; a loaded pipeline without the step shows it off (runs as it did)
+    ch._sat_cb.setChecked(False)
+    assert w.build_pipeline_dict()["steps"][0]["type"] == "Binning"
+    ch.set_saturation({"type": "SaturationMask", "level": 4095, "grow_px": 3})
+    assert ch.get_saturation_step() == {"type": "SaturationMask", "level": 4095.0, "grow_px": 3}
+    ch.set_saturation(None)
+    assert ch.get_saturation_step() is None
     # and they live on the Preprocessing page, not the Channels page
     assert ch._bin_combo.parent() is not None
     assert w._tabs.tabText(3) == "Preprocessing"

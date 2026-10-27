@@ -11,6 +11,7 @@ from skimage.measure import regionprops_table
 
 from .base import PipelineContext, Step, StepResult, register_step
 from .analyze import foreground_mask, ring_stats
+from .saturation import any_saturated, saturated
 from .segment import _project, channel_mask
 
 _COLOC_PROPS = [
@@ -122,6 +123,9 @@ class ColocalizationAnalysis(Step):
 
         # --- Per-particle colocalization ---
         dilation_px = int(round(self.dilation_um / px)) if self.dilation_um > 0 else 0
+        # The secondary channel's clipped pixels (SaturationMask) are left out of its mean / median / spread inside
+        # the particle (max keeps them); counted in secondary_saturated_px.
+        sat_s = saturated(context, self.secondary_channel, ch_s.shape)
         rows: list[dict] = []
         for particle_label in np.unique(primary_labels):
             if particle_label == 0:
@@ -131,20 +135,21 @@ class ColocalizationAnalysis(Step):
                 particle_mask = binary_dilation(particle_mask, iterations=dilation_px)
             secondary_in_mask = ch_s * particle_mask
             n_secondary_px = int((secondary_in_mask > 0).sum())
+            use = particle_mask & ~sat_s if sat_s is not None else particle_mask
+            v = ch_s[use]
             rows.append({
                 "primary_label": int(particle_label),
                 "primary_area_um2": float(particle_mask.sum()) * px ** 2,
                 "n_secondary_pixels": n_secondary_px,
-                "secondary_mean_intensity": float(secondary_in_mask[particle_mask].mean())
-                    if particle_mask.any() else 0.0,
+                "secondary_mean_intensity": float(v.mean()) if v.size else (0.0 if not particle_mask.any() else float("nan")),
                 "secondary_max_intensity": float(ch_s[particle_mask].max())
                     if particle_mask.any() else 0.0,
                 # robust to a few bright pixels (a speck) inside the particle, and the spread
-                "secondary_median_intensity": float(np.median(ch_s[particle_mask]))
-                    if particle_mask.any() else 0.0,
-                "secondary_std_intensity": float(ch_s[particle_mask].std()) if particle_mask.any() else 0.0,
-                "secondary_p25_intensity": float(np.percentile(ch_s[particle_mask], 25)) if particle_mask.any() else 0.0,
-                "secondary_p75_intensity": float(np.percentile(ch_s[particle_mask], 75)) if particle_mask.any() else 0.0,
+                "secondary_median_intensity": float(np.median(v)) if v.size else 0.0,
+                "secondary_std_intensity": float(v.std()) if v.size else 0.0,
+                "secondary_p25_intensity": float(np.percentile(v, 25)) if v.size else 0.0,
+                "secondary_p75_intensity": float(np.percentile(v, 75)) if v.size else 0.0,
+                "secondary_saturated_px": int((particle_mask & sat_s).sum()) if sat_s is not None else 0,
                 "overlap_fraction": n_secondary_px / max(particle_mask.sum(), 1),
                 "mask_overlap_fraction": (
                     float((particle_mask & sec_bool).sum()) / max(particle_mask.sum(), 1)
@@ -155,8 +160,11 @@ class ColocalizationAnalysis(Step):
         df = pd.DataFrame(rows)
         if len(df):
             # the secondary channel's local background around each primary particle (see analyze.ring_stats)
-            rs = ring_stats(ch_s_full, labels_full, df["primary_label"].to_numpy(),
-                            foreground_mask(context, self.roi_mask, ch_s_full.shape), px,
+            fg = foreground_mask(context, self.roi_mask, ch_s_full.shape)
+            any_sat = any_saturated(context, ch_s_full.shape)
+            if any_sat is not None:
+                fg = fg | any_sat
+            rs = ring_stats(ch_s_full, labels_full, df["primary_label"].to_numpy(), fg, px,
                             self.ring_gap_um, self.ring_width_um, within=roi)
             df["secondary_ring_median_intensity"] = rs["ring_median_intensity"].to_numpy()
             df["secondary_ring_sd_intensity"] = rs["ring_sd_intensity"].to_numpy()

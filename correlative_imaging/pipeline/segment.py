@@ -17,6 +17,7 @@ from skimage.morphology import remove_small_objects
 from skimage.segmentation import watershed
 
 from .base import PipelineContext, Step, StepResult, register_step
+from .saturation import saturated
 
 _THRESHOLD_METHODS: dict[str, object] = {
     "otsu": threshold_otsu,
@@ -114,6 +115,11 @@ class AutoThreshold(Step):
                    else f"ch{self.channel}")
         info = {"mask_key": key, "channel": ch_name, "roi_mask": self.roi_mask or "whole_image"}
 
+        # Clipped pixels (SaturationMask) do not set the threshold - their true value is unknown. They are still
+        # thresholded like any other pixel (at the detector maximum they are above any threshold anyway).
+        sat = saturated(context, self.channel, plane.shape)
+        use = ~sat if sat is not None else np.ones(plane.shape, bool)
+        info["saturated_px"] = int(sat.sum()) if sat is not None else 0
         if self.roi_mask:
             roi = context.masks.get(self.roi_mask)
             if roi is None:
@@ -121,13 +127,13 @@ class AutoThreshold(Step):
                     f"No selection mask '{self.roi_mask}' in context — the per-selection "
                     "AutoThreshold must run after that selection's ROI step."
                 )
-            pixels = plane[roi.astype(bool)]
+            pixels = plane[roi.astype(bool) & use]
             if pixels.size == 0 or pixels.min() == pixels.max():
                 # Nothing to threshold: no objects in this selection.
                 return StepResult(masks={key: np.zeros(plane.shape, bool)},
                                   info={**info, "threshold_value": float("nan")})
         else:
-            pixels = plane
+            pixels = plane[use] if sat is not None else plane
         threshold_value = float(thresh_fn(pixels))  # type: ignore[operator]
         binary = plane > threshold_value
         if self.min_size > 0:

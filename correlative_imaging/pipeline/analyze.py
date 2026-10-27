@@ -7,12 +7,13 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 from scipy.ndimage import binary_dilation, center_of_mass, distance_transform_edt
-from scipy.ndimage import labeled_comprehension, median as ndi_median, standard_deviation as ndi_std
+from scipy.ndimage import labeled_comprehension, mean as ndi_mean, median as ndi_median, standard_deviation as ndi_std
 from skimage.measure import label as sk_label, regionprops_table
 from skimage.segmentation import expand_labels
 
 from .base import PipelineContext, Step, StepResult, register_step
-from .segment import _project, channel_mask
+from .saturation import any_saturated, saturated
+from .segment import _project, channel_mask, mask_key
 
 _REGION_PROPS = [
     "label",
@@ -49,8 +50,21 @@ _PARTICLE_METRIC_COLUMNS = {
 # the selection's own area — independently toggleable from mean/sum/std so a
 # selection's area can be recorded without also measuring bulk intensity.
 INTENSITY_METRIC_CHOICES = [
-    "mean_intensity", "median_intensity", "sum_intensity", "std_intensity", "area_px", "area_um2",
+    "mean_intensity", "median_intensity", "sum_intensity", "std_intensity", "robust_sd_intensity",
+    "area_px", "area_um2",
 ]
+# robust_sd_intensity = 1.4826 x median absolute deviation: the spread of the background without the dim cells and
+# glow that inflate the plain SD (use it as the noise for SNR). A saved metric list that predates it gets it added.
+INTENSITY_NEW_METRICS = ["robust_sd_intensity"]
+
+
+def resolve_intensity_metrics(metrics: list[str] | None) -> list[str]:
+    """The bulk metrics to save: None = all; an old explicit list gets the metrics added since it was saved."""
+    if metrics is None:
+        return list(INTENSITY_METRIC_CHOICES)
+    if not any(m in metrics for m in INTENSITY_NEW_METRICS):
+        return list(metrics) + INTENSITY_NEW_METRICS
+    return list(metrics)
 
 # Where each particle sits in the frame: centroid in pixels of the grid the
 # pipeline ran on (binned if it bins) and in µm from the frame's top-left
@@ -78,6 +92,13 @@ def resolve_particle_metrics(metrics: list[str] | None) -> list[str]:
     if not any(m in metrics for m in PARTICLE_ROBUST_METRICS):
         return list(metrics) + PARTICLE_ROBUST_METRICS
     return list(metrics)
+
+
+def _robust_sd(v: np.ndarray) -> float:
+    """1.4826 x the median absolute deviation: equals the SD for normally distributed noise, but a few bright
+    pixels (dim cells, glow) do not inflate it."""
+    v = np.asarray(v, float)
+    return float(1.4826 * np.median(np.abs(v - np.median(v))))
 
 
 def foreground_mask(context: PipelineContext, roi_mask: str, shape) -> np.ndarray:
@@ -126,6 +147,10 @@ PARTICLE_EDGE_COLUMNS = [
     "area_full_um2", "cut_at_edge", "share_inside",
     "dist_centre_um", "dist_centre_rel", "dist_rim_um",
 ]
+
+# Always output: clipped pixels in the particle (SaturationMask; 0 without it) and, for a particle of a selection's
+# own threshold, the whole-image threshold's object it overlaps most and how well (_whole_image_link).
+PARTICLE_QC_COLUMNS = ["saturated_px", "whole_image_label", "whole_image_iou"]
 
 
 @dataclass
@@ -204,13 +229,18 @@ class ParticleAnalysis(Step):
         )
         df = pd.DataFrame(props)
         idx = df["label"].to_numpy()
-        df["median_intensity"] = ndi_median(intensity, label_image, idx)
-        with np.errstate(invalid="ignore", divide="ignore"):    # scipy divides over every label number up to the
-            df["std_intensity"] = ndi_std(intensity, label_image, idx)   # max, also those cut away (0/0, not used)
-        df["p25_intensity"] = labeled_comprehension(intensity, label_image, idx, lambda v: np.percentile(v, 25), float, np.nan)
-        df["p75_intensity"] = labeled_comprehension(intensity, label_image, idx, lambda v: np.percentile(v, 75), float, np.nan)
-        rs = ring_stats(intensity, full_labels, idx, foreground_mask(context, self.roi_mask, intensity.shape), px,
-                        self.ring_gap_um, self.ring_width_um, within=roi)
+        # Clipped pixels (SaturationMask) are left out of mean / median / spread / percentiles; max and min keep
+        # every pixel (a clipped max shows the particle reached the detector limit).
+        sat = saturated(context, self.channel, intensity.shape)
+        stat_labels = np.where(sat, 0, label_image) if sat is not None else label_image
+        df["saturated_px"] = (np.bincount(label_image[sat].ravel(), minlength=int(label_image.max()) + 1)[idx]
+                              if sat is not None else 0)
+        df = _robust_stats(df, intensity, stat_labels, idx, replace_mean=sat is not None)
+        fg = foreground_mask(context, self.roi_mask, intensity.shape)
+        any_sat = any_saturated(context, intensity.shape)
+        if any_sat is not None:
+            fg = fg | any_sat
+        rs = ring_stats(intensity, full_labels, idx, fg, px, self.ring_gap_um, self.ring_width_um, within=roi)
         for col in rs.columns:
             df[col] = rs[col].to_numpy()
 
@@ -236,6 +266,7 @@ class ParticleAnalysis(Step):
             df = df[df["circularity"] >= self.min_circularity]
 
         df = _edge_columns(df, full_labels, roi, px)
+        df = _whole_image_link(df, full_labels, context, self.channel, self.roi_mask)
 
         ch_name = context.channel_names[self.channel] if self.channel < len(context.channel_names) else f"ch{self.channel}"
         df.insert(0, "channel", ch_name)
@@ -258,6 +289,7 @@ class ParticleAnalysis(Step):
             keep.extend(_PARTICLE_METRIC_COLUMNS.get(m, [m]))
         keep.extend(c for c in PARTICLE_POSITION_COLUMNS if c not in keep)
         keep.extend(PARTICLE_EDGE_COLUMNS)
+        keep.extend(PARTICLE_QC_COLUMNS)
         df = df[[c for c in keep if c in df.columns]]
 
         return StepResult(
@@ -265,6 +297,64 @@ class ParticleAnalysis(Step):
             masks={f"particles_ch{self.channel}": filtered_labels},
             info={"n_particles": len(df)},
         )
+
+
+def _robust_stats(df: pd.DataFrame, intensity: np.ndarray, stat_labels: np.ndarray, idx: np.ndarray,
+                  replace_mean: bool) -> pd.DataFrame:
+    """Median, SD, 25th/75th percentile (and, with ``replace_mean``, the mean) of each particle over the pixels in
+    ``stat_labels`` - the label image with clipped pixels removed. A particle without any usable pixel gets NaN."""
+    n_ok = np.bincount(stat_labels.ravel(), minlength=int(max(stat_labels.max(), idx.max())) + 1)[idx]
+    ok = idx[n_ok > 0]
+    cols = ["median_intensity", "std_intensity", "p25_intensity", "p75_intensity"] + (["mean_intensity"] if replace_mean else [])
+    vals = {c: np.full(len(idx), np.nan) for c in cols}
+    if len(ok):
+        pos = np.nonzero(n_ok > 0)[0]
+        vals["median_intensity"][pos] = ndi_median(intensity, stat_labels, ok)
+        with np.errstate(invalid="ignore", divide="ignore"):    # scipy divides over every label number up to the
+            vals["std_intensity"][pos] = ndi_std(intensity, stat_labels, ok)   # max, also those cut away (0/0, not used)
+            if replace_mean:
+                vals["mean_intensity"][pos] = ndi_mean(intensity, stat_labels, ok)
+        vals["p25_intensity"][pos] = labeled_comprehension(intensity, stat_labels, ok, lambda v: np.percentile(v, 25), float, np.nan)
+        vals["p75_intensity"][pos] = labeled_comprehension(intensity, stat_labels, ok, lambda v: np.percentile(v, 75), float, np.nan)
+    for c in cols:
+        df[c] = vals[c]
+    return df
+
+
+def _labels_of(mask: np.ndarray) -> np.ndarray:
+    """A threshold mask as the label image ParticleAnalysis measures (binary -> connected components)."""
+    return sk_label(mask.astype(bool)) if mask.max() == 1 else mask
+
+
+def _whole_image_link(df: pd.DataFrame, full_labels: np.ndarray, context: PipelineContext, channel: int,
+                      roi_mask: str) -> pd.DataFrame:
+    """Link each particle of a selection's OWN threshold (per-selection thresholding) to the whole-image threshold's
+    object it overlaps most: ``whole_image_label`` (the label the whole-image ParticleAnalysis gives it) and
+    ``whole_image_iou`` (overlap / union of the two whole objects; 0 = no whole-image object there). NaN when the
+    particle comes from the whole-image threshold itself (no per-selection threshold)."""
+    df = df.copy()
+    df["whole_image_label"] = np.nan
+    df["whole_image_iou"] = np.nan
+    own = context.masks.get(mask_key(channel, roi_mask)) if roi_mask else None
+    glob = context.masks.get(mask_key(channel))
+    if own is None or glob is None or df.empty:
+        return df
+    g = _labels_of(glob).astype(np.int64)
+    f = full_labels.astype(np.int64)
+    labels = df["label"].to_numpy().astype(np.int64)
+    both = (f > 0) & (g > 0)
+    pairs = pd.DataFrame({"f": f[both], "g": g[both]}).value_counts().rename("n").reset_index()
+    area_f = np.bincount(f.ravel(), minlength=int(f.max()) + 1)
+    area_g = np.bincount(g.ravel(), minlength=int(g.max()) + 1)
+    best = pairs.sort_values("n", ascending=False).drop_duplicates("f").set_index("f")
+    for i, lab in enumerate(labels):
+        if lab in best.index:
+            gl, n = int(best.loc[lab, "g"]), int(best.loc[lab, "n"])
+            df.iloc[i, df.columns.get_loc("whole_image_label")] = gl
+            df.iloc[i, df.columns.get_loc("whole_image_iou")] = n / (area_f[lab] + area_g[gl] - n)
+        else:
+            df.iloc[i, df.columns.get_loc("whole_image_iou")] = 0.0
+    return df
 
 
 def _edge_columns(
@@ -366,12 +456,15 @@ class IntensityMeasurement(Step):
 
         if self.roi_mask and self.roi_mask in context.masks:
             mask    = context.masks[self.roi_mask].astype(bool)
-            pixels  = plane[mask]
             area_px = int(mask.sum())
         else:
             mask    = None
-            pixels  = plane.ravel()
             area_px = int(plane.size)
+        sel_all = mask if mask is not None else np.ones(plane.shape, bool)
+        # Clipped pixels (SaturationMask) are left out of mean / median / spread (sum keeps every pixel).
+        sat = saturated(context, self.channel, plane.shape)
+        sat_px = int((sel_all & sat).sum()) if sat is not None else 0
+        pixels = plane[sel_all & ~sat] if sat is not None else plane[sel_all]
 
         px       = context.pixel_size_um
         area_um2 = area_px * px * px
@@ -383,12 +476,13 @@ class IntensityMeasurement(Step):
         all_vals = {
             "mean_intensity": float(pixels.mean()) if pixels.size > 0 else 0.0,
             "median_intensity": float(np.median(pixels)) if pixels.size > 0 else 0.0,
-            "sum_intensity":  float(pixels.sum())  if pixels.size > 0 else 0.0,
+            "sum_intensity":  float(plane[sel_all].sum()),
             "std_intensity":  float(pixels.std())  if pixels.size > 0 else 0.0,
+            "robust_sd_intensity": _robust_sd(pixels) if pixels.size > 0 else 0.0,
             "area_px":        area_px,
             "area_um2":       area_um2,
         }
-        selected = self.metrics if self.metrics is not None else INTENSITY_METRIC_CHOICES
+        selected = resolve_intensity_metrics(self.metrics)
         roi_name = self.roi_mask or "whole_image"
         roi_path = context.mask_paths.get(self.roi_mask, "") if self.roi_mask else ""
         rows = [{
@@ -396,12 +490,16 @@ class IntensityMeasurement(Step):
             "roi_mask":       roi_name,
             "roi_path":       roi_path,
             **{m: all_vals[m] for m in selected if m in all_vals},
+            "saturated_px":   sat_px,
         }]
 
         if self.outside_particles:
             # Every channel's threshold mask — this selection's own where it
             # has per-selection thresholding, else the global one.
             fg = foreground_mask(context, self.roi_mask, plane.shape)
+            any_sat = any_saturated(context, plane.shape)
+            if any_sat is not None:
+                fg = fg | any_sat
             r = int(round(self.outside_margin_um / px)) if self.outside_margin_um > 0 else 0
             if r > 0:   # iterations=0 would dilate until nothing changes
                 fg = binary_dilation(fg, iterations=r)
@@ -414,6 +512,7 @@ class IntensityMeasurement(Step):
                 "median_intensity": float(np.median(bg)) if bg.size else float("nan"),
                 "sum_intensity":  float(bg.sum()),
                 "std_intensity":  float(bg.std()) if bg.size else float("nan"),
+                "robust_sd_intensity": _robust_sd(bg) if bg.size else float("nan"),
                 "area_px":        int(bg.size),
                 "area_um2":       bg.size * px * px,
             }
@@ -422,6 +521,7 @@ class IntensityMeasurement(Step):
                 "roi_mask":       f"{roi_name}:outside_particles",
                 "roi_path":       roi_path,
                 **{m: bg_vals[m] for m in selected if m in bg_vals},
+                "saturated_px":   0,
             })
 
         return StepResult(

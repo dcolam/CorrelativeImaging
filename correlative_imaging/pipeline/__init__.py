@@ -11,6 +11,7 @@ from .segment import AutoThreshold, ExtractROI, WatershedSplit
 from .analyze import ParticleAnalysis
 from .colocalize import ColocalizationAnalysis
 from .ilastik import ZProjection, IlastikROI
+from .saturation import SaturationMask
 
 __all__ = [
     # Core
@@ -20,6 +21,7 @@ __all__ = [
     "StepResult",
     "register_step",
     # Preprocessing
+    "SaturationMask",
     "Binning",
     "BackgroundSubtraction",
     "BlackLevelNormalization",

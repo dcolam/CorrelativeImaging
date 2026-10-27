@@ -81,7 +81,13 @@ CREATE TABLE IF NOT EXISTS particle_measurements (
     p75_intensity   REAL,
     ring_median_intensity REAL,
     ring_sd_intensity REAL,
-    ring_px         INTEGER
+    ring_px         INTEGER,
+    -- clipped camera pixels in the particle (left out of its mean/median/spread);
+    -- for a particle of a selection's own threshold: the whole-image threshold's
+    -- object it overlaps most (its label there) and overlap / union of the two
+    saturated_px    INTEGER,
+    whole_image_label INTEGER,
+    whole_image_iou REAL
 );
 
 CREATE TABLE IF NOT EXISTS colocalization_results (
@@ -118,7 +124,8 @@ CREATE TABLE IF NOT EXISTS colocalization_per_particle (
     secondary_p25_intensity REAL,
     secondary_p75_intensity REAL,
     secondary_ring_median_intensity REAL,
-    secondary_ring_sd_intensity REAL
+    secondary_ring_sd_intensity REAL,
+    secondary_saturated_px  INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS intensity_measurements (
@@ -132,7 +139,9 @@ CREATE TABLE IF NOT EXISTS intensity_measurements (
     std_intensity   REAL,
     area_px         INTEGER,
     area_um2        REAL,
-    median_intensity REAL
+    median_intensity REAL,
+    robust_sd_intensity REAL,   -- 1.4826 x MAD: the noise to use for SNR
+    saturated_px    INTEGER     -- clipped pixels in the selection (left out of mean/median/SD)
 );
 
 -- Per-image, per-channel levels the pipeline actually computed: the black
@@ -245,6 +254,12 @@ class ResultsDB:
             ("colocalization_per_particle", "secondary_p75_intensity REAL"),
             ("colocalization_per_particle", "secondary_ring_median_intensity REAL"),
             ("colocalization_per_particle", "secondary_ring_sd_intensity REAL"),
+            ("particle_measurements",       "saturated_px INTEGER"),
+            ("particle_measurements",       "whole_image_label INTEGER"),
+            ("particle_measurements",       "whole_image_iou REAL"),
+            ("colocalization_per_particle", "secondary_saturated_px INTEGER"),
+            ("intensity_measurements",      "robust_sd_intensity REAL"),
+            ("intensity_measurements",      "saturated_px INTEGER"),
         ]
         for table, col_def in new_columns:
             try:
@@ -377,6 +392,9 @@ class ResultsDB:
                     _as_float(r.get("ring_median_intensity")),
                     _as_float(r.get("ring_sd_intensity")),
                     _as_int(r.get("ring_px")),
+                    _as_int(r.get("saturated_px")),
+                    _as_int(r.get("whole_image_label")),
+                    _as_float(r.get("whole_image_iou")),
                 )
             )
         self._con.executemany(
@@ -389,9 +407,10 @@ class ResultsDB:
                  dist_centre_um, dist_centre_rel, dist_rim_um,
                  centroid_row_um, centroid_col_um, crop_row, crop_col, median_intensity,
                  std_intensity, p25_intensity, p75_intensity,
-                 ring_median_intensity, ring_sd_intensity, ring_px)
+                 ring_median_intensity, ring_sd_intensity, ring_px,
+                 saturated_px, whole_image_label, whole_image_iou)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             rows,
         )
@@ -416,6 +435,8 @@ class ResultsDB:
                 _as_int(r.get("area_px")),
                 _as_float(r.get("area_um2")),
                 _as_float(r.get("median_intensity")),
+                _as_float(r.get("robust_sd_intensity")),
+                _as_int(r.get("saturated_px")),
             )
             for _, r in df.iterrows()
         ]
@@ -424,8 +445,8 @@ class ResultsDB:
             INSERT INTO intensity_measurements
                 (image_id, channel, roi_mask, roi_path,
                  mean_intensity, sum_intensity, std_intensity, area_px, area_um2,
-                 median_intensity)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 median_intensity, robust_sd_intensity, saturated_px)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             rows,
         )
@@ -510,6 +531,7 @@ class ResultsDB:
                 _as_float(r.get("secondary_p75_intensity")),
                 _as_float(r.get("secondary_ring_median_intensity")),
                 _as_float(r.get("secondary_ring_sd_intensity")),
+                _as_int(r.get("secondary_saturated_px")),
             )
             for _, r in per_particle_df.iterrows()
         ]
@@ -521,8 +543,9 @@ class ResultsDB:
                  secondary_max_intensity, overlap_fraction, mask_overlap_fraction,
                  secondary_median_intensity, secondary_std_intensity,
                  secondary_p25_intensity, secondary_p75_intensity,
-                 secondary_ring_median_intensity, secondary_ring_sd_intensity)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 secondary_ring_median_intensity, secondary_ring_sd_intensity,
+                 secondary_saturated_px)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             rows,
         )
