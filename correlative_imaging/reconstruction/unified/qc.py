@@ -28,6 +28,7 @@ def check(T: dict, P: pd.DataFrame, e: dict) -> pd.DataFrame:
     W["flag_no_hole"] = [(p, i) not in holes for p, i in zip(W.plate_id, W.image_id)]
     W["user_excluded"] = [matches(e.get("exclude_wells"), p, w) for p, w in zip(W.plate_id, W.well_id)]
     W["user_empty"] = [matches(e.get("empty_wells"), p, w) for p, w in zip(W.plate_id, W.well_id)]
+    W["user_empty"] &= ~W.user_excluded            # excluded wins: a failed image is never the "no cell" reference
     # learning uses wells that pass; calls skip only user-excluded wells and wells without a hole
     W["use_for_learning"] = ~W.flag_few_cells & ~W.user_excluded & ~W.user_empty
     W["call"] = ~W.user_excluded & ~W.flag_no_hole

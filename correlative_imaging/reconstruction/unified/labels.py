@@ -166,17 +166,21 @@ def features(D: pd.DataFrame, chans: list, scale: dict, kind: str) -> np.ndarray
     return np.column_stack(cols) if cols else np.zeros((len(D), 0))
 
 
+def _typical(D, col, pos, sel):
+    """Median of a column over the positive cells of a population (None with fewer than 5)."""
+    if col not in D or pos not in D:
+        return None
+    v = D.loc[sel & D[pos].fillna(False).astype(bool), col].astype(float)
+    v = v[np.isfinite(v) & (v > 0)]
+    return float(v.median()) if len(v) >= 5 else None
+
+
 def scales(H: pd.DataFrame, O: pd.DataFrame, F: dict) -> tuple[dict, dict]:
     """{channel: (column, typical positive value)} for hole cells and for surrounding cells. Each channel is taken
     relative to a typical positive cell of the same population: hole cells are dimmed by the hole, surrounding cells
     are not, so raw signals or cut units would not be comparable between the two."""
     colour, marker = F["colour"], F["marker"]
-    def typical(D, col, pos, sel):
-        if col not in D or pos not in D:
-            return None
-        v = D.loc[sel & D[pos].fillna(False).astype(bool), col].astype(float)
-        v = v[np.isfinite(v) & (v > 0)]
-        return float(v.median()) if len(v) >= 5 else None
+    typical = _typical
     hcol = {c: f"x_{c}" for c in colour}
     hcol.update({m: f"hsig_{m}" if f"hsig_{m}" in H else f"own_{m}" for m in marker})
     fcol = {c: f"k_{c}" for c in colour}
@@ -193,13 +197,20 @@ def fit(R: pd.DataFrame, H: pd.DataFrame, O: pd.DataFrame, F: dict, cal: dict) -
     colour, marker = F["colour"], F["marker"]
     chans = colour + marker
     hole_scale, field_scale = scales(H, O, F)
+    # a second view of each colour: in holes the bleed-corrected own signal (sees a dim colour next to a bright one, e.g.
+    # FITC under bleed-through into TX RED); surrounding cells have one measure (already corrected), used for both
+    hole_own = {c: (f"own_{c}", _typical(H, f"own_{c}", f"pos_{c}", H.valid)) for c in colour}
+    field_own = {c: field_scale[c] for c in colour}
+
+    def design(D, a, b):
+        return np.hstack([features(D, chans, a, ""), features(D, colour, b, "")])
     info = dict(used=False, n=0, labels={}, why="")
     H["bio_label"], H["bio_p"] = "", np.nan
     O["bio_label"], O["bio_p"] = "", np.nan
     if not len(R):
         info["why"] = "no labels yet"
         return info
-    L = R[(R.your_label != "") & ~R.not_cell]
+    L = R[(R.your_label != "") & ~R.not_cell & (R.your_label.str.lower() != "unsure")]   # unsure is not a type
     # the sheet is read as text: match on text keys
     L = L.drop(columns=["image_id"]).assign(image_id=L.image_id.astype(str)) if "image_id" in L else L
     hk = L[L.kind == "hole"].drop(columns=["image_id"]).merge(
@@ -208,7 +219,7 @@ def fit(R: pd.DataFrame, H: pd.DataFrame, O: pd.DataFrame, F: dict, cal: dict) -
     Oo = O.assign(obj=O.channel.astype(str) + ":" + O.label.astype(str), image_id=O.image_id.astype(str),
                   plate_id=O.plate_id.astype(str))
     fk = L[L.kind != "hole"].merge(Oo, on=["plate_id", "image_id", "obj"], how="inner", suffixes=("", "_o"))
-    X = np.vstack([features(hk, chans, hole_scale, "hole"), features(fk, chans, field_scale, "field")])
+    X = np.vstack([design(hk, hole_scale, hole_own), design(fk, field_scale, field_own)])
     y = np.concatenate([hk.your_label.to_numpy(), fk.your_label.to_numpy()])
     kind = np.array(["hole"] * len(hk) + ["surrounding"] * len(fk))
     ok = np.isfinite(X).all(1)
@@ -228,8 +239,8 @@ def fit(R: pd.DataFrame, H: pd.DataFrame, O: pd.DataFrame, F: dict, cal: dict) -
                 acc_hole=float(np.mean(cv[kind == "hole"] == y[kind == "hole"])) if (kind == "hole").any() else np.nan,
                 confusion=pd.crosstab(pd.Series(y, name="your label"), pd.Series(cv, name="predicted")),
                 classes=list(lda.classes_), X=X, y=y)
-    for D, scale, sel in [(H, hole_scale, H.valid), (O, field_scale, O.learn)]:
-        Xd = features(D, chans, scale, "")
+    for D, scale, own, sel in [(H, hole_scale, hole_own, H.valid), (O, field_scale, field_own, O.learn)]:
+        Xd = design(D, scale, own)
         good = sel.to_numpy() & np.isfinite(Xd).all(1)
         if good.any():
             p = lda.predict_proba(Xd[good])

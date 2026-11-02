@@ -68,6 +68,9 @@ def particle_signal(FP: pd.DataFrame, results, prefix_of: dict, colour: list) ->
     return out
 
 
+MARKS_MIN_ACC = 0.75     # your channel marks move a cut only when they separate this well (balanced accuracy)
+
+
 def call(M: pd.DataFrame, W: pd.DataFrame, F: dict, cell_size: dict, nb: pd.DataFrame, e: dict, results=None,
          prefix_of=None, reviewed=None, FP=None, chan_marks=None, clump_marks=None) -> tuple:
     colour, marker, nm, K = F["colour"], F["marker"], F["nm"], F["K"]
@@ -91,6 +94,7 @@ def call(M: pd.DataFrame, W: pd.DataFrame, F: dict, cell_size: dict, nb: pd.Data
     cal = {}
     emp_mask = np.array([(p, w) in set(zip(empty.plate_id, empty.well_id)) for p, w in zip(H.plate_id, H.well_id)])
     bright_empty = {}
+    measures = {}                                   # per colour: every measurement with its cut (your marks pick one)
     for c in colour:
         # three measurements of the same colour: the grown cell's own signal (bleed-corrected, band background), its
         # hole signal (the hole's own background, removes aperture glow), the most cell-like particle's signal. Each
@@ -119,6 +123,7 @@ def call(M: pd.DataFrame, W: pd.DataFrame, F: dict, cell_size: dict, nb: pd.Data
             res[k] = dict(v=v, ok=ok, sd=sd, q=q, cut=floor, D=D, ce=ce,
                           how="two groups" if (cut is not None and D >= 2) else "noise (one group)")
         order = sorted(res, key=lambda k: -res[k]["D"])
+        measures[c] = res
         used = np.array([""] * len(H), dtype=object)
         xq, xr, br = np.ones(len(H)), np.full(len(H), np.nan), np.zeros(len(H), bool)
         for k in order[::-1]:                          # best-ranked last, so it overwrites where it exists
@@ -139,8 +144,10 @@ def call(M: pd.DataFrame, W: pd.DataFrame, F: dict, cell_size: dict, nb: pd.Data
                       empty_cut=res[best]["ce"] if best else np.nan, n_empty=int(emp_mask.sum()), measure=best,
                       separations={k: round(res[k]["D"], 2) for k in order},
                       used={k: int((used == k).sum()) for k in order})
-    # your marks (labels.csv, holes): a channel's cut moves to the point that best separates the holes where you saw that
-    # channel positive from those where you saw it negative or no cell (dim cells sit below a cut learnt from the bulk)
+    # your marks (labels.csv, holes): per channel, the measurement and cut that best separate the holes where you saw
+    # that channel positive from those where you saw it negative or no cell. The learnt measurement is the one whose
+    # hole cells split most clearly into two groups; it need not be the one that sees what you see (e.g. bleed-through
+    # from a bright channel lifts the particle signal but not the bleed-corrected own signal)
     reviewed, chan_marks = reviewed or {}, chan_marks or {}
     rkey = list(zip(H.plate_id, H.well_id))
     for c in colour:
@@ -149,14 +156,38 @@ def call(M: pd.DataFrame, W: pd.DataFrame, F: dict, cell_size: dict, nb: pd.Data
         unseen = np.array([chan_marks.get(k, {}).get(c) is False or reviewed.get(k) == "no" for k in rkey])
         yes, no = seen & np.isfinite(x), unseen & np.isfinite(x)
         cal[c]["marked"] = dict(positive=int(yes.sum()), negative=int(no.sum()))
-        if yes.sum() >= 5 and no.sum() >= 5:
-            cand = np.unique(np.clip(np.concatenate([x[yes], x[no]]), 0.3, 3.0))
-            acc = [(np.mean(x[yes] >= t) + np.mean(x[no] < t)) / 2 for t in cand]
-            t = float(cand[int(np.argmax(acc))])
-            H[f"x_{c}"] = x / t
+        if yes.sum() < 5 or no.sum() < 5:
+            continue
+        now = (np.mean(x[yes] >= 1) + np.mean(x[no] < 1)) / 2
+        best = None                                  # (balanced accuracy, measure, factor)
+        for k, r in measures.get(c, {}).items():
+            xk = r["v"] / r["cut"]
+            y, n = seen & r["ok"], unseen & r["ok"]
+            if y.sum() < 5 or n.sum() < 5:
+                continue
+            cand = np.unique(np.clip(np.concatenate([xk[y], xk[n]]), 0.3, 3.0))
+            acc = [(np.mean(xk[y] >= t) + np.mean(xk[n] < t)) / 2 for t in cand]
+            i = int(np.argmax(acc))
+            if best is None or acc[i] > best[0]:
+                best = (float(acc[i]), k, float(cand[i]))
+        if best is None:
+            continue
+        acc, k, t = best
+        info = dict(measure=k, factor=round(t, 2), balanced_accuracy=round(acc, 2), before=round(float(now), 2),
+                    measure_before=cal[c].get("measure", ""))
+        # used only where your marks clearly separate and better than the learnt call; otherwise the measurements cannot
+        # see what you see, and moving the cut would only shift the error
+        if acc >= MARKS_MIN_ACC and acc - now >= 0.05:
+            r = measures[c][k]
+            xk = r["v"] / (r["cut"] * t)
+            x = np.where(r["ok"], xk, x)
+            H[f"x_{c}"] = x
+            H[f"measure_{c}"] = np.where(r["ok"], k, H[f"measure_{c}"])
             glow = H[f"glow_{c}"].astype(bool)
             H[f"pos_{c}"] = H.valid & (H[f"x_{c}"] >= 1) & ~glow
-            cal[c]["cut_from_marks"] = dict(factor=round(t, 2), balanced_accuracy=round(float(max(acc)), 2))
+            cal[c]["cut_from_marks"] = info
+        else:
+            cal[c]["marks_not_used"] = info
     # holes without a cell (your empty wells) and the shape model: a colour counts when it is brighter than any empty
     # hole, or when the shape model says the hole holds a cell
     H["p_shape"] = np.nan

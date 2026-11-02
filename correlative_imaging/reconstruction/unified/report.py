@@ -235,10 +235,15 @@ def write(out: Path, T, P, W, F, C, size, H, cal, e, path_map, summary, linfo=No
              + "".join(f"<tr><td>{nm[c]}</td><td>{cal[c]['noise_sd']:.1f}</td><td>{cal[c]['cut']:.1f}</td>"
                        f"<td>{cal[c]['measure']}: {cal[c]['how']} (separation {cal[c]['separation']:.1f}; "
                        f"tried {cal[c]['separations']})"
-                       + (f"; moved to {cal[c]['cut_from_marks']['factor']}x by your marks "
+                       + (f"; by your marks: {cal[c]['cut_from_marks']['measure']}, cut x{cal[c]['cut_from_marks']['factor']} "
                           f"({cal[c]['marked']['positive']} seen positive, {cal[c]['marked']['negative']} negative or no cell; "
                           f"balanced accuracy {cal[c]['cut_from_marks']['balanced_accuracy']})"
-                          if 'cut_from_marks' in cal[c] else "") + "</td>"
+                          if 'cut_from_marks' in cal[c] else "")
+                       + (f"; your marks NOT used ({cal[c]['marked']['positive']} positive, "
+                          f"{cal[c]['marked']['negative']} negative; on this measure they separate only to balanced "
+                          f"accuracy {cal[c]['marks_not_used']['balanced_accuracy']}, the learnt cut "
+                          f"{cal[c]['marks_not_used']['before']}: the measure does not see what you see)"
+                          if 'marks_not_used' in cal[c] else "") + "</td>"
                        f"<td>{cal[c]['empty_cut']:.1f} ({cal[c]['n_empty']} holes)</td><td>{cal[c]['n_pos']}</td></tr>"
                        for c in colour) + "</table>")
     sh = cal.get("_shape", {})

@@ -25,7 +25,7 @@ import pandas as pd
 
 KEYS = ["question", "plate_id", "well_id", "image_id", "obj"]
 CHOICES = {
-    "wells": ["exclude", "empty", "keep"],
+    "wells": ["lost focus / failed: exclude", "no cells seeded: empty", "fine: keep"],
     "particle": ["cell", "several cells", "neighbour", "plug / halo", "debris", "unsure"],
     "size": ["one cell", "several cells", "part of a cell", "not a cell", "unsure"],
     "channel": ["positive", "negative", "not a cell", "unsure"],
@@ -65,7 +65,9 @@ class Answers:
 
 # ------------------------------------------------------------------------------------------------- apply (run.py)
 def wells(A: Answers) -> dict:
-    return {(r["plate_id"], r["well_id"]): r["answer"] for r in A.get("wells").to_dict("records")}
+    """{(plate, well): "exclude" | "empty" | "keep"} (answers given with the older one-word choices too)."""
+    word = lambda a: a.rsplit(":", 1)[-1].strip()
+    return {(r["plate_id"], r["well_id"]): word(r["answer"]) for r in A.get("wells").to_dict("records")}
 
 
 def particles(A: Answers) -> dict:
