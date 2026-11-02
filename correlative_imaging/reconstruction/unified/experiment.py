@@ -24,7 +24,7 @@ from pathlib import Path
 GREY = "#bbbbbb"          # the old fallback: channels saved with it get their colour resolved again
 UNKNOWN = "#bfbfbf"       # config.default_color when neither the name nor the wavelength says a colour
 FREE = {"#3b6fff": 225, "#38d9e8": 186, "#f2c12e": 45, "#ff8c1a": 30, "#e8413c": 2, "#e0398a": 330, "#2fbf4a": 130}
-DEFAULT_COLORS = {"GFP": "#2fbf4a", "mCherry": "#e8413c", "mScarlet": "#e0398a", "BFP": "#3b6fff"}
+DEFAULT_COLORS = {"GFP": "#2fbf4a", "mCherry": "#e8413c", "mScarlet": "#e8413c", "BFP": "#3b6fff"}
 
 
 def _stored_display(run_json: dict) -> dict:

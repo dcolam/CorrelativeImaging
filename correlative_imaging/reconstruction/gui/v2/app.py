@@ -22,7 +22,7 @@ import numpy as np
 import pandas as pd
 from qtpy.QtCore import QObject, Qt, QUrl, Signal
 from qtpy.QtGui import QColor, QDesktopServices
-from qtpy.QtWidgets import (QComboBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QInputDialog,
+from qtpy.QtWidgets import (QColorDialog, QComboBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QInputDialog,
                             QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QStackedWidget,
                             QTableWidget, QTableWidgetItem, QTabWidget, QTextBrowser, QVBoxLayout, QWidget)
 
@@ -147,7 +147,7 @@ class FirstPassTab(QWidget):
         if e is None:
             self.form.addRow(QLabel("written by the first run"))
             return
-        self.role, self.cname = {}, {}
+        self.role, self.cname, self.ccolor = {}, {}, {}
         for c, d in e["channels"].items():
             w = QWidget()
             h = QHBoxLayout(w)
@@ -158,9 +158,22 @@ class FirstPassTab(QWidget):
             r.setCurrentText(d.get("role", "colour"))
             r.setToolTip("colour: a reporter (bleed-through corrected, part of the pattern)\nmarker: a stain measured "
                          "on its own (e.g. an antibody)")
+            col = QPushButton()
+            col.setFixedWidth(28)
+            col.setToolTip("display colour: click to change")
+            col.setProperty("hex", d.get("color", "#ffffff"))
+            col.setStyleSheet(f"background:{d.get('color', '#ffffff')}")
+
+            def pick(_=False, b=col):
+                q = QColorDialog.getColor(QColor(b.property("hex")), self, "Channel colour")
+                if q.isValid():
+                    b.setProperty("hex", q.name())
+                    b.setStyleSheet(f"background:{q.name()}")
+            col.clicked.connect(pick)
+            h.addWidget(col)
             h.addWidget(n, 1)
             h.addWidget(r)
-            self.cname[c], self.role[c] = n, r
+            self.cname[c], self.role[c], self.ccolor[c] = n, r, col
             self.form.addRow(c, w)
         self.excl = QLineEdit("; ".join(e.get("exclude_wells") or []))
         self.excl.setToolTip("imaging failures, never used: '*:col 6', '18T40668:rows C-O cols 1-8', '18T39383:B04'")
@@ -178,6 +191,7 @@ class FirstPassTab(QWidget):
         for c in e["channels"]:
             e["channels"][c]["name"] = self.cname[c].text().strip() or c
             e["channels"][c]["role"] = self.role[c].currentText()
+            e["channels"][c]["color"] = self.ccolor[c].property("hex") or e["channels"][c].get("color")
         split = lambda s: [x.strip() for x in re.split(r"[;\n]", s) if x.strip()]
         e["exclude_wells"], e["empty_wells"] = split(self.excl.text()), split(self.empty.text())
         f.write_text(encoding="utf-8", data=json.dumps(e, indent=2))

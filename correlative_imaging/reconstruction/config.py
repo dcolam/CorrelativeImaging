@@ -119,7 +119,7 @@ _NAME_COLORS = [   # dye / filter names (display only), checked before the wavel
     (("cy5", "alexa647", "af647", "far red", "farred"), "#38d9e8"),       # before "red"
     (("dapi", "hoechst", "bfp", "blue"), "#4f7dff"),
     (("fitc", "gfp", "alexa488", "af488", "green"), "#3ddc5a"),
-    (("tx red", "texas", "tritc", "mcherry", "mscarlet", "cy3", "rfp", "tdtomato", "red"), "#ff4fd8"),
+    (("tx red", "texas", "tritc", "mcherry", "mscarlet", "cy3", "rfp", "tdtomato", "red"), "#e8413c"),
 ]
 
 
@@ -134,7 +134,7 @@ def default_color(ch: str) -> str:
     if not m:
         return "#bfbfbf"
     nm = int(m.group(1))
-    return "#4f7dff" if nm < 450 else "#3ddc5a" if nm < 520 else "#ff4fd8" if nm < 600 else "#38d9e8"
+    return "#4f7dff" if nm < 450 else "#3ddc5a" if nm < 520 else "#e8413c" if nm < 600 else "#38d9e8"
 
 
 def load_config(path: str | Path | None = None) -> Config:
