@@ -1,9 +1,11 @@
 """What the tool draws: holes (with the grown cell and Detect's particles), single particles, surrounding cells and
 whole wells, as RGB thumbnails or as raw per-channel images for the canvas. No Qt here.
 
-Display range, the same rule as ci reconstruct v1, linear: per channel from the background up to the brightest
-pixels (99.8th percentile), but never closer than 15 noise SDs, so an empty hole stays dark instead of its noise being
-stretched into "signal". The canvas shows the raw pixel values with this range as contrast limits (adjustable).
+Display range, linear, never clipped: every image (surrounding cell, whole image, hole) runs from its own minimum to its
+own maximum. The channels are stretched together, each relative to a typical positive surrounding cell of that channel
+(summary.json display_top.field_max), so the brightest channel just fills the range and the others keep their share:
+a dim cell is visible and its colour is the colour it has relative to the dataset's cells.
+The canvas shows the raw pixel values with these ranges as contrast limits (adjustable in the Control view).
 """
 from __future__ import annotations
 
@@ -40,9 +42,31 @@ def _rgb(hexc: str) -> np.ndarray:
     return np.array([int(h[i:i + 2], 16) / 255 for i in (0, 2, 4)])
 
 
-def display_range(a: np.ndarray, bg: float, sd: float) -> tuple:
-    """(low, high), linear: background to the brightest pixels (99.8th percentile), at least 15 noise SDs (as v1)."""
-    return float(bg), max(float(np.percentile(a, 99.8)), float(bg) + 15 * float(sd))
+def limits(planes: dict, white: dict | None = None, together: bool = False) -> dict:
+    """{channel: (low, high)} for raw planes {channel: image}: low = the image's minimum, high = white[channel] (else
+    the image's maximum). together: one common stretch so the brightest channel just reaches its high."""
+    out = {}
+    for c, a in planes.items():
+        lo, hi = display_range(a)
+        w = (white or {}).get(c)
+        if w is not None and np.isfinite(w) and w > lo:
+            hi = float(w)
+        out[c] = (lo, hi)
+    if together and out:
+        f = max((display_range(planes[c])[1] - lo) / (hi - lo) for c, (lo, hi) in out.items())
+        f = max(f, 1e-6) if white else 1.0          # the brightest channel ends exactly at its maximum: no clipping
+        out = {c: (lo, lo + f * (hi - lo)) for c, (lo, hi) in out.items()}
+    return out
+
+
+def display_range(a: np.ndarray, bg: float = 0.0, sd: float = 0.0) -> tuple:
+    """(low, high), linear: the image's minimum to its maximum (no clipping). bg / sd are no longer used."""
+    v = np.asarray(a, float)
+    v = v[np.isfinite(v)]
+    if not len(v):
+        return 0.0, 1.0
+    lo, hi = float(v.min()), float(v.max())
+    return lo, hi if hi > lo else lo + 1.0
 
 
 class Views:
@@ -57,6 +81,7 @@ class Views:
         self.prefix_of = self.S.get("prefix_of") or {}
         top = self.S.get("display_top") or {}
         self.top_hole, self.top_field = top.get("hole", {}), top.get("field", {})
+        self.white = top.get("field_max") or {}
         self.chans = list(self.e["channels"])
         self.color = {c: v.get("color", "#ffffff") for c, v in self.e["channels"].items()}
         self.name = {c: v.get("name", c) for c, v in self.e["channels"].items()}
@@ -111,11 +136,11 @@ class Views:
             return h
         return self._memo(("hole", plate_id, well_id), load)
 
-    limits = staticmethod(display_range)
-
     def raw_hole(self, h: dict) -> dict:
         """{channel: (raw image, (low, high))}."""
-        return {c: (h["img"][k], self.limits(h["img"][k], h["bg"][k], h["noise"][k])) for k, c in enumerate(h["names"])}
+        P = {c: h["img"][k] for k, c in enumerate(h["names"])}
+        L = limits(P, self.white, together=True)
+        return {c: (P[c], L[c]) for c in P}
 
     def planes_hole(self, h: dict) -> dict:
         """{channel: (H, W) in [0, 1]}, linear within the display range."""
@@ -134,14 +159,10 @@ class Views:
         return self._memo(("whole", diag, well_raw), load)
 
     def raw_field(self, P: dict, sl=None) -> dict:
-        """{channel: (raw image or crop, (low, high))}: background = the image's median, noise = its robust spread."""
-        out = {}
-        for c, a in P.items():
-            med = float(np.median(a))
-            sd = 1.4826 * float(np.median(np.abs(a[::4, ::4] - med)))
-            b = a[sl] if sl is not None else a
-            out[c] = (b, self.limits(b, med, sd))
-        return out
+        """{channel: (raw image or crop, (low, high))}: the crop's minimum to the dataset's brightest surrounding cell."""
+        B = {c: (a[sl] if sl is not None else a) for c, a in P.items()}
+        L = limits(B, self.white, together=True)
+        return {c: (B[c], L[c]) for c in B}
 
     def planes_field(self, P: dict, sl=None) -> dict:
         """{channel: (H, W) in [0, 1]}, linear within the display range."""

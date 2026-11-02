@@ -60,29 +60,31 @@ class Crops:
         sl = (slice(max(y - h, 0), y + h), slice(max(x - h, 0), x + h))
         chans = which or [c for c, v in self.e["channels"].items() if v["role"] == "colour"]
         out = None
-        from .view import display_range
+        from .view import limits
+        # colour: minimum to maximum of the crop, channels together (view.limits); one channel alone (grey): its own range
+        L = limits({c: p[c][sl] for c in chans}, self.top if which is None else None, together=which is None)
         for c in chans:
-            med = float(np.median(p[c]))
-            sd = 1.4826 * float(np.median(np.abs(p[c][::4, ::4] - med)))
             a = p[c][sl]
-            lo, hi = display_range(a, med, sd)                      # linear, as everywhere (view.py)
+            lo, hi = L[c]
             v = np.clip((a - lo) / max(hi - lo, 1e-6), 0, 1)
             col = _rgb(self.e["channels"][c]["color"]) if which is None else np.ones(3)
             out = v[..., None] * col if out is None else out + v[..., None] * col
         return np.clip(out, 0, 1)
 
 
-def hole_rgb(npz: Path, e: dict, top: dict):
+def hole_rgb(npz: Path, e: dict, white: dict):
+    """The hole crop as in the tool (view.py): minimum to maximum, channels stretched together."""
+    from .view import limits
     z = np.load(npz)
     names = [str(n) for n in z["names"]]
     out = None
+    use = [c for c, v in e["channels"].items() if v["role"] == "colour" and c in names]
+    L = limits({c: z["img"][names.index(c)] for c in use}, white, together=True)
     for c, v in e["channels"].items():
-        if v["role"] != "colour" or c not in names:
+        if c not in use:
             continue
-        k = names.index(c)
-        from .view import display_range
-        a = z["img"][k]
-        lo, hi = display_range(a, z["bg"][k], z["noise"][k])        # linear, as everywhere (view.py)
+        a = z["img"][names.index(c)]
+        lo, hi = L[c]
         d = np.clip((a - lo) / max(hi - lo, 1e-6), 0, 1)
         out = d[..., None] * _rgb(v["color"]) if out is None else out + d[..., None] * _rgb(v["color"])
     out = np.clip(out, 0, 1)
@@ -210,7 +212,8 @@ def write(out: Path, T, P, W, F, C, size, H, cal, e, path_map, summary, linfo=No
         v = (O.loc[O.channel == c, f"med_{c}"] - O.loc[O.channel == c, f"ring_{c}"]).dropna() \
             if f"med_{c}" in O else pd.Series([1.0])
         top[c] = float(np.percentile(v, 90)) if len(v) else 1.0
-    cr = Crops(e, path_map, top)
+    white = (summary.get("display_top") or {}).get("field_max") or {}
+    cr = Crops(e, path_map, white)
     imgs, labs = [], []
     for k in cl.index[:6]:
         g = ex[ex.cls == k]
@@ -295,7 +298,7 @@ def write(out: Path, T, P, W, F, C, size, H, cal, e, path_map, summary, linfo=No
         for r in sel.iloc[RNG.choice(len(sel), min(8, len(sel)), replace=False)].itertuples() if len(sel) else []:
             f = out / "wells" / f"{r.plate_id}_{r.well_id}.npz"
             if f.exists():
-                imgs.append(hole_rgb(f, e, topH)); labs.append(f"{r.plate_id[-5:]} {r.well_id}")
+                imgs.append(hole_rgb(f, e, white)); labs.append(f"{r.plate_id[-5:]} {r.well_id}")
         if imgs:
             t.append(f"<p>{html.escape(title)} (random; yellow = hole, cyan = hole cell; each channel linear from its background to the brightest pixels, at least 15 noise SDs)</p>"
                      f"<img src=\"{_b64(grid(imgs, labs, title, ncol=6, size=2.2))}\">")
@@ -352,7 +355,7 @@ def write(out: Path, T, P, W, F, C, size, H, cal, e, path_map, summary, linfo=No
             for r in sel.iloc[RNG.choice(len(sel), min(8, len(sel)), replace=False)].itertuples():
                 f = out / "wells" / f"{r.plate_id}_{r.well_id}.npz"
                 if f.exists():
-                    imgs.append(hole_rgb(f, e, topH)); labs.append(f"{r.plate_id[-5:]} {r.well_id} p {r.bio_p:.2f}")
+                    imgs.append(hole_rgb(f, e, white)); labs.append(f"{r.plate_id[-5:]} {r.well_id} p {r.bio_p:.2f}")
             if imgs:
                 t.append(f"<p>Hole cells predicted {html.escape(str(lab))} (random)</p>"
                          f"<img src=\"{_b64(grid(imgs, labs, str(lab), ncol=6, size=2.2))}\">")
@@ -409,7 +412,7 @@ def write(out: Path, T, P, W, F, C, size, H, cal, e, path_map, summary, linfo=No
     if untouched:
         Sh = labels_mod.suggest(H, O)
         Sh.to_csv(f_lab, index=False)
-        labels_mod.sheet(Sh, H, O, out, e, Crops(e, path_map, top), topH, iv / "labels.html")
+        labels_mod.sheet(Sh, H, O, out, e, Crops(e, path_map, white), white, iv / "labels.html")
     # what to do: the first pass's open questions (the same list as in the tool), then your labels
     linfo = linfo or {}
     try:

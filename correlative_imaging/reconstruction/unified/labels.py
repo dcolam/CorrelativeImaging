@@ -113,7 +113,7 @@ def sheet(S: pd.DataFrame, H: pd.DataFrame, O: pd.DataFrame, out: Path, e: dict,
                     if c in names:
                         k = names.index(c)
                         from .view import display_range
-                        lo, hi = display_range(z["img"][k], z["bg"][k], z["noise"][k])
+                        lo, hi = display_range(z["img"][k])            # one channel alone: its own range
                         grey[c] = np.clip((z["img"][k] - lo) / max(hi - lo, 1e-6), 0, 1)
             else:
                 o = Oi.loc[(r["plate_id"], r["image_id"], r["obj"])]

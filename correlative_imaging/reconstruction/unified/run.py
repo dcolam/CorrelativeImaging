@@ -70,7 +70,25 @@ def _display_top(F: dict, H: pd.DataFrame, colour: list, marker: list) -> dict:
         field_[c] = float(np.percentile(v, 90)) if len(v) else 1.0
     hole = {c: float(np.nanpercentile(H.loc[H[f"pos_{c}"].astype(bool), f"snr_{c}"], 90))
             if f"pos_{c}" in H and H[f"pos_{c}"].astype(bool).any() else 50.0 for c in colour + marker}
-    return dict(field=field_, hole=hole)
+    # the channel balance of the thumbnails: the brightest pixel of a typical positive surrounding cell of each channel
+    # (median over its unsaturated positive cells; a channel without objects of its own: its brightest cell median).
+    # Each thumbnail is then stretched from its minimum to its maximum (view.limits), so only the balance comes from here
+    field_max = {}
+    for c in colour + marker:
+        own = O[(O.channel == c) & O.get("learn", True)] if "channel" in O else O.iloc[:0]
+        if "max_intensity" in own:
+            ok = own.max_intensity.notna() & (own.get("saturated_px", 0) == 0)
+            if f"pos_{c}" in own and own[f"pos_{c}"].fillna(False).astype(bool)[ok].sum() >= 20:
+                ok &= own[f"pos_{c}"].fillna(False).astype(bool)
+            v = own.loc[ok, "max_intensity"]
+        else:
+            v = pd.Series(dtype=float)
+        if len(v):
+            field_max[c] = float(v.median())
+        else:
+            m = O[f"med_{c}"].dropna() if f"med_{c}" in O else pd.Series(dtype=float)
+            field_max[c] = float(m.quantile(0.9)) if len(m) else None
+    return dict(field=field_, hole=hole, field_max=field_max)
 
 
 def run(results, out=None, workers: int = 8, log=print) -> Path:

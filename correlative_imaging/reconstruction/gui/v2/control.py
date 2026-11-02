@@ -47,14 +47,9 @@ def _rgb(hexc: str) -> np.ndarray:
 
 
 def auto_rule(a: np.ndarray) -> tuple:
-    """As the first contrast of every item (unified/view.py display_range): background = median, up to the 99.8th
-    percentile but at least 15 noise SDs above it."""
-    a = a[np.isfinite(a)]
-    if not len(a):
-        return 0.0, 1.0
-    med = float(np.median(a))
-    sd = 1.4826 * float(np.median(np.abs(a - med)))
-    return med, max(float(np.percentile(a, 99.8)), med + 15 * sd, med + 1e-3)
+    """As the first contrast of every item (unified/view.py display_range): minimum to maximum, no clipping."""
+    from ...unified.view import display_range
+    return display_range(a)
 
 
 class ControlView(QWidget):

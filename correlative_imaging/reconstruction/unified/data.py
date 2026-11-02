@@ -51,10 +51,14 @@ def _plate(pr) -> dict:
     im["file_barcode"] = im.filename.str.extract(r"(\d{2}[A-Z]\d{4,5})")[0]
     im = im.drop(columns="metadata").assign(plate_id=plate, plate_dir=str(pr.db_path.parent),
                                              diag=str(pr.diagnostics_dir) if pr.diagnostics_dir else "")
+    has = {r[1] for r in con.execute("pragma table_info(particle_measurements)")}
+    mx = ", max_intensity" if "max_intensity" in has else ""          # brightest pixel: the thumbnails' white point
     P = pd.read_sql("select image_id, channel, roi_mask, label, area_um2, area_px, circularity, solidity, eccentricity, "
                     "median_intensity, ring_median_intensity, ring_px, centroid_row, centroid_col, cut_at_edge, "
-                    "saturated_px, share_inside from particle_measurements "
+                    f"saturated_px, share_inside{mx} from particle_measurements "
                     "where roi_mask in ('whole_image', 'roi_hole')", con)
+    if not mx:
+        P["max_intensity"] = np.nan
     C = pd.read_sql("select image_id, roi_mask, primary_channel, primary_label, secondary_channel, "
                     "secondary_median_intensity, secondary_ring_median_intensity, mask_overlap_fraction "
                     "from colocalization_per_particle where roi_mask in ('whole_image', 'roi_hole')", con)
@@ -103,9 +107,15 @@ def _local_dirs(T: dict) -> dict:
     return T
 
 
+def _current(cache: Path) -> bool:
+    """A cache written before max_intensity was read is read again (seconds to minutes, no images)."""
+    import pyarrow.parquet as pq
+    return "max_intensity" in pq.read_schema(cache / "objects.parquet").names
+
+
 def load_run(root, run_tag, cache: Path, log=print) -> dict:
     cache = Path(cache)
-    if all((cache / f"{t}.parquet").exists() for t in TABLES):
+    if all((cache / f"{t}.parquet").exists() for t in TABLES) and _current(cache):
         return _local_dirs({t: pd.read_parquet(cache / f"{t}.parquet") for t in TABLES})
     runs = {g.run_tag: g for g in discover_runs(root)}
     if run_tag not in runs:
