@@ -28,6 +28,7 @@ from qtpy.QtWidgets import (QComboBox, QFileDialog, QFormLayout, QGroupBox, QHBo
 
 from . import canvas
 from .asker import Asker
+from .control import ControlView
 
 STEPS = {"detect": "Detect", "first": "First pass", "label": "Label", "learn": "Learn", "report": "Report"}
 ACTIONS = {"detect": "Run Detect", "first": "Run first pass", "label": "Open Label", "learn": "Learn from my labels",
@@ -89,6 +90,11 @@ class FirstPassTab(QWidget):
         self.last.setProperty("role", "hint")
         row.addWidget(self.last, 1)
         v.addLayout(row)
+        self.report_link = QLabel("<a href='report' style='color:#6cb6ff'>Open the report in the browser</a>")
+        self.report_link.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        self.report_link.linkActivated.connect(lambda _: app.open_report())
+        self.report_link.setVisible(False)
+        v.addWidget(self.report_link)
         self.bar = QProgressBar()
         self.bar.setRange(0, 5)
         self.bar.setFormat("%v/5")
@@ -181,6 +187,7 @@ class FirstPassTab(QWidget):
     def fill(self):
         self.fill_setup()
         S = self.app.summary()
+        self.report_link.setVisible(bool(self.app.out and (self.app.out / "report.html").exists()))
         self.last.setText(f"last run: {S.get('minutes', '?')} min" if S else "not run yet: the first run reads every "
                           "hole image once (15-40 min); later runs take 2-6 min")
         try:
@@ -335,6 +342,10 @@ class LabelTab(QWidget):
         c = R.your_label[R.your_label != ""].value_counts()
         self.counts.setText(" · ".join(f"{k} {v}" for k, v in c.items()) + f" · left {int((R.your_label == '').sum())}")
         self.app.update_strip()
+        try:
+            self.app.control.fill()                       # the white frames: what you labelled
+        except Exception:                                                   # noqa: BLE001
+            pass
 
 
 class LearnTab(QWidget):
@@ -416,7 +427,7 @@ class ReportTab(QWidget):
         v.setContentsMargins(4, 4, 4, 4)
         row = QHBoxLayout()
         ob = QPushButton("Open in browser")
-        ob.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.app.out / "report.html"))))
+        ob.clicked.connect(lambda: self.app.open_report())
         row.addWidget(ob)
         fb = QPushButton("Open output folder")
         fb.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.app.out))))
@@ -451,7 +462,7 @@ class AppV2:
         from ..theme import stylesheet, theme
         self.v = viewer
         self.results, self.out, self._V, self._S = None, None, None, None
-        self.workers = workers or max(2, (os.cpu_count() or 4) - 2)
+        self.workers = workers or min(max(2, (os.cpu_count() or 4) - 2), 16)   # reading from the share limits it anyway
         self.busy = False
         self.bus = _Bus()
         self.bus.log.connect(self._log)
@@ -481,7 +492,10 @@ class AppV2:
         lay.addWidget(self.tabs, 1)
         self.host.setStyleSheet(stylesheet(t))
         self.host.setMinimumWidth(640)
-        viewer.window.add_dock_widget(self.host, area="right", name="Cell reconstruction v2")
+        dock = viewer.window.add_dock_widget(self.host, area="right", name="Cell reconstruction v2")
+        from ....gui_common.docks import add_control_view
+        self.control = ControlView(self)
+        add_control_view(viewer, self.control, right_dock=dock, right_width=640)
         viewer.text_overlay.visible = True
         viewer.text_overlay.position = "top_left"
         if results:
@@ -574,6 +588,10 @@ class AppV2:
             w.fill()
             if w is not self.first_tab:
                 self.first_tab.fill()
+            try:
+                self.control.fill()
+            except Exception as ex:                                         # noqa: BLE001
+                self.say(f"plate: {ex}")
         self.update_strip()
 
     # ------------------------------------------------------------------------------------------- canvas
@@ -583,8 +601,18 @@ class AppV2:
             return
         try:
             self.v.text_overlay.text = canvas.show(self.v, V, item)
+            for name, cb in self.control.ov.items():         # keep the overlays as switched in the Control view
+                self.control._set_vis(name, cb.isChecked())
+            self.control.mark(item["plate_id"], item["well_id"])
         except Exception as ex:                                             # noqa: BLE001
             self.say(f"cannot show {item.get('plate_id')} {item.get('well_id')}: {ex}")
+
+    def open_report(self):
+        f = self.out / "report.html" if self.out else None
+        if f is not None and f.exists():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(f)))
+        else:
+            self.say("no report yet: it is written by every first-pass run")
 
     def say(self, msg: str):
         self.first_tab.log.appendPlainText(msg)
@@ -621,7 +649,7 @@ class AppV2:
         def done(*_):
             self.busy = False
             self.first_tab.run_b.setEnabled(True)
-            self.say("done")
+            self.say(f"done. Report: {self.out / 'report.html'} (link above, or the Report tab)")
             self.refresh()
 
         def failed(ex):

@@ -148,12 +148,14 @@ def run(results, out=None, workers: int = 8, log=print) -> Path:
         log(f"   label model from {linfo['n']} labels {linfo['labels']}: leave-one-out accuracy {linfo['acc']:.2f}")
     else:
         log(f"   no label model: {linfo['why']}")
+    from . import hue
+    hue.add(H, F["O"], F, e)                              # each cell's colour as seen on screen
     keep = ["plate_id", "well_id", "image_id", "cls", "pattern", "confidence", "flags", "status_cell", "cell_um2", "cells_in_body",
             "cell_in_hole", "hole_um2"] + [f"{p}_{c}" for c in colour + marker for p in ("own", "snr")] + \
         [f"q_{c}" for c in colour] + [f"pos_{c}" for c in colour + marker if f"pos_{c}" in H] + \
         [f"shape_only_{c}" for c in colour if f"shape_only_{c}" in H] + \
         ["nb_nearest_um", "nb_nearest_cls", "p_shape", "part_p", "part_um2", "bio_label", "bio_p"] + [f"part_{c}" for c in colour] + \
-        [f"x_{c}" for c in colour]
+        [f"x_{c}" for c in colour] + ["hue", "purity", "strength", "mix"]
     H[[k for k in keep if k in H]].to_csv(out / "hole_calls.csv", index=False)
     O = F["O"]
     O.drop(columns=[c for c in O.columns if c.startswith(("med_", "ring_"))]).to_parquet(out / "field_cells.parquet",

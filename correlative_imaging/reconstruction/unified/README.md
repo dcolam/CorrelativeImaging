@@ -20,7 +20,13 @@ colour, the hole (yellow), the grown cell (cyan), the asked particle (white), or
 | First pass | Setup (channel names and roles, excluded / empty wells), **Run first pass**, then answer its **questions**: only where this dataset cannot decide on its own, each with the reason and how many answers it needs (wells with few cells; cell or not for hole particles; one cell? for the cell size; is a channel positive near its cut; one cell or several for large hole cells). Answers are saved at once; run again to apply them. "What it found": patterns, cuts, flags |
 | Label | Your **biological labels** in your own words (+ new label), on holes and surrounding cells drawn at random from every channel pattern, interspersed; correct the positive channels where you see it differently. "More suggestions" adds items |
 | Learn | **Learn from my labels**: the LDA, how often it agrees with you (each label predicted by a model that did not see it), the confusion table, pattern × label; "Label the unsure ones" sends uncertain cells back to Label |
-| Report | the full report (also "Open in browser") |
+| Report | the full report (also "Open in browser"; after every run also a link in the First pass tab) |
+
+On the left, the **Control view** (tabbed with napari's layer list), as in ci gui / ci reconstruct v1: the plate (click a
+well: its hole; double-click: the whole image), coloured by *cell colour* (the hole cell's colour as seen on screen),
+*channel pattern*, *your label* or *checks*, with a white frame where you answered or labelled something; the channel
+histogram of the canvas layers (min / max handles, gamma, auto; right-click a channel to change its colour, saved in
+experiment.json and used everywhere); the overlay switches; the cell-colour histogram of the last run.
 
 Keys in the thumbnail grids: 1-9 answer, 0 clear, arrows move, Space open in the canvas, PgDn/PgUp page.
 
@@ -59,7 +65,8 @@ Output goes to `<results>/unified/` (or `--out`). Nothing else is changed. The f
 ## Outputs
 
 - `report.html`: everything, readable top to bottom.
-- `hole_calls.csv`: one row per hole: channel positivity (`pattern`), your label or the predicted one (`bio_label`, `bio_p`), flags, the signals behind the call.
+- `hole_calls.csv`: one row per hole: channel positivity (`pattern`), your label or the predicted one (`bio_label`, `bio_p`), flags, the signals behind the call, the cell's colour (`hue`, `purity`, `strength`, `mix`).
+- `cell_colours.png`: the hue histogram (surrounding vs hole cells); the report's section 5 has it per label too.
 - `field_cells.parquet`, `field_cells_per_well.csv`: every surrounding cell and the counts per well.
 - `checks.csv`, `summary.json`, `measurements.parquet`, `wells/` (crops for the example images).
 

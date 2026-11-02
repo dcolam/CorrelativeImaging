@@ -353,6 +353,21 @@ def write(out: Path, T, P, W, F, C, size, H, cal, e, path_map, summary, linfo=No
                          f"<img src=\"{_b64(grid(imgs, labs, str(lab), ncol=6, size=2.2))}\">")
     S.append(("4 Your labels", "".join(t)))
 
+    # ---- 5 cell colours ----
+    if "hue" in H:
+        from . import hue as hue_mod
+        t = ["<p>Each cell's colour as you see it on screen: the channels' display colours mixed by each channel's "
+             "signal relative to a typical positive cell (hole cells and surrounding cells each against their own). "
+             "The line is the share of cells per 10 degrees of hue; the ring shows the hues and where each channel's "
+             "own colour sits. Cells with several channels about equally strong mix to near white and are counted "
+             f"below the plot, not placed on the circle; cells weaker than {hue_mod.WEAK:.2f} of a typical positive "
+             "cell in every channel have no colour and are left out.</p>"]
+        for i, (title, fig) in enumerate(hue_mod.figures(H, O, e)):
+            if i == 0:
+                fig.savefig(out / "cell_colours.png", dpi=110)       # the tool shows it next to the plate
+            t.append(f"<h3>{html.escape(title)}</h3><img style='max-width:520px' src=\"{_b64(fig)}\">")
+        S.append(("5 Cell colours", "".join(t)))
+
     # ---- interventions ----
     iv = out / "interventions"
     iv.mkdir(exist_ok=True)

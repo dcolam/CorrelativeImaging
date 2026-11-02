@@ -42,6 +42,10 @@ TERMS = [
     ("dim (e.g. 'FITC? (dim)')", "A hole cell with no channel above its cut whose strongest channel reaches half its "
      "cut and at least twice the next (or is above the cut but no brighter than an empty hole). Probably dim and "
      "positive in that channel; the channels you see positive in the label sheet set where dim starts."),
+    ("cell colour (hue)", "A cell's colour as seen on screen: the channels' display colours mixed by each channel's "
+                          "signal relative to a typical positive cell (capped at one). Hue = the angle on the colour "
+                          "circle; purity = how much one hue dominates (several channels equally strong mix to near "
+                          "white); cells below a quarter of a typical positive cell in every channel have no colour."),
     ("fragment", "A hole cell smaller than a quarter of a cell body."),
     ("q-value", "Mirrored false-discovery rate: among cells this bright in a channel, the expected share that are "
                 "only noise (from the cells below 0, mirrored). Positive at q < 0.05."),

@@ -22,6 +22,8 @@ import re
 from pathlib import Path
 
 GREY = "#bbbbbb"          # the old fallback: channels saved with it get their colour resolved again
+UNKNOWN = "#bfbfbf"       # config.default_color when neither the name nor the wavelength says a colour
+FREE = {"#3b6fff": 225, "#38d9e8": 186, "#f2c12e": 45, "#ff8c1a": 30, "#e8413c": 2, "#e0398a": 330, "#2fbf4a": 130}
 DEFAULT_COLORS = {"GFP": "#2fbf4a", "mCherry": "#e8413c", "mScarlet": "#e0398a", "BFP": "#3b6fff"}
 
 
@@ -56,6 +58,24 @@ def _colour(c: str, name: str, *sources) -> str:
     return guess if guess != "#bfbfbf" else default_color(c)
 
 
+def _hue(hexc: str) -> float:
+    import colorsys
+    h = hexc.lstrip("#")
+    return colorsys.rgb_to_hsv(*(int(h[i:i + 2], 16) / 255 for i in (0, 2, 4)))[0] * 360
+
+
+def _spread(chans: dict) -> None:
+    """Channels without a known colour (e.g. named 'ROMK') get the free colour farthest on the hue circle from the
+    colours already taken, so every channel stays distinguishable on any setup."""
+    for c, v in chans.items():
+        if str(v.get("color", "")).lower() not in (UNKNOWN, GREY, ""):
+            continue
+        taken = [_hue(w["color"]) for k, w in chans.items() if k != c and str(w.get("color", "")).lower()
+                 not in (UNKNOWN, GREY, "")]
+        dist = lambda h: min((min(abs(h - t), 360 - abs(h - t)) for t in taken), default=360)
+        v["color"] = max(FREE, key=lambda k: dist(FREE[k]))
+
+
 def default(run_json: dict) -> dict:
     cfg = run_json.get("config", {})
     chans = run_json.get("channels", [])
@@ -67,6 +87,7 @@ def default(run_json: dict) -> dict:
         name = (disp.get(c) or {}).get("name") or (stored.get(c) or {}).get("name") or c
         out[c] = {"name": name, "role": "marker" if c in markers else "colour",
                   "color": _colour(c, name, disp, stored)}
+    _spread(out)
     return {"channels": out, "colour_priority": [], "marker_negative": {}, "exclude_wells": [], "empty_wells": [],
             "cell_size_um2": {}}
 
@@ -82,7 +103,7 @@ def load(out: Path, run_json: dict) -> dict:
     # colours saved as the old grey fallback: resolve them again (Detect's settings, ci gui, dye name / wavelength)
     fixed = False
     for c, v in e["channels"].items():
-        if str(v.get("color", "")).lower() in (GREY, "") and c in d:
+        if str(v.get("color", "")).lower() in (GREY, UNKNOWN, "") and c in d:
             v["color"] = d[c]["color"]
             fixed = True
     if fixed:

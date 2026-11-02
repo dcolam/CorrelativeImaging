@@ -166,15 +166,14 @@ def features(D: pd.DataFrame, chans: list, scale: dict, kind: str) -> np.ndarray
     return np.column_stack(cols) if cols else np.zeros((len(D), 0))
 
 
-def fit(R: pd.DataFrame, H: pd.DataFrame, O: pd.DataFrame, F: dict, cal: dict) -> dict:
-    """The label model from your labels. Adds bio_label / bio_p to H and O; returns what the report shows."""
-    from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
-    from sklearn.model_selection import LeaveOneOut, cross_val_predict
+def scales(H: pd.DataFrame, O: pd.DataFrame, F: dict) -> tuple[dict, dict]:
+    """{channel: (column, typical positive value)} for hole cells and for surrounding cells. Each channel is taken
+    relative to a typical positive cell of the same population: hole cells are dimmed by the hole, surrounding cells
+    are not, so raw signals or cut units would not be comparable between the two."""
     colour, marker = F["colour"], F["marker"]
-    chans = colour + marker
-    # each channel relative to a typical positive cell of the same population: hole cells are dimmed by the hole,
-    # surrounding cells are not, so raw signals or cut units would not be comparable between the two
     def typical(D, col, pos, sel):
+        if col not in D or pos not in D:
+            return None
         v = D.loc[sel & D[pos].fillna(False).astype(bool), col].astype(float)
         v = v[np.isfinite(v) & (v > 0)]
         return float(v.median()) if len(v) >= 5 else None
@@ -182,8 +181,18 @@ def fit(R: pd.DataFrame, H: pd.DataFrame, O: pd.DataFrame, F: dict, cal: dict) -
     hcol.update({m: f"hsig_{m}" if f"hsig_{m}" in H else f"own_{m}" for m in marker})
     fcol = {c: f"k_{c}" for c in colour}
     fcol.update({m: f"y_{m}" for m in marker})
-    hole_scale = {c: (hcol[c], typical(H, hcol[c], f"pos_{c}", H.valid)) for c in chans}
-    field_scale = {c: (fcol[c], typical(O, fcol[c], f"pos_{c}", O.learn)) for c in chans}
+    hole = {c: (hcol[c], typical(H, hcol[c], f"pos_{c}", H.valid)) for c in colour + marker}
+    field = {c: (fcol[c], typical(O, fcol[c], f"pos_{c}", O.learn)) for c in colour + marker}
+    return hole, field
+
+
+def fit(R: pd.DataFrame, H: pd.DataFrame, O: pd.DataFrame, F: dict, cal: dict) -> dict:
+    """The label model from your labels. Adds bio_label / bio_p to H and O; returns what the report shows."""
+    from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+    from sklearn.model_selection import LeaveOneOut, cross_val_predict
+    colour, marker = F["colour"], F["marker"]
+    chans = colour + marker
+    hole_scale, field_scale = scales(H, O, F)
     info = dict(used=False, n=0, labels={}, why="")
     H["bio_label"], H["bio_p"] = "", np.nan
     O["bio_label"], O["bio_p"] = "", np.nan

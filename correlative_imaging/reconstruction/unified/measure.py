@@ -21,6 +21,7 @@ and noise the residual was computed with (run database). Nothing is written next
 """
 from __future__ import annotations
 
+import os
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
@@ -222,6 +223,7 @@ def measure(T: dict, W: pd.DataFrame, e: dict, results: Path, out: Path, path_ma
                          drop=(drop or {}).get((r.plate_id, r.well_id), {})))
     log(f"  measuring {len(jobs)} holes")
     rows = []
+    workers = max(1, min(int(workers), 61 if os.name == "nt" else 256, len(jobs) or 1))   # Windows allows at most 61
     with ProcessPoolExecutor(workers) as ex:
         for i, o in enumerate(ex.map(_one, jobs, chunksize=4)):
             rows.append(o)
