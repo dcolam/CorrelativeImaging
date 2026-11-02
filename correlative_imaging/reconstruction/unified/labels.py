@@ -6,8 +6,12 @@
               where you disagree with the first pass or it says dim, the channels you see positive
   your labels set the dim cut per channel (call.py), feed the shape model (cell / not a cell), and train the label
               model: LDA (shrinkage) on the per-channel signals relative to a typical positive cell of the same
-              population (holes are dimmed by the hole), holes and surrounding cells together. Leave-one-out accuracy on your labels; every hole and surrounding cell gets the most
-              likely label and its probability ("unsure" below 0.7). Labels with fewer than 3 examples are left out
+              population (holes are dimmed by the hole), holes and surrounding cells together. Leave-one-out accuracy
+              on the hand labels. Labels with fewer than 3 examples are left out.
+  outputs     two separate columns on every hole and surrounding cell: predicted_label (the model's most likely label,
+              "not sure" below 0.7) with predicted_p, and hand_label (the label given by hand, empty if none).
+              label_model.csv: every hand-labelled cell with its two discriminant coordinates (LD1, LD2), its hand
+              label and the leave-one-out prediction (what the report and figures draw)
 """
 from __future__ import annotations
 
@@ -19,6 +23,7 @@ import pandas as pd
 
 MIN_PER_LABEL = 3
 SURE = 0.7
+NOT_SURE = "not sure"
 NOT_A_CELL = ("not a cell", "no cell", "halo", "plug", "debris", "no")
 
 
@@ -191,7 +196,8 @@ def scales(H: pd.DataFrame, O: pd.DataFrame, F: dict) -> tuple[dict, dict]:
 
 
 def fit(R: pd.DataFrame, H: pd.DataFrame, O: pd.DataFrame, F: dict, cal: dict) -> dict:
-    """The label model from your labels. Adds bio_label / bio_p to H and O; returns what the report shows."""
+    """The label model from the hand labels. Adds predicted_label / predicted_p / hand_label to H and O; returns what
+    the report shows (model_table: the hand-labelled cells on the discriminant axes)."""
     from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
     from sklearn.model_selection import LeaveOneOut, cross_val_predict
     colour, marker = F["colour"], F["marker"]
@@ -205,8 +211,9 @@ def fit(R: pd.DataFrame, H: pd.DataFrame, O: pd.DataFrame, F: dict, cal: dict) -
     def design(D, a, b):
         return np.hstack([features(D, chans, a, ""), features(D, colour, b, "")])
     info = dict(used=False, n=0, labels={}, why="")
-    H["bio_label"], H["bio_p"] = "", np.nan
-    O["bio_label"], O["bio_p"] = "", np.nan
+    for D in (H, O):
+        D["predicted_label"], D["predicted_p"], D["hand_label"] = "", np.nan, ""
+    _hand(R, H, O)
     if not len(R):
         info["why"] = "no labels yet"
         return info
@@ -222,8 +229,10 @@ def fit(R: pd.DataFrame, H: pd.DataFrame, O: pd.DataFrame, F: dict, cal: dict) -
     X = np.vstack([design(hk, hole_scale, hole_own), design(fk, field_scale, field_own)])
     y = np.concatenate([hk.your_label.to_numpy(), fk.your_label.to_numpy()])
     kind = np.array(["hole"] * len(hk) + ["surrounding"] * len(fk))
+    keys = pd.concat([hk[["plate_id", "well_id"]].assign(image_id="", obj=""),
+                      fk[["plate_id", "well_id", "image_id", "obj"]]], ignore_index=True)
     ok = np.isfinite(X).all(1)
-    X, y, kind = X[ok], y[ok], kind[ok]
+    X, y, kind, keys = X[ok], y[ok], kind[ok], keys[ok].reset_index(drop=True)
     cnt = pd.Series(y).value_counts()
     keep = cnt[cnt >= MIN_PER_LABEL].index
     m = np.isin(y, keep)
@@ -231,27 +240,42 @@ def fit(R: pd.DataFrame, H: pd.DataFrame, O: pd.DataFrame, F: dict, cal: dict) -
     if len(keep) < 2:
         info["why"] = f"at least 2 labels with {MIN_PER_LABEL}+ examples needed (have: {cnt.to_dict()})"
         return info
-    X, y, kind = X[m], y[m], kind[m]
+    X, y, kind, keys = X[m], y[m], kind[m], keys[m].reset_index(drop=True)
     lda = LinearDiscriminantAnalysis(solver="lsqr", shrinkage="auto")
     cv = cross_val_predict(LinearDiscriminantAnalysis(solver="lsqr", shrinkage="auto"), X, y, cv=LeaveOneOut())
     lda.fit(X, y)
     info.update(used=True, n=int(len(y)), acc=float(np.mean(cv == y)),
                 acc_hole=float(np.mean(cv[kind == "hole"] == y[kind == "hole"])) if (kind == "hole").any() else np.nan,
-                confusion=pd.crosstab(pd.Series(y, name="your label"), pd.Series(cv, name="predicted")),
+                confusion=pd.crosstab(pd.Series(y, name="hand label"), pd.Series(cv, name="predicted")),
                 classes=list(lda.classes_), X=X, y=y)
+    # the model as a picture: the hand-labelled cells on the discriminant axes (the eigen solver gives the same
+    # shrinkage LDA with a projection; lsqr has none)
+    try:
+        Z = LinearDiscriminantAnalysis(solver="eigen", shrinkage="auto").fit(X, y).transform(X)
+    except Exception:                                                        # noqa: BLE001
+        Z = np.full((len(y), 1), np.nan)
+    Z = np.column_stack([Z, np.full((len(y), 2), np.nan)])[:, :2]
+    info["model_table"] = keys.assign(kind=kind, hand_label=y, ld1=Z[:, 0], ld2=Z[:, 1], loo_predicted=cv)
     for D, scale, own, sel in [(H, hole_scale, hole_own, H.valid), (O, field_scale, field_own, O.learn)]:
         Xd = design(D, scale, own)
         good = sel.to_numpy() & np.isfinite(Xd).all(1)
         if good.any():
             p = lda.predict_proba(Xd[good])
             lab = lda.classes_[p.argmax(1)]
-            D.loc[good, "bio_p"] = p.max(1)
-            D.loc[good, "bio_label"] = np.where(p.max(1) >= SURE, lab, "unsure")
-    # your own labels win for the holes you labelled
-    own = {(r["plate_id"], r["well_id"]): r["your_label"] for r in R[R.kind == "hole"].to_dict("records")
-           if r["your_label"]}
-    k = [own.get((str(p), str(w))) for p, w in zip(H.plate_id, H.well_id)]
-    sel = [v is not None for v in k]
-    H.loc[sel, "bio_label"] = [f"{v} (you)" for v in k if v is not None]
-    H.loc[sel, "bio_p"] = 1.0
+            D.loc[good, "predicted_p"] = p.max(1)
+            D.loc[good, "predicted_label"] = np.where(p.max(1) >= SURE, lab, NOT_SURE)
     return info
+
+
+def _hand(R: pd.DataFrame, H: pd.DataFrame, O: pd.DataFrame) -> None:
+    """hand_label on the holes and surrounding cells labelled by hand (any answer: a type, not a cell, unsure)."""
+    if not len(R):
+        return
+    R = R[R.your_label != ""]
+    hole = {(str(r["plate_id"]), str(r["well_id"])): r["your_label"] for r in R[R.kind == "hole"].to_dict("records")}
+    H["hand_label"] = [hole.get((str(p), str(w)), "") for p, w in zip(H.plate_id, H.well_id)]
+    fld = {(str(r["plate_id"]), str(r["image_id"]), str(r["obj"])): r["your_label"]
+           for r in R[R.kind != "hole"].to_dict("records")}
+    if fld and "label" in O:
+        O["hand_label"] = [fld.get((str(p), str(i), f"{c}:{l}"), "")
+                           for p, i, c, l in zip(O.plate_id, O.image_id, O.channel, O.label)]

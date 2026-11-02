@@ -3,7 +3,7 @@
   plate          one button per well (gui_common.plate.PlateGrid), coloured by
                    cell colour       the hole cell's colour as seen on screen (channels mixed, unified/hue.py)
                    channel pattern   the first pass's positive channels, mixed in their colours (dim: darker)
-                   your label        the label model's call (your own label where you gave one)
+                   cell type         the hand label where one was given, else the predicted label
                    checks            ok / flagged / no cell / excluded / empty well / no hole
                  white frame: you answered a question or labelled something in that well. Click: the hole on the
                  canvas; double-click: the whole image.
@@ -72,7 +72,7 @@ class ControlView(QWidget):
 
         v.addWidget(_section("Plate"))
         self.plate = PlateGrid({"cell colour": self._c_mix, "channel pattern": self._c_pattern,
-                                "your label": self._c_label, "checks": self._c_check},
+                                "cell type": self._c_label, "checks": self._c_check},
                                legend_fn=self._legend, frame_fn=self._frame, tip_fn=self._tip)
         self.plate.well_clicked.connect(lambda p, w: app.open_item({"kind": "hole", "plate_id": p, "well_id": w}))
         self.plate.well_double_clicked.connect(
@@ -133,8 +133,9 @@ class ControlView(QWidget):
         hc = out / "hole_calls.csv"
         if hc.exists():
             H = pd.read_csv(hc, dtype={"plate_id": str, "well_id": str})
-            keep = [c for c in ("plate_id", "well_id", "pattern", "status_cell", "flags", "bio_label", "mix", "cls")
-                    if c in H]
+            H = H.rename(columns={"bio_label": "predicted_label"})                  # older runs
+            keep = [c for c in ("plate_id", "well_id", "pattern", "status_cell", "flags", "predicted_label", "hand_label",
+                                "mix", "cls") if c in H]
             W = W.merge(H[keep].drop_duplicates(["plate_id", "well_id"]), on=["plate_id", "well_id"], how="left")
         touched = set()
         iv = out / "interventions"
@@ -148,11 +149,13 @@ class ControlView(QWidget):
                     A = A[(A.your_label != "") | (A.get("positive_channels", "") != "")]
                 touched |= set(zip(A.plate_id, A.well_id))
         W["touched"] = [(p, w) in touched for p, w in zip(W.plate_id, W.well_id)]
-        for c in ("pattern", "status_cell", "flags", "bio_label", "mix", "your_label"):
+        for c in ("pattern", "status_cell", "flags", "predicted_label", "hand_label", "mix", "your_label"):
             if c not in W:
                 W[c] = ""
         W = W.fillna("")
-        labs = [l for l in pd.concat([W.your_label, W.bio_label]).value_counts().index if l and l != "unsure"]
+        W["hand_label"] = W.hand_label.where(W.hand_label != "", W.your_label)    # labelled since the last run too
+        labs = [l for l in pd.concat([W.hand_label, W.predicted_label]).value_counts().index
+                if l and l not in ("unsure", "not sure", "not a cell")]
         self.label_colour = {l: LABEL_COLOURS[i % len(LABEL_COLOURS)] for i, l in enumerate(labs)}
         self.D = W
         self.plate.set(W, stage=f"first pass of {pd.Timestamp.fromtimestamp((out / 'summary.json').stat().st_mtime):%d.%m. %H:%M}"
@@ -212,7 +215,7 @@ class ControlView(QWidget):
         return self._status(r) or self._pattern_colour(str(r.get("pattern", "")))
 
     def _c_label(self, r) -> str:
-        lab = r.get("your_label") or r.get("bio_label")
+        lab = r.get("hand_label") or r.get("predicted_label")
         return self._status(r) or self.label_colour.get(lab, NO_CELL)
 
     def _frame(self, r):
@@ -222,11 +225,11 @@ class ControlView(QWidget):
         t = [f"{plate} {well}", str(r.get("status", ""))]
         if r.get("status_cell"):
             t.append(f"{r.get('pattern', '')} ({r.get('status_cell')})")
-        if r.get("bio_label"):
+        if r.get("predicted_label"):
             from ...unified.vocab import shown
-            t.append(f"label model: {shown(r['bio_label'])}")
-        if r.get("your_label"):
-            t.append(f"your label: {r['your_label']}")
+            t.append(f"predicted label: {shown(r['predicted_label'])}")
+        if r.get("hand_label"):
+            t.append(f"hand label: {r['hand_label']}")
         if r.get("flags"):
             t.append(f"flags: {r['flags']}")
         return "\n".join(x for x in t if x)
@@ -241,8 +244,8 @@ class ControlView(QWidget):
         if mode == "channel pattern":
             c = d.pattern.where(d.status_cell == "cell", "").value_counts()
             return " ".join(f"{sw(self._pattern_colour(p))} {p} {n}" for p, n in c.items() if p)
-        if mode == "your label":
-            lab = d.your_label.where(d.your_label != "", d.bio_label)
+        if mode == "cell type":
+            lab = d.hand_label.where(d.hand_label != "", d.predicted_label)
             c = lab[d.status_cell == "cell"].value_counts()
             return (" ".join(f"{sw(self.label_colour.get(l, NO_CELL))} {l} {n}" for l, n in c.items() if l)
                     or "no labels yet (Label tab, then Learn)")

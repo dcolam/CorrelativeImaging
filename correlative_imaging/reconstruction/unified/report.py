@@ -304,63 +304,65 @@ def write(out: Path, T, P, W, F, C, size, H, cal, e, path_map, summary, linfo=No
                      f"<img src=\"{_b64(grid(imgs, labs, title, ncol=6, size=2.2))}\">")
     S.append(("3 Hole cells", "".join(t)))
 
-    # ---- 4 your labels ----
+    # ---- 4 hand labels and predicted labels ----
     li = linfo or {}
     t = []
     if not li.get("used"):
-        t.append("<p>No label model yet: the calls above are channel positivity only. Cell types come only from your "
+        t.append("<p>No label model yet: the calls above are channel positivity only. Cell types come only from hand "
                  "labels (see 'What you need to do'). " + html.escape(li.get("why", "")) + "</p>")
     else:
-        t.append(f"<p>Learnt from {li['n']} of your labels (" + ", ".join(
+        t.append(f"<p>Learnt from {li['n']} hand labels (" + ", ".join(
             f"{html.escape(str(k))} {v}" for k, v in li["labels"].items()) + ")" + (
             f"; left out (fewer than 3): {html.escape(', '.join(map(str, li['left_out'])))}" if li.get("left_out")
             else "") + ". Model: LDA on each channel's signal relative to a typical positive cell of the same "
             "population (hole cells are dimmed by the hole, surrounding cells are not), holes and surrounding cells "
-            f"together. Each of your labels predicted by a model trained on all the others (leave-one-out): "
+            f"together. Each hand label predicted by a model trained on all the others (leave-one-out): "
             f"<b>{100 * li['acc']:.0f} %</b> right"
             + (f", on holes {100 * li['acc_hole']:.0f} %" if np.isfinite(li.get("acc_hole", np.nan)) else "")
-            + ". A cell gets a label when its probability is at least 0.7, otherwise 'not sure (model)' (stored as 'unsure' in hole_calls.csv).</p>")
+            + ". Every cell gets a predicted label when its probability is at least 0.7, otherwise 'not sure'. "
+              "Two separate columns in hole_calls.csv and field_cells.parquet: <code>predicted_label</code> (with "
+              "<code>predicted_p</code>) and <code>hand_label</code>.</p>")
         cf = li["confusion"]
-        t.append("<table><tr><th>your label \\ predicted</th>" + "".join(f"<th>{html.escape(str(c))}</th>"
-                                                                          for c in cf.columns) + "</tr>" + "".join(
+        t.append("<table><tr><th>hand label \\ predicted (left out)</th>" + "".join(
+            f"<th>{html.escape(str(c))}</th>" for c in cf.columns) + "</tr>" + "".join(
             f"<tr><td>{html.escape(str(i))}</td>" + "".join(f"<td>{v}</td>" for v in row) + "</tr>"
             for i, row in zip(cf.index, cf.to_numpy())) + "</table>")
-        X, y = li["X"], li["y"]
-        chans = colour + marker
-        k = min(len(chans), 3)
-        fig, ax = plt.subplots(1, max(k - 1, 1), figsize=(4.2 * max(k - 1, 1), 3.4), squeeze=False)
-        pairs = [(0, j) for j in range(1, k)] or [(0, 0)]
-        cls_ = sorted(set(y))
-        cmap = plt.get_cmap("tab10")
-        for a, (i0, j0) in zip(ax[0], pairs):
-            for n_, c_ in enumerate(cls_):
-                m = y == c_
-                a.scatter(X[m, i0], X[m, j0], s=22, color=cmap(n_ % 10), label=str(c_), edgecolor="white", lw=0.5)
-            a.set_xlabel(f"{nm[chans[i0]]} (log, 1 = typical positive cell)"); a.set_ylabel(f"{nm[chans[j0]]}")
-            a.axvline(np.log1p(1), color="k", ls=":", lw=0.8); a.axhline(np.log1p(1), color="k", ls=":", lw=0.8)
-        ax[0][0].legend(fontsize=7, frameon=False)
-        t.append("<p>Your labelled cells by their channel signals (dotted = a typical positive cell).</p>"
-                 f"<img src=\"{_b64(fig)}\">")
+        M_ = li.get("model_table")
+        if M_ is not None and np.isfinite(M_.ld1).any():
+            two = np.isfinite(M_.ld2).any()
+            fig, a = plt.subplots(figsize=(5.2, 3.8))
+            cmap = plt.get_cmap("tab10")
+            for n_, c_ in enumerate(sorted(M_.hand_label.unique())):
+                for kind_, mk in (("hole", "o"), ("surrounding", "^")):
+                    m = (M_.hand_label == c_) & (M_.kind == kind_)
+                    a.scatter(M_.ld1[m], M_.ld2[m] if two else np.zeros(int(m.sum())), s=22, marker=mk,
+                              color=cmap(n_ % 10), edgecolor="white", lw=0.5,
+                              label=f"{c_} ({kind_})")
+            a.set_xlabel("LD1"); a.set_ylabel("LD2" if two else "")
+            a.legend(fontsize=7, frameon=False, ncol=2)
+            t.append("<p>The label model: every hand-labelled cell on the two discriminant axes the model learnt "
+                     "(circles: holes, triangles: surrounding cells). Coordinates in label_model.csv.</p>"
+                     f"<img src=\"{_b64(fig)}\">")
         from .vocab import shown
-        ct = pd.crosstab(V.pattern, V.bio_label.map(shown))
+        ct = pd.crosstab(V.pattern, V.predicted_label.map(shown))
         t.append("<p>Hole cells: first-pass pattern vs predicted label.</p><table><tr><th>pattern</th>" + "".join(
             f"<th>{html.escape(str(c))}</th>" for c in ct.columns) + "</tr>" + "".join(
             f"<tr><td>{html.escape(str(i))}</td>" + "".join(f"<td>{v}</td>" for v in row) + "</tr>"
             for i, row in zip(ct.index, ct.to_numpy())) + "</table>")
-        fo = O[O.learn].bio_label.map(shown).value_counts()
+        fo = O[O.learn].predicted_label.map(shown).value_counts()
         t.append("<p>Surrounding cells by predicted label: " + ", ".join(
             f"{html.escape(str(k))} {v} ({100 * v / fo.sum():.0f} %)" for k, v in fo.items()) + ".</p>")
-        for lab in [c for c in V.bio_label.value_counts().index if c and c != "unsure"][:6]:
-            sel = V[(V.bio_label == lab)]
+        for lab in [c for c in V.predicted_label.value_counts().index if c and c not in ("unsure", "not sure")][:6]:
+            sel = V[(V.predicted_label == lab)]
             imgs, labs = [], []
             for r in sel.iloc[RNG.choice(len(sel), min(8, len(sel)), replace=False)].itertuples():
                 f = out / "wells" / f"{r.plate_id}_{r.well_id}.npz"
                 if f.exists():
-                    imgs.append(hole_rgb(f, e, white)); labs.append(f"{r.plate_id[-5:]} {r.well_id} p {r.bio_p:.2f}")
+                    imgs.append(hole_rgb(f, e, white)); labs.append(f"{r.plate_id[-5:]} {r.well_id} p {r.predicted_p:.2f}")
             if imgs:
                 t.append(f"<p>Hole cells predicted {html.escape(str(lab))} (random)</p>"
                          f"<img src=\"{_b64(grid(imgs, labs, str(lab), ncol=6, size=2.2))}\">")
-    S.append(("4 Your labels", "".join(t)))
+    S.append(("4 Hand labels and predicted labels", "".join(t)))
 
     # ---- 5 cell colours ----
     if "hue" in H:

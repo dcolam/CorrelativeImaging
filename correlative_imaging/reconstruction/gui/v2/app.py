@@ -385,17 +385,18 @@ class LearnTab(QWidget):
         t = (f"<p>Learnt from <b>{L['n']}</b> of your labels: " + ", ".join(f"{e(k)} {v}" for k, v in L["labels"].items())
              + f".</p><p>Each of your labels predicted by a model trained on all the others: <b>{100 * L['acc']:.0f} %"
              f"</b> right" + (f" (holes {100 * L['acc_hole']:.0f} %)" if L.get("acc_hole") == L.get("acc_hole") else "")
-             + ".</p><table border='1' cellspacing='0' cellpadding='3'><tr><th>your label → predicted</th>"
+             + ".</p><table border='1' cellspacing='0' cellpadding='3'><tr><th>hand label → predicted</th>"
              + "".join(f"<th>{e(c)}</th>" for c in cols) + "</tr>"
              + "".join(f"<tr><td>{e(i)}</td>" + "".join(f"<td>{r.get(c, 0)}</td>" for c in cols) + "</tr>"
                        for i, r in cf.items()) + "</table>")
         H = pd.read_csv(self.app.out / "hole_calls.csv")
-        if "bio_label" in H:
-            c = H.bio_label.fillna("").replace("", "—").map(shown).value_counts()
-            t += ("<p>Hole cells per label: " + ", ".join(f"{e(str(k))} {v}" for k, v in c.items()) + ". <i>not sure "
-                  "(model)</i>: the model's best guess is below 70 % (nothing you have to fill in).</p>")
+        pl = "predicted_label" if "predicted_label" in H else "bio_label"           # older runs: bio_label
+        if pl in H:
+            c = H[pl].fillna("").replace("", "—").map(shown).value_counts()
+            t += ("<p>Hole cells per predicted label: " + ", ".join(f"{e(str(k))} {v}" for k, v in c.items()) +
+                  ". <i>not sure</i>: the model's best guess is below 70 % (nothing you have to fill in).</p>")
             Hv = H[H.status_cell == "cell"] if "status_cell" in H else H
-            ct = pd.crosstab(Hv.pattern, Hv.bio_label.fillna("").map(shown))
+            ct = pd.crosstab(Hv.pattern, Hv[pl].fillna("").map(shown))
             t += ("<p>First-pass pattern × label:</p><table border='1' cellspacing='0' cellpadding='3'><tr><th></th>"
                   + "".join(f"<th>{e(str(c))}</th>" for c in ct.columns) + "</tr>"
                   + "".join(f"<tr><td>{e(str(i))}</td>" + "".join(f"<td>{v}</td>" for v in row) + "</tr>"
@@ -418,7 +419,8 @@ class LearnTab(QWidget):
     def unsure(self):
         out = self.app.out
         H = pd.read_csv(out / "hole_calls.csv", dtype={"plate_id": str, "well_id": str})
-        U = H[H.get("bio_label", pd.Series("", index=H.index)).fillna("") == "unsure"]
+        pl = "predicted_label" if "predicted_label" in H else "bio_label"
+        U = H[H.get(pl, pd.Series("", index=H.index)).fillna("").isin(["unsure", "not sure"])]
         if not len(U):
             self.app.say("the model is sure about every hole cell")
             return

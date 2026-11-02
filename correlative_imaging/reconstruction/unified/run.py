@@ -159,7 +159,7 @@ def run(results, out=None, workers: int = 8, log=print) -> Path:
     H, cal = call_mod.call(M, W, F, size, nb, e, results, prefix_of, reviewed, FP, chan_marks, questions.clumps(A))
     if reviewed:
         k = [reviewed.get((p, w)) == "no" for p, w in zip(H.plate_id, H.well_id)]
-        H.loc[k, "cls"] = "not a cell (you)"
+        H.loc[k, "cls"] = "not a cell (hand label)"
     log("5/5 your labels and the report")
     linfo = labels.fit(R, H, F["O"], F, cal)
     if linfo["used"]:
@@ -172,7 +172,7 @@ def run(results, out=None, workers: int = 8, log=print) -> Path:
             "cell_in_hole", "hole_um2"] + [f"{p}_{c}" for c in colour + marker for p in ("own", "snr")] + \
         [f"q_{c}" for c in colour] + [f"pos_{c}" for c in colour + marker if f"pos_{c}" in H] + \
         [f"shape_only_{c}" for c in colour if f"shape_only_{c}" in H] + \
-        ["nb_nearest_um", "nb_nearest_cls", "p_shape", "part_p", "part_um2", "bio_label", "bio_p"] + [f"part_{c}" for c in colour] + \
+        ["nb_nearest_um", "nb_nearest_cls", "p_shape", "part_p", "part_um2", "predicted_label", "predicted_p", "hand_label"] + [f"part_{c}" for c in colour] + \
         [f"x_{c}" for c in colour] + ["hue", "purity", "strength", "mix"]
     H[[k for k in keep if k in H]].to_csv(out / "hole_calls.csv", index=False)
     O = F["O"]
@@ -180,7 +180,7 @@ def run(results, out=None, workers: int = 8, log=print) -> Path:
                                                                                           index=False)
     FW = O.groupby(["plate_id", "well_id", "cls"]).size().unstack(fill_value=0)
     if linfo["used"]:
-        FW = FW.join(O[O.learn].groupby(["plate_id", "well_id", "bio_label"]).size().unstack(fill_value=0)
+        FW = FW.join(O[O.learn].groupby(["plate_id", "well_id", "predicted_label"]).size().unstack(fill_value=0)
                      .add_prefix("label: "))
     FW.to_csv(out / "field_cells_per_well.csv")
     W.to_csv(out / "checks.csv", index=False)
@@ -189,7 +189,9 @@ def run(results, out=None, workers: int = 8, log=print) -> Path:
                    shape={k: v for k, v in cal['_shape'].items() if k != 'feats'}, cuts=F["cuts"], how=F["how"],
                    bleed={f"{F['nm'][a]}->{F['nm'][b]}": float(F["K"][i, j]) for i, a in enumerate(colour)
                           for j, b in enumerate(colour) if i != j})
-    summary["labels"] = {k: v for k, v in linfo.items() if k not in ("X", "y", "confusion")}
+    summary["labels"] = {k: v for k, v in linfo.items() if k not in ("X", "y", "confusion", "model_table")}
+    if linfo.get("model_table") is not None:
+        linfo["model_table"].to_csv(out / "label_model.csv", index=False)       # the label model as a picture
     if linfo.get("used"):
         cf = linfo["confusion"]
         summary["labels"]["confusion"] = {str(i): {str(c): int(v) for c, v in row.items()} for i, row in cf.iterrows()}

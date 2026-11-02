@@ -123,10 +123,11 @@ def figures(H: pd.DataFrame, O: pd.DataFrame, e: dict) -> list:
     g = [("surrounding cells", Ol.hue.to_numpy(), Ol.purity.to_numpy(), STYLES[0]),
          ("hole cells", V.hue.to_numpy(), V.purity.to_numpy(), STYLES[1])]
     out.append(("Surrounding and hole cells", figure(g, e)))
-    if "bio_label" in V and (V.bio_label.fillna("") != "").any():
-        both = pd.concat([V[["hue", "purity", "bio_label"]], Ol[["hue", "purity", "bio_label"]]])
-        labs = [l for l in both.bio_label.fillna("").value_counts().index if l and l != "unsure"][:len(STYLES)]
-        g = [(l, both.hue[both.bio_label == l].to_numpy(), both.purity[both.bio_label == l].to_numpy(), STYLES[i])
+    if "predicted_label" in V and (V.predicted_label.fillna("") != "").any():
+        both = pd.concat([V[["hue", "purity", "predicted_label"]], Ol[["hue", "purity", "predicted_label"]]])
+        both = both.rename(columns={"predicted_label": "lab"})
+        labs = [l for l in both.lab.fillna("").value_counts().index if l and l not in ("unsure", "not sure")][:len(STYLES)]
+        g = [(l, both.hue[both.lab == l].to_numpy(), both.purity[both.lab == l].to_numpy(), STYLES[i])
              for i, l in enumerate(labs)]
         out.append(("Per label (the label model's call, hole and surrounding cells)", figure(g, e)))
     return out
