@@ -248,6 +248,14 @@ def _shape_cols(D: pd.DataFrame, field: bool) -> np.ndarray:
                             for c in ("p_shape", "part_p")])
 
 
+def _size_col(D: pd.DataFrame, field: bool) -> np.ndarray:
+    """How big the grown cell is, in typical cells (log1p of cells_in_body): a small speck in the hole is not a cell.
+    Nothing grown = 0. Surrounding cells are one cell by construction."""
+    if field or "cells_in_body" not in D:
+        return np.full((len(D), 1), np.log1p(1.0) if field else 0.0)
+    return np.log1p(D["cells_in_body"].astype(float).clip(lower=0).fillna(0.0).to_numpy())[:, None]
+
+
 def fit(R: pd.DataFrame, H: pd.DataFrame, O: pd.DataFrame, F: dict, cal: dict, reviewed: dict | None = None) -> dict:
     """The label model from every hand input. Classes: your cell types plus "no cell" (labels such as "not a cell",
     "plug", "halo", and the holes you answered "no cell" in the questions). Adds predicted_label / predicted_p /
@@ -262,11 +270,18 @@ def fit(R: pd.DataFrame, H: pd.DataFrame, O: pd.DataFrame, F: dict, cal: dict, r
     # FITC under bleed-through into TX RED); surrounding cells have one measure (already corrected), used for both
     hole_own = {c: (f"own_{c}", _typical(H, f"own_{c}", f"pos_{c}", H.valid)) for c in colour}
     field_own = {c: field_scale[c] for c in colour}
+    # a third view: the particle's colour (the object in the hole itself). The grown cell can follow a bright
+    # neighbour and lose the patched cell's colour (Olympus PNC: blue particle, grown cell red); the particle keeps it.
+    # Surrounding cells are particles already: their one measure again
+    hole_part = {c: (f"part_{c}", _typical(H, f"part_{c}", f"pos_{c}", H.valid)) if f"part_{c}" in H
+                 else hole_own[c] for c in colour}
+    field_part = {c: field_scale[c] for c in colour}
 
-    def design(D, a, b, field):
+    def design(D, a, b, p, field):
         # nothing grown in the hole = no own signal: 0, not missing (a hole valid by its particle alone is still a cell)
-        sig = np.nan_to_num(np.hstack([features(D, chans, a, ""), features(D, colour, b, "")]), nan=0.0)
-        return np.hstack([sig, _shape_cols(D, field)])
+        sig = np.nan_to_num(np.hstack([features(D, chans, a, ""), features(D, colour, b, ""),
+                                       features(D, colour, p, "")]), nan=0.0)
+        return np.hstack([sig, _shape_cols(D, field), _size_col(D, field)])
     info = dict(used=False, n=0, labels={}, why="")
     for D in (H, O):
         D["predicted_label"], D["predicted_p"], D["hand_label"] = "", np.nan, ""
@@ -293,7 +308,8 @@ def fit(R: pd.DataFrame, H: pd.DataFrame, O: pd.DataFrame, F: dict, cal: dict, r
     Oo = O.assign(obj=O.channel.astype(str) + ":" + O.label.astype(str), image_id=O.image_id.astype(str),
                   plate_id=O.plate_id.astype(str))
     fk = L[L.kind != "hole"].merge(Oo, on=["plate_id", "image_id", "obj"], how="inner", suffixes=("", "_o"))
-    X = np.vstack([design(hk, hole_scale, hole_own, False), design(fk, field_scale, field_own, True)])
+    X = np.vstack([design(hk, hole_scale, hole_own, hole_part, False),
+                   design(fk, field_scale, field_own, field_part, True)])
     y = np.concatenate([hk.your_label.to_numpy(), fk.your_label.to_numpy()])
     kind = np.array(["hole"] * len(hk) + ["surrounding"] * len(fk))
     keys = pd.concat([hk[["plate_id", "well_id"]].assign(image_id="", obj=""),
@@ -331,9 +347,9 @@ def fit(R: pd.DataFrame, H: pd.DataFrame, O: pd.DataFrame, F: dict, cal: dict, r
     # every hole with an object in it (a cell, or not a cell by shape: the label model may disagree) and every
     # surrounding cell; surrounding cells never get "not a cell" (they are cells by construction)
     with_obj = H.valid | (H.status_cell.astype(str) == "no cell (shape)")
-    for D, scale, own, sel, field in [(H, hole_scale, hole_own, with_obj, False),
-                                      (O, field_scale, field_own, O.learn, True)]:
-        Xd = design(D, scale, own, field)
+    for D, scale, own, part, sel, field in [(H, hole_scale, hole_own, hole_part, with_obj, False),
+                                            (O, field_scale, field_own, field_part, O.learn, True)]:
+        Xd = design(D, scale, own, part, field)
         good = sel.to_numpy() & np.isfinite(Xd).all(1)
         if good.any():
             p = lda.predict_proba(Xd[good])
