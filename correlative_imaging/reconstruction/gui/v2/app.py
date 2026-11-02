@@ -263,6 +263,11 @@ class LabelTab(QWidget):
         mb.setToolTip("add random holes and surrounding cells from every pattern that are not on the sheet yet")
         mb.clicked.connect(self.more)
         row.addWidget(mb)
+        fb = QPushButton("Start labels fresh")
+        fb.setToolTip("moves your labels to interventions/old_labels/ (kept, not deleted) and starts a new sheet of "
+                      "clean holes; answers to the questions stay")
+        fb.clicked.connect(self.fresh)
+        row.addWidget(fb)
         row.addStretch(1)
         self.counts = QLabel("")
         row.addWidget(self.counts)
@@ -336,6 +341,25 @@ class LabelTab(QWidget):
             self.asker._buttons()
             self.asker.items = items
             self.asker._paint()
+
+    def fresh(self):
+        import datetime
+        import shutil
+        f = self._file()
+        if f.exists():
+            if QMessageBox.question(self, "Start labels fresh",
+                                    "Your current labels are moved to interventions/old_labels/ (kept, not deleted) "
+                                    "and are no longer used. Answers to the questions stay.\n\nStart a new sheet?") \
+                    != QMessageBox.Yes:
+                return
+            old = f.parent / "old_labels"
+            old.mkdir(exist_ok=True)
+            dest = old / f"labels_{datetime.datetime.now():%Y%m%d_%H%M%S}.csv"
+            shutil.move(str(f), str(dest))
+            self.app.say(f"labels moved to {dest.name}; new sheet started. Run the first pass again after labelling")
+        self.labels = []
+        self.more()
+        self.app.refresh()
 
     def more(self):
         from ...unified import labels as L
