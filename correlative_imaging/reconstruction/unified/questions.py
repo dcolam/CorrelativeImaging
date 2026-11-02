@@ -27,10 +27,14 @@ KEYS = ["question", "plate_id", "well_id", "image_id", "obj"]
 CHOICES = {
     "wells": ["lost focus / failed: exclude", "no cells seeded: empty", "fine: keep"],
     "particle": ["cell", "several cells", "neighbour", "plug / halo", "debris", "unsure"],
-    "size": ["one cell", "several cells", "part of a cell", "no cell", "unsure"],
+    "size": ["one cell", "several cells", "part of a cell", "unsure"],      # surrounding objects: never "no cell"
     "channel": ["positive", "negative", "no cell", "unsure"],
     "clump": ["one cell", "several cells", "no cell", "unsure"],
 }
+# One rule: "no cell" is offered only on questions about a whole hole (channel, clump) and always means "this hole has
+# no cell": a "no cell" example for the label model, like "no cell" in the Label tab. The particle question is about
+# one object in the hole (a hole can hold debris and a cell): it teaches the shape model only.
+HOLE_NO_CELL = "\n\"no cell\" = this hole has no cell; it is learnt as a no-cell example (same as in the Label tab)."
 CELL = {"cell", "several cells"}
 NOT_CELL = {"neighbour", "plug / halo", "debris"}
 
@@ -169,7 +173,7 @@ def open_questions(out: Path, n_items: int = 48) -> list[dict]:
             D = pd.concat([_sample(g, max(n_items // max(P.ch.nunique() * 4, 1), 3), seed=i)
                            for i, (_, g) in enumerate(P.groupby(["ch", "_b"]))])
             need = n_cell < 15 or n_not < 15
-            Q.append(dict(id="particle", title="Cell or not? (particles in the hole)",
+            Q.append(dict(id="particle", title="Is this object a cell? (one particle in the hole, not the whole hole)",
                           why="No examples of holes without a cell yet, so a plug or the aperture's glow can pass for "
                               "a dim cell. Your answers teach the shape model what a cell looks like here.",
                           choices=CHOICES["particle"], needed=f"15 cell, 15 no cell (now {n_cell}, {n_not})",
@@ -177,9 +181,10 @@ def open_questions(out: Path, n_items: int = 48) -> list[dict]:
         else:
             U = P[(P.p_cell >= 0.3) & (P.p_cell <= 0.7)]
             share = len(U) / max(len(P), 1)
-            Q.append(dict(id="particle", title="Cell or not? (particles the shape model is unsure about)",
+            Q.append(dict(id="particle", title="Is this object a cell? (one particle the shape model is unsure about)",
                           why=f"Shape model AUC {sh.get('auc', float('nan')):.2f}; {len(U)} particles "
-                              f"({100 * share:.0f} %) have P(cell) 0.3-0.7.",
+                              f"({100 * share:.0f} %) have P(cell) 0.3-0.7. About this one object only, not the "
+                              "whole hole.",
                           choices=CHOICES["particle"], needed="20 answers", answered=len(a),
                           state="open" if share >= 0.05 and len(a) < 20 else ("done" if len(a) >= 20 else "optional"),
                           items=items(_sample(U, n_items), "particle", cap)))
@@ -222,7 +227,7 @@ def open_questions(out: Path, n_items: int = 48) -> list[dict]:
             Q.append(dict(id=f"channel:{c}", question="channel", channel=c,
                           title=f"Is {nm.get(c, c)} positive? (hole cells near its cut)",
                           why=f"{len(near)} hole cells lie within 0.5-1.5x of the {nm.get(c, c)} cut, {len(dim)} are dim "
-                              f"calls. Your answers set where {nm.get(c, c)} starts.",
+                              f"calls. Your answers set where {nm.get(c, c)} starts." + HOLE_NO_CELL,
                           choices=CHOICES["channel"], needed=f"5 positive, 5 negative (now {pos}, {neg})",
                           answered=len(a), state="open" if need else ("done" if pos >= 5 and neg >= 5 else "optional"),
                           items=items(D.assign(kind="hole", obj=c, image_id=D.get("image_id", "")), "channel",
@@ -232,7 +237,7 @@ def open_questions(out: Path, n_items: int = 48) -> list[dict]:
         if len(cl):
             a = answered("clump")
             Q.append(dict(id="clump", title="One cell or several? (large hole cells)",
-                          why=f"{len(cl)} hole cells are at least twice the typical hole cell.",
+                          why=f"{len(cl)} hole cells are at least twice the typical hole cell." + HOLE_NO_CELL,
                           choices=CHOICES["clump"], needed="10 answers", answered=len(a),
                           state="open" if len(cl) >= 10 and len(a) < 10 else ("done" if len(a) >= 10 else "optional"),
                           items=items(_sample(cl, n_items, 4).assign(kind="hole", obj=""), "clump",

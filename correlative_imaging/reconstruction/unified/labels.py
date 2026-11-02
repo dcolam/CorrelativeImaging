@@ -28,7 +28,7 @@ NOT_SURE = "not sure"
 NOT_A_CELL = ("not a cell", "no cell", "halo", "plug", "debris", "no", "plug / halo", "empty", "nothing")
 NOT_CELL = "no cell"     # one label for every hole without a cell: empty, or an object that is not a cell (plug, halo,
                          # debris); learnt like any cell type. The reason stays in status_cell
-UNSURE = ("unsure", "not sure", "?", "skip")
+UNSURE = ("unsure", "not sure", "?", "skip", "skip (not clean or can't tell)")
 
 
 def _norm(s) -> str:
@@ -96,8 +96,21 @@ def hole_marks(R: pd.DataFrame, chans: list = ()) -> tuple[dict, dict]:
     return shape_m, chan_m
 
 
+NOT_CLEAN = ("possible clump", "neighbour of another type", "glow from neighbour")
+
+
+def clean(H: pd.DataFrame) -> pd.Series:
+    """Holes worth a biological label: one cell in the hole, no neighbour of another type touching it, not a clump.
+    Clumps and neighbours are the tool's job (flags, questions), never the Label tab's."""
+    fl = H["flags"].astype(str) if "flags" in H else pd.Series("", index=H.index)
+    ok = (H.status_cell.astype(str) == "cell") if "status_cell" in H else pd.Series(True, index=H.index)
+    ok &= ~fl.str.contains("|".join(NOT_CLEAN))      # clump: the flag (learnt size factor), not a fixed size rule
+    return ok
+
+
 def suggest(H: pd.DataFrame, O: pd.DataFrame, n_holes: int = 40, n_field: int = 20, seed: int = 0) -> pd.DataFrame:
-    """Random holes from every positivity pattern (sqrt of its size, at least 2) and surrounding cells likewise."""
+    """Random clean holes (see clean) from every positivity pattern (sqrt of its size, at least 2) and surrounding
+    cells likewise."""
     rng = np.random.default_rng(seed)
 
     def draw(D, key, n):
@@ -109,7 +122,7 @@ def suggest(H: pd.DataFrame, O: pd.DataFrame, n_holes: int = 40, n_field: int = 
         parts = [D[D[key] == p].sample(min(int(k[p]), int(cnt[p])), random_state=int(rng.integers(1e9)))
                  for p in cnt.index]
         return pd.concat(parts)
-    h = draw(H[H.valid], "pattern", n_holes)
+    h = draw(H[H.valid & clean(H)], "pattern", n_holes)
     h = pd.DataFrame(dict(kind="hole", plate_id=h.plate_id, well_id=h.well_id, image_id=h.image_id, obj="",
                           first_pass=h.pattern))
     f = draw(O[O.learn & O.exemplar], "pattern", n_field) if "exemplar" in O else draw(O[O.learn], "pattern", n_field)

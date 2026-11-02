@@ -31,6 +31,8 @@ from .asker import Asker
 from .control import ControlView
 from ...unified.vocab import shown
 
+SKIP = "skip (not clean or can't tell)"
+
 STEPS = {"detect": "Detect", "first": "First pass", "label": "Label", "learn": "Learn", "report": "Report"}
 ACTIONS = {"detect": "Run Detect", "first": "Run first pass", "label": "Open Label", "learn": "Learn from my labels",
            "report": "Show report"}
@@ -286,9 +288,10 @@ class LabelTab(QWidget):
         self.head.setText(
             "<b>What is this cell?</b> In your own words (+ new label: astrocyte, interneuron, …), or <i>no cell</i>. "
             "Holes and surrounding cells are drawn at random from every channel pattern of the first pass. About 10 per "
-            "label; then <b>Learn</b>. <i>unsure</i> = you cannot tell (left out of learning). The channel call needs no "
+            "label; then <b>Learn</b>. Only clean holes are shown (one cell, no clump, no neighbour of another type touching "
+            "it). If one still is not clean, or you cannot tell: <i>skip</i> (left out of learning). The channel call needs no "
             "checking; only if it is clearly wrong, open <b>channels look wrong?</b>")
-        own = [x for x in R.your_label.unique() if x and x.lower() not in ("not a cell", "no cell", "unsure")]
+        own = [x for x in R.your_label.unique() if x and x.lower() not in ("not a cell", "no cell", "unsure", SKIP)]
         self.labels = list(dict.fromkeys(self.labels + own))
         names = {c: d.get("name", c) for c, d in e["channels"].items()}
         by_name = {n: c for c, n in names.items()}
@@ -305,7 +308,7 @@ class LabelTab(QWidget):
                         st.add(c)
             chan_state[Asker._key(r)] = st
         self._fp = {Asker._key(r): r["first_pass"] for r in items.to_dict("records")}
-        self.asker.set_items(items, self.labels + ["no cell", "unsure"], self.on_answer, "",
+        self.asker.set_items(items, self.labels + ["no cell", SKIP], self.on_answer, "",
                              channels=list(names.items()), on_channels=self.on_channels, chan_state=chan_state)
         self.update_counts()
 
@@ -329,7 +332,7 @@ class LabelTab(QWidget):
         if ok and t and t not in self.labels:
             self.labels.append(t)
             items = self.asker.items
-            self.asker.choices = self.labels + ["no cell", "unsure"]
+            self.asker.choices = self.labels + ["no cell", SKIP]
             self.asker._buttons()
             self.asker.items = items
             self.asker._paint()
@@ -434,7 +437,8 @@ class LearnTab(QWidget):
         out = self.app.out
         H = pd.read_csv(out / "hole_calls.csv", dtype={"plate_id": str, "well_id": str})
         pl = "predicted_label" if "predicted_label" in H else "bio_label"
-        U = H[H.get(pl, pd.Series("", index=H.index)).fillna("").isin(["unsure", "not sure"])]
+        from ...unified.labels import clean
+        U = H[H.get(pl, pd.Series("", index=H.index)).fillna("").isin(["unsure", "not sure"]) & clean(H)]
         if not len(U):
             self.app.say("the model is sure about every hole cell")
             return
@@ -857,7 +861,7 @@ class AppV2:
                                outputs=["report.html", "hole_calls.csv"])
         R = pd.read_csv(inter / "labels.csv", dtype=str).fillna("") if inter and (inter / "labels.csv").exists() \
             else pd.DataFrame()
-        lab = R.your_label[(R.your_label != "") & ~R.your_label.str.lower().isin(["not a cell", "no cell", "unsure"])] \
+        lab = R.your_label[(R.your_label != "") & ~R.your_label.str.lower().isin(["not a cell", "no cell", "unsure", SKIP])] \
             if len(R) else pd.Series(dtype=str)
         c = lab.value_counts()
         enough = int((c >= 3).sum()) >= 2
