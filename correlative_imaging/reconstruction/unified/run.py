@@ -173,7 +173,8 @@ def run(results, out=None, workers: int = 8, log=print) -> Path:
         [f"q_{c}" for c in colour] + [f"pos_{c}" for c in colour + marker if f"pos_{c}" in H] + \
         [f"shape_only_{c}" for c in colour if f"shape_only_{c}" in H] + \
         ["nb_nearest_um", "nb_nearest_cls", "p_shape", "part_p", "part_um2", "predicted_label", "predicted_p", "hand_label"] + [f"part_{c}" for c in colour] + \
-        [f"x_{c}" for c in colour] + ["hue", "purity", "strength", "mix"]
+        [f"x_{c}" for c in colour] + ["hue", "purity", "strength", "mix"] + \
+        [c for c in H.columns if c.startswith("p_") and c != "p_shape"]
     H[[k for k in keep if k in H]].to_csv(out / "hole_calls.csv", index=False)
     O = F["O"]
     O.drop(columns=[c for c in O.columns if c.startswith(("med_", "ring_"))]).to_parquet(out / "field_cells.parquet",

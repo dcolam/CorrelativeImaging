@@ -343,6 +343,11 @@ def fit(R: pd.DataFrame, H: pd.DataFrame, O: pd.DataFrame, F: dict, cal: dict, r
                 p = p / p.sum(1, keepdims=True)
                 cls = cls[cls != NOT_CELL]
             lab = cls[p.argmax(1)]
+            for j, c in enumerate(cls):             # every label's probability: curves of certainty vs calls
+                col = "p_" + re.sub(r"\W+", "_", str(c)).strip("_")
+                if col not in D:
+                    D[col] = np.nan
+                D.loc[good, col] = p[:, j]
             D.loc[good, "predicted_p"] = p.max(1)
             D.loc[good, "predicted_label"] = np.where(p.max(1) >= SURE, lab, NOT_SURE)
     return info
