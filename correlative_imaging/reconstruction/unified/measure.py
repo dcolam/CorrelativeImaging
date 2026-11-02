@@ -114,13 +114,18 @@ def _one(job):
         own = {c: cz[f"map|hole|{c}"] > 0 for c in names if f"map|hole|{c}" in cz.files}
         safety = binary_dilation(hole, iterations=um(10))
         # particles the shape model calls "not a cell" (plug, glow): not seeds, but barriers
+        # per channel: a dropped particle removes only its own channel's seed (a cell bright in all colours with one
+        # dropped colour particle kept no seed in any colour and lost its outline)
         notcell = np.zeros(hole.shape, bool)
+        notc = {}
         for c, labs in (job.get("drop") or {}).items():
+            notc[c] = np.zeros(hole.shape, bool)
             for lev in ("hole", "whole"):
                 key = f"map|{lev}|{c}"
                 if key in cz.files and labs.get(lev):
-                    notcell |= np.isin(cz[key], labs[lev])
-        own = {c: m_ & ~notcell for c, m_ in own.items()}
+                    notc[c] |= np.isin(cz[key], labs[lev])
+            notcell |= notc[c]
+        own = {c: m_ & ~notc.get(c, np.zeros(hole.shape, bool)) for c, m_ in own.items()}
         seeds, near_obj = {}, {}
         for c in colour:
             lab, n = nd_label(own.get(c, np.zeros(hole.shape, bool)) & safety)

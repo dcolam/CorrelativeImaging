@@ -58,6 +58,10 @@ def particle_signal(FP: pd.DataFrame, results, prefix_of: dict, colour: list) ->
     back = {v: k for k, v in (prefix_of or {}).items() if v}
     Wr["plate_id"] = Wr.plate_id.map(lambda p: back.get(p, p))
     F = FP.merge(Wr, on=["plate_id", "well_id"], suffixes=("", "_w"))       # every particle touching the hole
+    # only particles at least half inside the hole (the seed rule): a neighbour touching the hole is not the hole's cell
+    # (it gave holes its colour, e.g. a blue neighbour below the hole made the hole BFP+)
+    if "share" in F:
+        F = F[F.share >= 0.5]
     rank = F.p_cell.fillna(0) * 1e6 + F.hsnr.fillna(0) if F.p_cell.notna().any() else F.hsnr.fillna(0)
     F = F.assign(_r=rank).sort_values("_r", ascending=False).drop_duplicates(["plate_id", "well_id"])
     out = F[["plate_id", "well_id"]].copy()

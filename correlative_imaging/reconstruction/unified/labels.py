@@ -239,28 +239,12 @@ def _answers_not_cell(R: pd.DataFrame, reviewed: dict) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def _shape_cols(D: pd.DataFrame, field: bool) -> np.ndarray:
-    """How cell-like the object is by shape (never brightness): the hole's shape model and particle model. Surrounding
-    cells are cells by construction (1)."""
-    if field:
-        return np.ones((len(D), 2))
-    return np.column_stack([D[c].astype(float).fillna(0.5).to_numpy() if c in D else np.full(len(D), 0.5)
-                            for c in ("p_shape", "part_p")])
-
-
-def _size_col(D: pd.DataFrame, field: bool) -> np.ndarray:
-    """How big the grown cell is, in typical cells (log1p of cells_in_body): a small speck in the hole is not a cell.
-    Nothing grown = 0. Surrounding cells are one cell by construction."""
-    if field or "cells_in_body" not in D:
-        return np.full((len(D), 1), np.log1p(1.0) if field else 0.0)
-    return np.log1p(D["cells_in_body"].astype(float).clip(lower=0).fillna(0.0).to_numpy())[:, None]
-
-
 def fit(R: pd.DataFrame, H: pd.DataFrame, O: pd.DataFrame, F: dict, cal: dict, reviewed: dict | None = None) -> dict:
-    """The label model from every hand input. Classes: your cell types plus "no cell" (labels such as "not a cell",
-    "plug", "halo", and the holes you answered "no cell" in the questions). Adds predicted_label / predicted_p /
-    hand_label to H and O; every hole gets a predicted_label: a type, "not sure", "no cell" (empty hole, or an object
-    that is not a cell; the reason is in status_cell) or "hole detection failed"."""
+    """The label model, in two steps. 1) cell or no cell: the first pass (shape model and size; your "no cell" labels
+    and answers train the shape model). 2) the type, among cells only: LDA on the colours, learnt from your type labels
+    ("no cell" is not a type). Adds predicted_label / predicted_p / hand_label to H and O; every hole gets a
+    predicted_label: a type, "not sure", "no cell" (empty hole, an object that is not a cell, or your "no cell" label;
+    the reason is in status_cell) or "hole detection failed"."""
     from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
     from sklearn.model_selection import LeaveOneOut, cross_val_predict
     colour, marker = F["colour"], F["marker"]
@@ -278,10 +262,10 @@ def fit(R: pd.DataFrame, H: pd.DataFrame, O: pd.DataFrame, F: dict, cal: dict, r
     field_part = {c: field_scale[c] for c in colour}
 
     def design(D, a, b, p, field):
+        # the type is a colour question: colour only (cell or not was decided before, by shape and size)
         # nothing grown in the hole = no own signal: 0, not missing (a hole valid by its particle alone is still a cell)
-        sig = np.nan_to_num(np.hstack([features(D, chans, a, ""), features(D, colour, b, ""),
-                                       features(D, colour, p, "")]), nan=0.0)
-        return np.hstack([sig, _shape_cols(D, field), _size_col(D, field)])
+        return np.nan_to_num(np.hstack([features(D, chans, a, ""), features(D, colour, b, ""),
+                                        features(D, colour, p, "")]), nan=0.0)
     info = dict(used=False, n=0, labels={}, why="")
     for D in (H, O):
         D["predicted_label"], D["predicted_p"], D["hand_label"] = "", np.nan, ""
@@ -297,7 +281,11 @@ def fit(R: pd.DataFrame, H: pd.DataFrame, O: pd.DataFrame, F: dict, cal: dict, r
         info["why"] = "no labels yet"
         return info
     L = R[(R.your_label != "") & (R.your_label != "unsure")]                 # unsure is not a type
-    L = L[~(L.not_cell & (L.kind != "hole"))]            # surrounding objects are cells by construction
+    # two steps: cell or no cell is decided by the first pass (shape model and size, which your "no cell" labels and
+    # answers train); the type only among cells, from your type labels. "no cell" is not a type: as one of the
+    # classes it took every red, cell-like object to "not sure" (red debris looks like a red cell in colour)
+    info["no_cell_labels"] = int(L.not_cell.sum())
+    L = L[~L.not_cell]
     # the sheet is read as text: match on text keys
     L = L.drop(columns=["image_id"]).assign(image_id=L.image_id.astype(str)) if "image_id" in L else L
     L = L.assign(plate_id=L.plate_id.astype(str), well_id=L.well_id.astype(str))
@@ -325,8 +313,7 @@ def fit(R: pd.DataFrame, H: pd.DataFrame, O: pd.DataFrame, F: dict, cal: dict, r
         info["why"] = f"at least 2 labels with {MIN_PER_LABEL}+ examples needed (have: {cnt.to_dict()})"
         return info
     X, y, kind, keys = X[m], y[m], kind[m], keys[m].reset_index(drop=True)
-    # every label weighs the same, however many examples it has: "not a cell" answers are many and would otherwise
-    # pull every borderline cell their way
+    # every label weighs the same, however many examples it has
     pri = np.full(len(np.unique(y)), 1 / len(np.unique(y)))
     lda = LinearDiscriminantAnalysis(solver="lsqr", shrinkage="auto", priors=pri)
     cv = cross_val_predict(LinearDiscriminantAnalysis(solver="lsqr", shrinkage="auto", priors=pri), X, y,
@@ -344,20 +331,16 @@ def fit(R: pd.DataFrame, H: pd.DataFrame, O: pd.DataFrame, F: dict, cal: dict, r
         Z = np.full((len(y), 1), np.nan)
     Z = np.column_stack([Z, np.full((len(y), 2), np.nan)])[:, :2]
     info["model_table"] = keys.assign(kind=kind, hand_label=y, ld1=Z[:, 0], ld2=Z[:, 1], loo_predicted=cv)
-    # every hole with an object in it (a cell, or not a cell by shape: the label model may disagree) and every
-    # surrounding cell; surrounding cells never get "not a cell" (they are cells by construction)
-    with_obj = H.valid | (H.status_cell.astype(str) == "no cell (shape)")
-    for D, scale, own, part, sel, field in [(H, hole_scale, hole_own, hole_part, with_obj, False),
+    # step 2 on every hole the first pass calls a cell, and every surrounding cell; a hole you labelled "no cell"
+    # keeps it (your label wins over the first pass)
+    no_hand = (H.hand_label.astype(str) == NOT_CELL).to_numpy()
+    for D, scale, own, part, sel, field in [(H, hole_scale, hole_own, hole_part, H.valid & ~no_hand, False),
                                             (O, field_scale, field_own, field_part, O.learn, True)]:
         Xd = design(D, scale, own, part, field)
         good = sel.to_numpy() & np.isfinite(Xd).all(1)
         if good.any():
             p = lda.predict_proba(Xd[good])
             cls = np.asarray(lda.classes_)
-            if field and NOT_CELL in cls:
-                p = p[:, cls != NOT_CELL]
-                p = p / p.sum(1, keepdims=True)
-                cls = cls[cls != NOT_CELL]
             lab = cls[p.argmax(1)]
             for j, c in enumerate(cls):             # every label's probability: curves of certainty vs calls
                 col = "p_" + re.sub(r"\W+", "_", str(c)).strip("_")
@@ -366,6 +349,7 @@ def fit(R: pd.DataFrame, H: pd.DataFrame, O: pd.DataFrame, F: dict, cal: dict, r
                 D.loc[good, col] = p[:, j]
             D.loc[good, "predicted_p"] = p.max(1)
             D.loc[good, "predicted_label"] = np.where(p.max(1) >= SURE, lab, NOT_SURE)
+    H.loc[no_hand & (H.status_cell.astype(str) != "hole detection failed"), "predicted_label"] = NOT_CELL
     return info
 
 
