@@ -197,8 +197,16 @@ def run(results, out=None, workers: int = 8, log=print) -> Path:
     summary.update(names=F["nm"], colour=colour, marker=marker, prefix_of=prefix_of,
                    particle_shape={k: v for k, v in sinfo.items() if k != "feats"},
                    display_top=_display_top(F, H, colour, marker))
+    # does more data still help? every learnt quantity again on random subsets (calibration.py)
+    from . import calibration
+    try:
+        calib = calibration.compute(H, F["O"], C["table"], cal, colour, linfo)
+    except Exception as ex:                                                  # noqa: BLE001
+        calib = {}
+        log(f"   calibration curves skipped: {type(ex).__name__}: {ex}")
+    summary["calibration"] = {g: {k: D.to_dict("list") for k, D in v.items()} for g, v in calib.items()}
     (out / "summary.json").write_text(encoding="utf-8", data=json.dumps(summary, indent=2, default=float))   # the report's questions read it
-    report.write(out, T, P, W, F, C, size, H, cal, e, path_map, summary, linfo, R)
+    report.write(out, T, P, W, F, C, size, H, cal, e, path_map, summary, linfo, R, calib=calib)
     (out / "summary.json").write_text(encoding="utf-8", data=json.dumps(summary, indent=2, default=float))
     log(f"done in {summary['minutes']} min -> {out / 'report.html'}")
     return out

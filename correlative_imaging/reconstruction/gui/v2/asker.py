@@ -155,13 +155,19 @@ class Asker(QWidget):
         self._clear_layout(self.chan_row)
         self.chan_boxes = {}
         if self.channels:
-            lab = QLabel("positive channels:")
-            self.chan_row.addWidget(lab)
+            # optional: the channel call needs no checking; only where it is clearly wrong
+            tog = QCheckBox("channels look wrong?")
+            tog.setToolTip("only if the first pass's positive channels are clearly wrong for this cell: tick the "
+                           "channels you see. Used only when your corrections clearly separate (see the report)")
+            self.chan_row.addWidget(tog)
             for c, name in self.channels:
                 cb = QCheckBox(name)
                 cb.toggled.connect(lambda on, c=c: self._chan_toggled(c, on))
+                cb.setVisible(False)
                 self.chan_boxes[c] = cb
                 self.chan_row.addWidget(cb)
+            tog.toggled.connect(lambda on: [b.setVisible(on) for b in self.chan_boxes.values()])
+            self.chan_toggle = tog
             self.chan_row.addStretch(1)
 
     # ------------------------------------------------------------------------------------------------- paging

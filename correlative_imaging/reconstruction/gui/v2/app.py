@@ -29,6 +29,7 @@ from qtpy.QtWidgets import (QComboBox, QFileDialog, QFormLayout, QGroupBox, QHBo
 from . import canvas
 from .asker import Asker
 from .control import ControlView
+from ...unified.vocab import shown
 
 STEPS = {"detect": "Detect", "first": "First pass", "label": "Label", "learn": "Learn", "report": "Report"}
 ACTIONS = {"detect": "Run Detect", "first": "Run first pass", "label": "Open Label", "learn": "Learn from my labels",
@@ -270,8 +271,9 @@ class LabelTab(QWidget):
             return
         self.head.setText(
             "<b>What is this cell?</b> In your own words (+ new label: astrocyte, interneuron, …), or <i>not a cell</i>. "
-            "Holes and surrounding cells are drawn at random from every channel pattern of the first pass. Correct the "
-            "positive channels only where you see it differently. About 10 per label; then <b>Learn</b>.")
+            "Holes and surrounding cells are drawn at random from every channel pattern of the first pass. About 10 per "
+            "label; then <b>Learn</b>. <i>unsure</i> = you cannot tell (left out of learning). The channel call needs no "
+            "checking; only if it is clearly wrong, open <b>channels look wrong?</b>")
         own = [x for x in R.your_label.unique() if x and x.lower() not in ("not a cell", "unsure")]
         self.labels = list(dict.fromkeys(self.labels + own))
         names = {c: d.get("name", c) for c, d in e["channels"].items()}
@@ -360,7 +362,8 @@ class LearnTab(QWidget):
         b.setToolTip("runs the first pass again with your answers and labels, then learns the labels (LDA)")
         b.clicked.connect(lambda: app.run())
         row.addWidget(b)
-        u = QPushButton("Label the unsure ones")
+        u = QPushButton("Label cells the model is not sure about")
+        u.setToolTip("adds 20 hole cells whose label the model is not sure about (probability < 0.7) to the Label tab")
         u.clicked.connect(self.unsure)
         row.addWidget(u)
         row.addStretch(1)
@@ -388,14 +391,28 @@ class LearnTab(QWidget):
                        for i, r in cf.items()) + "</table>")
         H = pd.read_csv(self.app.out / "hole_calls.csv")
         if "bio_label" in H:
-            c = H.bio_label.fillna("").replace("", "—").value_counts()
-            t += "<p>Hole cells per label: " + ", ".join(f"{e(str(k))} {v}" for k, v in c.items()) + "</p>"
+            c = H.bio_label.fillna("").replace("", "—").map(shown).value_counts()
+            t += ("<p>Hole cells per label: " + ", ".join(f"{e(str(k))} {v}" for k, v in c.items()) + ". <i>not sure "
+                  "(model)</i>: the model's best guess is below 70 % (nothing you have to fill in).</p>")
             Hv = H[H.status_cell == "cell"] if "status_cell" in H else H
-            ct = pd.crosstab(Hv.pattern, Hv.bio_label.fillna(""))
+            ct = pd.crosstab(Hv.pattern, Hv.bio_label.fillna("").map(shown))
             t += ("<p>First-pass pattern × label:</p><table border='1' cellspacing='0' cellpadding='3'><tr><th></th>"
                   + "".join(f"<th>{e(str(c))}</th>" for c in ct.columns) + "</tr>"
                   + "".join(f"<tr><td>{e(str(i))}</td>" + "".join(f"<td>{v}</td>" for v in row) + "</tr>"
                             for i, row in zip(ct.index, ct.to_numpy())) + "</table>")
+        png = self.app.out / "calib_labels.png"
+        if png.exists():
+            cv = ((S.get("calibration") or {}).get("label model (% right)") or {}).get("your labels") or {}
+            hint = ""
+            if len(cv.get("n", [])) >= 2:
+                gain = cv["median"][-1] - cv["median"][-2]
+                hint = (f" From {cv['n'][-2]} to {cv['n'][-1]} labels: {gain:+.0f} percentage points. " +
+                        ("Still rising: labelling more helps." if gain >= 3 else
+                         "About flat: more labels of the same kind will not help much; label the cells the model "
+                         "is not sure about, or accept the current accuracy."))
+            t += (f"<p><b>Does labelling more help?</b> Accuracy on held-out labels when the model learns from fewer of "
+                  f"your labels (median and 5-95 % of 15 random draws).{hint}</p>"
+                  f"<img src='{QUrl.fromLocalFile(str(png)).toString()}' width='520'>")
         self.text.setHtml(t)
 
     def unsure(self):
@@ -403,7 +420,7 @@ class LearnTab(QWidget):
         H = pd.read_csv(out / "hole_calls.csv", dtype={"plate_id": str, "well_id": str})
         U = H[H.get("bio_label", pd.Series("", index=H.index)).fillna("") == "unsure"]
         if not len(U):
-            self.app.say("no unsure hole cells")
+            self.app.say("the model is sure about every hole cell")
             return
         f = out / "interventions" / "labels.csv"
         R = pd.read_csv(f, dtype=str).fillna("") if f.exists() else pd.DataFrame()
@@ -414,7 +431,7 @@ class LearnTab(QWidget):
                               well_id=U.well_id, image_id=U.get("image_id", ""), obj="", first_pass=U.pattern,
                               your_label="", positive_channels="")).astype(str)
         pd.concat([R, S]).to_csv(f, index=False)
-        self.app.say(f"{len(S)} unsure hole cells added to the Label tab")
+        self.app.say(f"{len(S)} hole cells the model is not sure about added to the Label tab")
         self.app.tabs.setCurrentWidget(self.app.label_tab)
         self.app.label_tab.fill()
 
@@ -469,18 +486,36 @@ class AppV2:
         self.host = QWidget()
         lay = QVBoxLayout(self.host)
         lay.setContentsMargins(4, 4, 4, 4)
+        # the input: a ci gui output folder; pick one of its runs (and Detect results), or run Detect
         top = QHBoxLayout()
-        self.where = QLabel("no results open")
-        self.where.setWordWrap(True)
-        self.where.setProperty("role", "hint")
-        top.addWidget(self.where, 1)
-        ob = QPushButton("Open Detect results…")
+        self.root_lab = QLabel("no ci gui output folder open")
+        self.root_lab.setWordWrap(True)
+        self.root_lab.setProperty("role", "hint")
+        top.addWidget(self.root_lab, 1)
+        ob = QPushButton("Open ci gui output…")
+        ob.setToolTip("the folder ci gui wrote its run(s) to; a Detect results folder (reconstruction_<run>) works too")
         ob.clicked.connect(self.choose)
         top.addWidget(ob)
         lay.addLayout(top)
+        row = QHBoxLayout()
+        self.run_box = QComboBox()
+        self.run_box.setToolTip("every run of this folder with its Detect results and first pass")
+        self.run_box.activated.connect(self._run_picked)
+        row.addWidget(self.run_box, 1)
+        self.detect_b = QPushButton("Run Detect")
+        self.detect_b.setToolTip("Detect: finds the objects of every channel in and around each hole (shape and "
+                                 "brightness); needs no model. About 5-15 min. The first pass works on its output")
+        self.detect_b.clicked.connect(self.run_detect)
+        row.addWidget(self.detect_b)
+        lay.addLayout(row)
+        self.where = QLabel("")
+        self.where.setWordWrap(True)
+        self.where.setProperty("role", "hint")
+        lay.addWidget(self.where)
+        self.root, self.R = None, pd.DataFrame()
         t = theme(viewer)
         self.strip = WorkflowStrip(STEPS, ACTIONS, self._next, self._pick, self._act, t,
-                                   loop_text="First pass → answer its questions → Label → Learn → label the unsure ones")
+                                   loop_text="First pass → answer its questions → Label → Learn → label what the model is not sure about")
         lay.addWidget(self.strip)
         self.tabs = QTabWidget()
         self.first_tab, self.label_tab = FirstPassTab(self), LabelTab(self)
@@ -499,15 +534,132 @@ class AppV2:
         viewer.text_overlay.visible = True
         viewer.text_overlay.position = "top_left"
         if results:
-            self.open(results, out)
+            self.open_any(results, out)
         else:
             self.update_strip()
 
     # ------------------------------------------------------------------------------------------- files
     def choose(self):
-        d = QFileDialog.getExistingDirectory(self.host, "Detect results (reconstruction_<run tag>)")
+        d = QFileDialog.getExistingDirectory(self.host, "ci gui output folder (or a Detect results folder)")
         if d:
+            self.open_any(d)
+
+    def open_any(self, d, out=None):
+        """A ci gui output folder (scan its runs) or a Detect results folder (open it, and scan its parent)."""
+        d = local(d)
+        if (d / "particles.parquet").exists():
+            self.scan(d.parent, select=d)
+            self.open(d, out)
+        else:
+            self.scan(d)
+
+    def scan(self, root, select=None):
+        from .runs import scan
+        self.root = local(root)
+        try:
+            self.R = scan(self.root)
+        except Exception as ex:                                             # noqa: BLE001
+            self.R = pd.DataFrame()
+            self.say(f"cannot read {self.root}: {ex}")
+        self.root_lab.setText(f"ci gui output: {self.root}")
+        self.run_box.blockSignals(True)
+        self.run_box.clear()
+        for r in self.R.itertuples():
+            self.run_box.addItem(r.text, r.Index)
+        i = None
+        if select is not None:
+            m = [str(local(x)) == str(local(select)) if x else False for x in self.R.detect]
+            i = m.index(True) if any(m) else None
+        elif len(self.R):
+            done = [k for k, x in enumerate(self.R.detect) if x]
+            i = done[-1] if done else len(self.R) - 1
+        if i is not None:
+            self.run_box.setCurrentIndex(i)
+        self.run_box.blockSignals(False)
+        if not len(self.R):
+            self.say(f"no ci gui run found in {self.root}")
+        elif select is None and i is not None:
+            self._run_picked(i)
+        self._detect_button()
+
+    def _row(self):
+        i = self.run_box.currentIndex()
+        return self.R.iloc[i] if 0 <= i < len(self.R) else None
+
+    def _detect_button(self):
+        r = self._row()
+        self.detect_b.setEnabled(r is not None and not self.busy)
+        self.detect_b.setText("Run Detect again…" if (r is not None and r.detect) else "Run Detect…")
+
+    def _run_picked(self, i):
+        r = self._row()
+        self._detect_button()
+        if r is None:
+            return
+        if r.detect:
+            self.open(r.detect)
+        else:
+            self.results, self.out = None, None
+            self.where.setText(f"{r.run_tag}: no Detect yet. Press Run Detect (about 5-15 min).")
+            self.update_strip()
+
+    def run_detect(self):
+        """Detect for the picked run: into reconstruction_<run>, or a new dated folder when one exists (never over
+        existing results); your setup, labels and answers come along, except the answers about single particles."""
+        r = self._row()
+        if r is None or self.busy:
+            return
+        from .runs import fresh_out
+        new = fresh_out(self.root, r.run_tag)
+        msg = (f"Detect finds the objects of every channel in and around each hole of run {r.run_tag} "
+               f"({r.n_plates} plates). About 5-15 min; the window stays usable.\n\nIt writes {new.name}.")
+        if r.detect:
+            msg += (f"\n\nThe current Detect ({Path(r.detect).name}) stays as it is. Your setup, labels and answers "
+                    "are copied to the new one, except the 'cell or not' answers about single particles: a new Detect "
+                    "numbers its objects anew, so you answer those again. Then run the first pass (15-40 min).")
+        if QMessageBox.question(self.host, "Run Detect", msg) != QMessageBox.StandardButton.Yes:
+            return
+        from napari.qt.threading import create_worker
+        from ...config import Config
+        from ...pipeline import detect_run, source_from_spec
+        root, tag, old, emit = str(self.root), r.run_tag, r.detect, self.bus.log.emit
+        self.busy = True
+        self._detect_button()
+        self.first_tab.run_b.setEnabled(False)
+        self.say(f"Detect {tag} -> {new} …")
+
+        def prog(i, n, m=""):
+            if m or (n and (i % 100 == 0 or i == n)):
+                emit(f"  Detect: {m or f'{i}/{n}'}")
+
+        def job():
+            spec = dict(kind="run", root=root, run_tag=tag)
+            cfg = Config()
+            detect_run(source_from_spec(spec, cfg), cfg, str(new), workers=self.workers, progress=prog,
+                       source_spec=spec)
+            if old:
+                from .runs import carry_over
+                for t in carry_over(old, new):
+                    emit(f"  carried over: {t}")
+            return str(new)
+        w = create_worker(job)
+
+        def done(d):
+            self.busy = False
+            self.first_tab.run_b.setEnabled(True)
+            self.say(f"Detect done: {d}. Next: Run first pass.")
+            self.scan(self.root, select=d)
             self.open(d)
+
+        def failed(ex):
+            self.busy = False
+            self.first_tab.run_b.setEnabled(True)
+            self._detect_button()
+            self.say(f"Detect FAILED: {type(ex).__name__}: {ex}")
+        w.returned.connect(done)
+        w.errored.connect(failed)
+        w.start()
+        self.update_strip()
 
     def open(self, results, out=None):
         results = local(results)
@@ -669,10 +821,11 @@ class AppV2:
                                                     can_run=True), **k})
         st = {}
         has_detect = self.results is not None and (self.results / "particles.parquet").exists()
-        st["detect"] = step(title="Detect", purpose="find the particles of every hole (no model needed)",
-                            state="done" if has_detect else "needed", can_run=False,
-                            reason="" if has_detect else "run Detect in ci gui (after a run) or in the classic ci "
-                                                         "reconstruct", outputs=["particles.parquet"])
+        st["detect"] = step(title="Detect", purpose="find the objects of every channel in and around each hole",
+                            state="running" if (self.busy and not has_detect) else ("done" if has_detect else "needed"),
+                            can_run=self._row() is not None,
+                            reason="" if has_detect else "pick a run above and press Run Detect",
+                            outputs=["particles.parquet"])
         inter = self.out / "interventions" if self.out else None
         if S is None:
             st["first"] = step(title="First pass", purpose="channel positivity of every hole and surrounding cell, "
@@ -729,7 +882,9 @@ class AppV2:
             self.tabs.setCurrentWidget(tab[key])
 
     def _act(self, key: str):
-        if key in ("first", "learn"):
+        if key == "detect":
+            self.run_detect()
+        elif key in ("first", "learn"):
             self.run()
         else:
             self._pick(key)

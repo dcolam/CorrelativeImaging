@@ -153,7 +153,8 @@ def call(M: pd.DataFrame, W: pd.DataFrame, F: dict, cell_size: dict, nb: pd.Data
     for c in colour:
         x = H[f"x_{c}"].to_numpy(float)
         seen = np.array([chan_marks.get(k, {}).get(c) is True for k in rkey])
-        unseen = np.array([chan_marks.get(k, {}).get(c) is False or reviewed.get(k) == "no" for k in rkey])
+        # negative = you saw the cell but not this channel; "not a cell" holes (halos, plugs) are the shape model's job
+        unseen = np.array([chan_marks.get(k, {}).get(c) is False for k in rkey])
         yes, no = seen & np.isfinite(x), unseen & np.isfinite(x)
         cal[c]["marked"] = dict(positive=int(yes.sum()), negative=int(no.sum()))
         if yes.sum() < 5 or no.sum() < 5:
@@ -208,6 +209,18 @@ def call(M: pd.DataFrame, W: pd.DataFrame, F: dict, cell_size: dict, nb: pd.Data
         else:
             H[f"dim_unsure_{c}"] = False
             H[f"shape_only_{c}"] = False
+    # no empty wells to compare brightness with (e.g. every well seeded): the shape model alone decides whether the hole
+    # holds a cell (an aperture glowing in every channel is as bright as a cell, but not shaped like one)
+    no_ref = not any(np.isfinite(cal[c]["empty_cut"]) for c in colour)
+    if shape_info.get("used") and no_ref:
+        yours = np.array([reviewed.get(k) not in (None, "no") for k in zip(H.plate_id, H.well_id)])
+        off = H.valid & (H.p_shape < 0.5) & ~yours            # a hole you called a cell stays a cell
+        H.loc[off, "valid"] = False
+        H.loc[off, "status_cell"] = "not a cell (shape)"
+        for c in colour:
+            H[f"pos_{c}"] = H[f"pos_{c}"] & H.valid
+        shape_info["gate"] = f"no empty wells: {int(off.sum())} holes are not a cell by shape (p < 0.5)"
+    for c in colour:
         cal[c]["n_pos"] = int(H[f"pos_{c}"].sum())
     cal["_shape"] = shape_info
     # copies: a positive colour weaker than 3 x the copy the other colours would put there

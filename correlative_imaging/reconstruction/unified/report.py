@@ -108,7 +108,7 @@ def grid(images, labels, title, ncol=8, size=1.35):
 
 
 # ---------------------------------------------------------------------------------------------------------- write
-def write(out: Path, T, P, W, F, C, size, H, cal, e, path_map, summary, linfo=None, R=None):
+def write(out: Path, T, P, W, F, C, size, H, cal, e, path_map, summary, linfo=None, R=None, calib=None):
     colour, marker, nm = F["colour"], F["marker"], F["nm"]
     O = F["O"]
     S = []                                          # (title, html)
@@ -319,7 +319,7 @@ def write(out: Path, T, P, W, F, C, size, H, cal, e, path_map, summary, linfo=No
             f"together. Each of your labels predicted by a model trained on all the others (leave-one-out): "
             f"<b>{100 * li['acc']:.0f} %</b> right"
             + (f", on holes {100 * li['acc_hole']:.0f} %" if np.isfinite(li.get("acc_hole", np.nan)) else "")
-            + ". A cell gets a label when its probability is at least 0.7, otherwise 'unsure'.</p>")
+            + ". A cell gets a label when its probability is at least 0.7, otherwise 'not sure (model)' (stored as 'unsure' in hole_calls.csv).</p>")
         cf = li["confusion"]
         t.append("<table><tr><th>your label \\ predicted</th>" + "".join(f"<th>{html.escape(str(c))}</th>"
                                                                           for c in cf.columns) + "</tr>" + "".join(
@@ -341,12 +341,13 @@ def write(out: Path, T, P, W, F, C, size, H, cal, e, path_map, summary, linfo=No
         ax[0][0].legend(fontsize=7, frameon=False)
         t.append("<p>Your labelled cells by their channel signals (dotted = a typical positive cell).</p>"
                  f"<img src=\"{_b64(fig)}\">")
-        ct = pd.crosstab(V.pattern, V.bio_label)
+        from .vocab import shown
+        ct = pd.crosstab(V.pattern, V.bio_label.map(shown))
         t.append("<p>Hole cells: first-pass pattern vs predicted label.</p><table><tr><th>pattern</th>" + "".join(
             f"<th>{html.escape(str(c))}</th>" for c in ct.columns) + "</tr>" + "".join(
             f"<tr><td>{html.escape(str(i))}</td>" + "".join(f"<td>{v}</td>" for v in row) + "</tr>"
             for i, row in zip(ct.index, ct.to_numpy())) + "</table>")
-        fo = O[O.learn].bio_label.value_counts()
+        fo = O[O.learn].bio_label.map(shown).value_counts()
         t.append("<p>Surrounding cells by predicted label: " + ", ".join(
             f"{html.escape(str(k))} {v} ({100 * v / fo.sum():.0f} %)" for k, v in fo.items()) + ".</p>")
         for lab in [c for c in V.bio_label.value_counts().index if c and c != "unsure"][:6]:
@@ -375,6 +376,23 @@ def write(out: Path, T, P, W, F, C, size, H, cal, e, path_map, summary, linfo=No
                 fig.savefig(out / "cell_colours.png", dpi=110)       # the tool shows it next to the plate
             t.append(f"<h3>{html.escape(title)}</h3><img style='max-width:520px' src=\"{_b64(fig)}\">")
         S.append(("5 Cell colours", "".join(t)))
+
+    # ---- 6 does more data help ----
+    if calib:
+        from . import calibration as cb
+        t = ["<p>Every quantity learnt above, learnt again on random subsets of growing size (" + str(cb.DRAWS) +
+             " draws per size): the line is the median, the band 5-95 % of the draws, the last point all the data. "
+             "<b>Flat and narrow at the right end: enough data.</b> Still moving or wide: more data would change it. "
+             "For the label model: rising at the right end = labelling more still helps (accuracy on the labels left "
+             "out of each draw).</p>"]
+        for g, curves in calib.items():
+            fig = cb.figure(g, curves, nm, col, cb.XLABEL.get(g, "n"))
+            if g.startswith("label model"):
+                fig.savefig(out / "calib_labels.png", dpi=100)                 # the Learn tab shows it
+            t.append(f"<h3>{html.escape(g)}</h3><img src=\"{_b64(fig)}\"><ul>" + "".join(
+                f"<li>{html.escape(' -> '.join(nm.get(x, x) for x in k.split(' -> ')))}: "
+                f"{html.escape(cb.verdict(D))}</li>" for k, D in curves.items()) + "</ul>")
+        S.append(("6 Does more data help?", "".join(t)))
 
     # ---- interventions ----
     iv = out / "interventions"

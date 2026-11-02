@@ -267,8 +267,10 @@ def reconstruct(folder: Path | None, v2: bool, out: Path | None) -> None:
     particles, train the classifier and call each cell's channels.
 
     FOLDER (optional) is a results folder of this tool to open directly. With
-    --v2: the new workflow on Detect results (channel positivity first, questions
-    where the data is unsure, your labels, report). Headless commands (detect,
+    --v2: the new workflow; FOLDER = the ci gui output folder (its runs are
+    listed, Detect can be run from there) or one Detect results folder
+    (channel positivity first, questions where the data is unsure, your
+    labels, report). Headless commands (detect,
     classify, train, import-labels, unified):
     ``python -m correlative_imaging.reconstruction --help``.
     """

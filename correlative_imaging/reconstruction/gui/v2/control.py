@@ -217,7 +217,8 @@ class ControlView(QWidget):
         if r.get("status_cell"):
             t.append(f"{r.get('pattern', '')} ({r.get('status_cell')})")
         if r.get("bio_label"):
-            t.append(f"label model: {r['bio_label']}")
+            from ...unified.vocab import shown
+            t.append(f"label model: {shown(r['bio_label'])}")
         if r.get("your_label"):
             t.append(f"your label: {r['your_label']}")
         if r.get("flags"):
