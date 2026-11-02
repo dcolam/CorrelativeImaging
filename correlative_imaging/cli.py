@@ -259,14 +259,23 @@ def results(folder: Path | None) -> None:
 
 @cli.command()
 @click.argument("folder", type=click.Path(exists=True, path_type=Path), required=False)
-def reconstruct(folder: Path | None) -> None:
+@click.option("--v2", "v2", is_flag=True, help="The new workflow: First pass, Label, Learn, Report.")
+@click.option("--out", type=click.Path(path_type=Path), default=None,
+              help="--v2 only: output folder of the first pass (default <FOLDER>/unified).")
+def reconstruct(folder: Path | None, v2: bool, out: Path | None) -> None:
     """Open Cell reconstruction (napari): find the cell in each hole, label
     particles, train the classifier and call each cell's channels.
 
-    FOLDER (optional) is a results folder of this tool to open directly. Headless
-    commands (detect, classify, train, import-labels):
+    FOLDER (optional) is a results folder of this tool to open directly. With
+    --v2: the new workflow on Detect results (channel positivity first, questions
+    where the data is unsure, your labels, report). Headless commands (detect,
+    classify, train, import-labels, unified):
     ``python -m correlative_imaging.reconstruction --help``.
     """
+    if v2:
+        from correlative_imaging.reconstruction.gui.v2.app import launch as launch_v2
+
+        raise SystemExit(launch_v2(str(folder) if folder else None, str(out) if out else None))
     from correlative_imaging.reconstruction.gui.app import launch
 
     raise SystemExit(launch(str(folder) if folder else None))

@@ -11,6 +11,7 @@
   python -m correlative_imaging.reconstruction freeze-test-wells --out <dir> --labels new.db [--from old.db]
   python -m correlative_imaging.reconstruction compare --out <dir> --labels ci_labels.db --models preview a.joblib ...
         [--plate-map map.csv --check Condition=Empty]
+  python -m correlative_imaging.reconstruction unified --results <dir> [--out <dir>]   (unified/README.md)
   python -m correlative_imaging.reconstruction status --out <dir> [--labels ci_labels.db] [--model <file.joblib>]
   python -m correlative_imaging.reconstruction commands --out <dir> [--write]     (how to make the results again)
   python -m correlative_imaging.reconstruction methods --out <dir>                (a methods text from the results)
@@ -32,6 +33,8 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="cmd", required=True)
     g = sub.add_parser("gui")
     g.add_argument("--results")
+    g.add_argument("--v2", action="store_true", help="the new workflow: First pass → Label → Learn → Report")
+    g.add_argument("--out", help="v2: output folder of the first pass (default <results>/unified)")
     d = sub.add_parser("detect", help="stage 1: particles, reference, features (no model needed)")
     d.add_argument("--root"); d.add_argument("--run-tag")
     d.add_argument("--spec", help="JSON source spec instead of --root/--run-tag (e.g. a viewer-crop source)")
@@ -56,6 +59,11 @@ def main(argv=None):
     k.add_argument("--models", nargs="+", default=["preview"])
     k.add_argument("--plate-map", help="CSV with plate_id, well_id and condition columns (for --check)")
     k.add_argument("--check", help="COLUMN=VALUE: wells where no cell is expected, e.g. Condition=Empty")
+    u = sub.add_parser("unified", help="learn the cell types from the surrounding cells, call the hole cells, write "
+                                       "a report (unified/README.md)")
+    u.add_argument("--results", required=True, help="the Detect results folder")
+    u.add_argument("--out", help="output folder (default <results>/unified)")
+    u.add_argument("--workers", type=int, default=8)
     s_ = sub.add_parser("status", help="where a results folder stands in the workflow (the GUI's strip, as text)")
     s_.add_argument("--out", required=True); s_.add_argument("--labels"); s_.add_argument("--model")
     cm = sub.add_parser("commands", help="the command lines that make these results again (provenance.py)")
@@ -69,7 +77,14 @@ def main(argv=None):
     i.add_argument("--wells-csv")
     a = ap.parse_args(argv)
 
+    if a.cmd == "unified":
+        from .unified.run import run as run_unified
+        run_unified(a.results, a.out, a.workers)
+        return
     if a.cmd == "gui":
+        if a.v2:
+            from .gui.v2.app import launch as launch_v2
+            raise SystemExit(launch_v2(a.results, a.out))
         from .gui.app import launch
         raise SystemExit(launch(a.results))
     if a.cmd == "detect":
