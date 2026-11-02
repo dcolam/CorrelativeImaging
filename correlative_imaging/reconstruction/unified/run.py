@@ -46,7 +46,7 @@ def _interventions(out: Path, e: dict, W: pd.DataFrame):
         chan_marks.setdefault(k, {}).update(v)
     reviewed.update(no)
     for k, v in questions.clumps(A).items():
-        if v == "not a cell":
+        if v in ("not a cell", "no cell"):
             reviewed[k] = "no"
     n = len(A.df)
     if n:
@@ -54,7 +54,7 @@ def _interventions(out: Path, e: dict, W: pd.DataFrame):
     if len(R):
         n = R[(R.your_label != "") | R.positive.notna()]
         if len(n):
-            applied.append(f"{len(n)} items labelled by you ({int(n.not_cell.sum())} not a cell, "
+            applied.append(f"{len(n)} items labelled by you ({int(n.not_cell.sum())} no cell, "
                            f"{int(R.positive.notna().sum())} with channels)")
     return applied, reviewed, chan_marks, R, A
 
@@ -159,7 +159,7 @@ def run(results, out=None, workers: int = 8, log=print) -> Path:
     H, cal = call_mod.call(M, W, F, size, nb, e, results, prefix_of, reviewed, FP, chan_marks, questions.clumps(A))
     if reviewed:
         k = [reviewed.get((p, w)) == "no" for p, w in zip(H.plate_id, H.well_id)]
-        H.loc[k, "cls"] = "not a cell (hand label)"
+        H.loc[k, "cls"] = "no cell (hand label)"
     log("5/5 your labels and the report")
     linfo = labels.fit(R, H, F["O"], F, cal, reviewed)
     if linfo["used"]:

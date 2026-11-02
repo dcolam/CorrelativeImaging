@@ -207,10 +207,10 @@ def call(M: pd.DataFrame, W: pd.DataFrame, F: dict, cell_size: dict, nb: pd.Data
         yours = np.array([reviewed.get(k) not in (None, "no") for k in zip(H.plate_id, H.well_id)])
         off = H.valid & (H.p_shape < 0.5) & ~yours            # a hole you called a cell stays a cell
         H.loc[off, "valid"] = False
-        H.loc[off, "status_cell"] = "not a cell (shape)"
+        H.loc[off, "status_cell"] = "no cell (shape)"
         for c in colour:
             H[f"pos_{c}"] = H[f"pos_{c}"] & H.valid
-        shape_info["gate"] = f"{int(off.sum())} holes are not a cell by shape (p < 0.5)"
+        shape_info["gate"] = f"{int(off.sum())} holes are no cell by shape (p < 0.5)"
     for c in colour:
         cal[c]["n_pos"] = int(H[f"pos_{c}"].sum())
     cal["_shape"] = shape_info

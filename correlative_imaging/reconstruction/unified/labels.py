@@ -26,7 +26,8 @@ MIN_PER_LABEL = 3
 SURE = 0.7
 NOT_SURE = "not sure"
 NOT_A_CELL = ("not a cell", "no cell", "halo", "plug", "debris", "no", "plug / halo", "empty", "nothing")
-NOT_CELL = "not a cell"                 # a learnt class like any cell type (plugs, halos, bright debris, empty holes)
+NOT_CELL = "no cell"     # one label for every hole without a cell: empty, or an object that is not a cell (plug, halo,
+                         # debris); learnt like any cell type. The reason stays in status_cell
 UNSURE = ("unsure", "not sure", "?", "skip")
 
 
@@ -167,7 +168,7 @@ def sheet(S: pd.DataFrame, H: pd.DataFrame, O: pd.DataFrame, out: Path, e: dict,
         "<p>Holes (yellow = hole, cyan = hole cell) and surrounding cells (centred), drawn at random from every "
         "channel-positivity pattern of the first pass. For each number, in <code>labels.csv</code>:</p><ul>"
         "<li><code>your_label</code>: what the cell is, in your own words (e.g. astrocyte, interneuron, excitatory "
-        "neuron), or <code>not a cell</code> (halo, plug, debris, glow). Leave empty if you cannot tell.</li>"
+        "neuron), or <code>no cell</code> (empty, halo, plug, debris, glow). Leave empty if you cannot tell.</li>"
         f"<li><code>positive_channels</code>: only where you disagree with the first pass or it says dim: the "
         f"channels you see positive ({names}), or <code>none</code>.</li></ul>"
         "<p>About 10 per label you use is enough. Then run the same command again.</p>"
@@ -235,9 +236,10 @@ def _shape_cols(D: pd.DataFrame, field: bool) -> np.ndarray:
 
 
 def fit(R: pd.DataFrame, H: pd.DataFrame, O: pd.DataFrame, F: dict, cal: dict, reviewed: dict | None = None) -> dict:
-    """The label model from every hand input. Classes: your cell types plus "not a cell" (labels, and the holes you
-    answered "not a cell" in the questions). Adds predicted_label / predicted_p / hand_label to H and O; every hole gets
-    a predicted_label: a type, "not sure", "not a cell", "no cell" (nothing in the hole) or "hole detection failed"."""
+    """The label model from every hand input. Classes: your cell types plus "no cell" (labels such as "not a cell",
+    "plug", "halo", and the holes you answered "no cell" in the questions). Adds predicted_label / predicted_p /
+    hand_label to H and O; every hole gets a predicted_label: a type, "not sure", "no cell" (empty hole, or an object
+    that is not a cell; the reason is in status_cell) or "hole detection failed"."""
     from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
     from sklearn.model_selection import LeaveOneOut, cross_val_predict
     colour, marker = F["colour"], F["marker"]
@@ -259,7 +261,7 @@ def fit(R: pd.DataFrame, H: pd.DataFrame, O: pd.DataFrame, F: dict, cal: dict, r
     st = H.status_cell.astype(str)
     H.loc[st == "hole detection failed", "predicted_label"] = "hole detection failed"
     H.loc[st.isin(["no cell", "speck (< 1/10 cell)", "mostly outside the hole"]), "predicted_label"] = "no cell"
-    H.loc[st == "not a cell (shape)", "predicted_label"] = NOT_CELL
+    H.loc[st == "no cell (shape)", "predicted_label"] = NOT_CELL
     extra = _answers_not_cell(R, reviewed)
     R = pd.concat([R, extra], ignore_index=True) if len(extra) else R
     _hand(R, H, O)
@@ -315,7 +317,7 @@ def fit(R: pd.DataFrame, H: pd.DataFrame, O: pd.DataFrame, F: dict, cal: dict, r
     info["model_table"] = keys.assign(kind=kind, hand_label=y, ld1=Z[:, 0], ld2=Z[:, 1], loo_predicted=cv)
     # every hole with an object in it (a cell, or not a cell by shape: the label model may disagree) and every
     # surrounding cell; surrounding cells never get "not a cell" (they are cells by construction)
-    with_obj = H.valid | (H.status_cell.astype(str) == "not a cell (shape)")
+    with_obj = H.valid | (H.status_cell.astype(str) == "no cell (shape)")
     for D, scale, own, sel, field in [(H, hole_scale, hole_own, with_obj, False),
                                       (O, field_scale, field_own, O.learn, True)]:
         Xd = design(D, scale, own, field)

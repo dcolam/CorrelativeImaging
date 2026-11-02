@@ -270,11 +270,11 @@ class LabelTab(QWidget):
             self.asker.set_items(pd.DataFrame(columns=["kind", "plate_id", "well_id", "image_id", "obj"]), [], None)
             return
         self.head.setText(
-            "<b>What is this cell?</b> In your own words (+ new label: astrocyte, interneuron, …), or <i>not a cell</i>. "
+            "<b>What is this cell?</b> In your own words (+ new label: astrocyte, interneuron, …), or <i>no cell</i>. "
             "Holes and surrounding cells are drawn at random from every channel pattern of the first pass. About 10 per "
             "label; then <b>Learn</b>. <i>unsure</i> = you cannot tell (left out of learning). The channel call needs no "
             "checking; only if it is clearly wrong, open <b>channels look wrong?</b>")
-        own = [x for x in R.your_label.unique() if x and x.lower() not in ("not a cell", "unsure")]
+        own = [x for x in R.your_label.unique() if x and x.lower() not in ("not a cell", "no cell", "unsure")]
         self.labels = list(dict.fromkeys(self.labels + own))
         names = {c: d.get("name", c) for c, d in e["channels"].items()}
         by_name = {n: c for c, n in names.items()}
@@ -291,7 +291,7 @@ class LabelTab(QWidget):
                         st.add(c)
             chan_state[Asker._key(r)] = st
         self._fp = {Asker._key(r): r["first_pass"] for r in items.to_dict("records")}
-        self.asker.set_items(items, self.labels + ["not a cell", "unsure"], self.on_answer, "",
+        self.asker.set_items(items, self.labels + ["no cell", "unsure"], self.on_answer, "",
                              channels=list(names.items()), on_channels=self.on_channels, chan_state=chan_state)
         self.update_counts()
 
@@ -315,7 +315,7 @@ class LabelTab(QWidget):
         if ok and t and t not in self.labels:
             self.labels.append(t)
             items = self.asker.items
-            self.asker.choices = self.labels + ["not a cell", "unsure"]
+            self.asker.choices = self.labels + ["no cell", "unsure"]
             self.asker._buttons()
             self.asker.items = items
             self.asker._paint()
@@ -843,7 +843,7 @@ class AppV2:
                                outputs=["report.html", "hole_calls.csv"])
         R = pd.read_csv(inter / "labels.csv", dtype=str).fillna("") if inter and (inter / "labels.csv").exists() \
             else pd.DataFrame()
-        lab = R.your_label[(R.your_label != "") & ~R.your_label.str.lower().isin(["not a cell", "unsure"])] \
+        lab = R.your_label[(R.your_label != "") & ~R.your_label.str.lower().isin(["not a cell", "no cell", "unsure"])] \
             if len(R) else pd.Series(dtype=str)
         c = lab.value_counts()
         enough = int((c >= 3).sum()) >= 2

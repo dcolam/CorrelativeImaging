@@ -27,9 +27,9 @@ KEYS = ["question", "plate_id", "well_id", "image_id", "obj"]
 CHOICES = {
     "wells": ["lost focus / failed: exclude", "no cells seeded: empty", "fine: keep"],
     "particle": ["cell", "several cells", "neighbour", "plug / halo", "debris", "unsure"],
-    "size": ["one cell", "several cells", "part of a cell", "not a cell", "unsure"],
-    "channel": ["positive", "negative", "not a cell", "unsure"],
-    "clump": ["one cell", "several cells", "not a cell", "unsure"],
+    "size": ["one cell", "several cells", "part of a cell", "no cell", "unsure"],
+    "channel": ["positive", "negative", "no cell", "unsure"],
+    "clump": ["one cell", "several cells", "no cell", "unsure"],
 }
 CELL = {"cell", "several cells"}
 NOT_CELL = {"neighbour", "plug / halo", "debris"}
@@ -100,7 +100,7 @@ def channels(A: Answers) -> tuple[dict, dict]:
         k = (r["plate_id"], r["well_id"])
         if r["answer"] in ("positive", "negative"):
             marks.setdefault(k, {})[r["obj"]] = r["answer"] == "positive"
-        elif r["answer"] == "not a cell":
+        elif r["answer"] in ("not a cell", "no cell"):
             no[k] = "no"
     return marks, no
 
@@ -172,7 +172,7 @@ def open_questions(out: Path, n_items: int = 48) -> list[dict]:
             Q.append(dict(id="particle", title="Cell or not? (particles in the hole)",
                           why="No examples of holes without a cell yet, so a plug or the aperture's glow can pass for "
                               "a dim cell. Your answers teach the shape model what a cell looks like here.",
-                          choices=CHOICES["particle"], needed=f"15 cell, 15 not a cell (now {n_cell}, {n_not})",
+                          choices=CHOICES["particle"], needed=f"15 cell, 15 no cell (now {n_cell}, {n_not})",
                           answered=len(a), state="open" if need else "done", items=items(D, "particle", cap)))
         else:
             U = P[(P.p_cell >= 0.3) & (P.p_cell <= 0.7)]
