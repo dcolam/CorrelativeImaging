@@ -161,7 +161,7 @@ def run(results, out=None, workers: int = 8, log=print) -> Path:
         k = [reviewed.get((p, w)) == "no" for p, w in zip(H.plate_id, H.well_id)]
         H.loc[k, "cls"] = "not a cell (hand label)"
     log("5/5 your labels and the report")
-    linfo = labels.fit(R, H, F["O"], F, cal)
+    linfo = labels.fit(R, H, F["O"], F, cal, reviewed)
     if linfo["used"]:
         log(f"   label model from {linfo['n']} labels {linfo['labels']}: leave-one-out accuracy {linfo['acc']:.2f}")
     else:

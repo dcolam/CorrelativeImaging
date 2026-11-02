@@ -189,8 +189,7 @@ def call(M: pd.DataFrame, W: pd.DataFrame, F: dict, cell_size: dict, nb: pd.Data
             cal[c]["cut_from_marks"] = info
         else:
             cal[c]["marks_not_used"] = info
-    # holes without a cell (your empty wells) and the shape model: a colour counts when it is brighter than any empty
-    # hole, or when the shape model says the hole holds a cell
+    # the shape model (cell or not by shape): learnt from your "no cell" examples (hand labels, answers, empty wells)
     H["p_shape"] = np.nan
     shape_info = dict(used=False)
     if results is not None and (len(empty) or reviewed):
@@ -199,27 +198,19 @@ def call(M: pd.DataFrame, W: pd.DataFrame, F: dict, cell_size: dict, nb: pd.Data
         H["p_shape"], shape_info = shape.model(Fp, H, W, {c: cal[c]["empty_cut"] for c in colour},
                                                {k: "no" if v == "no" else "yes" for k, v in reviewed.items()})
     for c in colour:
-        ce = cal[c]["empty_cut"]
-        if np.isfinite(ce):
-            bright = pd.Series(bright_empty[c], index=H.index)
-            by_shape = (H.p_shape >= 0.5) & ~bright if shape_info.get("used") else pd.Series(False, index=H.index)
-            H[f"shape_only_{c}"] = H[f"pos_{c}"] & by_shape
-            H[f"dim_unsure_{c}"] = H[f"pos_{c}"] & ~bright & ~by_shape
-            H[f"pos_{c}"] = H[f"pos_{c}"] & (bright | by_shape)
-        else:
-            H[f"dim_unsure_{c}"] = False
-            H[f"shape_only_{c}"] = False
-    # no empty wells to compare brightness with (e.g. every well seeded): the shape model alone decides whether the hole
-    # holds a cell (an aperture glowing in every channel is as bright as a cell, but not shaped like one)
-    no_ref = not any(np.isfinite(cal[c]["empty_cut"]) for c in colour)
-    if shape_info.get("used") and no_ref:
+        H[f"dim_unsure_{c}"] = False
+        H[f"shape_only_{c}"] = False
+    # one path for every experiment, with or without empty wells: the shape model (learnt from every "no cell" example:
+    # hand labels, answers, and the holes of empty wells where there are any) decides whether the hole holds a cell.
+    # Empty wells only add examples; their brightness gates nothing (one stray cell in an "empty" well would set the bar)
+    if shape_info.get("used"):
         yours = np.array([reviewed.get(k) not in (None, "no") for k in zip(H.plate_id, H.well_id)])
         off = H.valid & (H.p_shape < 0.5) & ~yours            # a hole you called a cell stays a cell
         H.loc[off, "valid"] = False
         H.loc[off, "status_cell"] = "not a cell (shape)"
         for c in colour:
             H[f"pos_{c}"] = H[f"pos_{c}"] & H.valid
-        shape_info["gate"] = f"no empty wells: {int(off.sum())} holes are not a cell by shape (p < 0.5)"
+        shape_info["gate"] = f"{int(off.sum())} holes are not a cell by shape (p < 0.5)"
     for c in colour:
         cal[c]["n_pos"] = int(H[f"pos_{c}"].sum())
     cal["_shape"] = shape_info

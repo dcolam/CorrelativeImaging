@@ -119,7 +119,7 @@ def label_curve(X: np.ndarray, y: np.ndarray, seed: int = 0) -> pd.DataFrame:
             rest = np.setdiff1d(np.arange(n), tr)
             tr = np.concatenate([tr, rng.choice(rest, k - len(tr), replace=False)]) if k > len(tr) else tr
             te = np.setdiff1d(np.arange(n), tr)
-            m = LinearDiscriminantAnalysis(solver="lsqr", shrinkage="auto").fit(X[tr], y[tr])
+            m = LinearDiscriminantAnalysis(solver="lsqr", shrinkage="auto", priors=np.full(len(labs), 1 / len(labs))).fit(X[tr], y[tr])
             acc.append(100 * float(np.mean(m.predict(X[te]) == y[te])))
         rows.append(dict(n=k, median=float(np.median(acc)), p5=float(np.percentile(acc, 5)),
                          p95=float(np.percentile(acc, 95)), draws=len(acc)))
