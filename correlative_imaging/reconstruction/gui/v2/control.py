@@ -20,7 +20,7 @@ import numpy as np
 import pandas as pd
 from qtpy.QtCore import Qt
 from qtpy.QtGui import QPixmap
-from qtpy.QtWidgets import QCheckBox, QFrame, QHBoxLayout, QLabel, QScrollArea, QVBoxLayout, QWidget
+from qtpy.QtWidgets import QCheckBox, QFrame, QHBoxLayout, QLabel, QScrollArea, QSizePolicy, QVBoxLayout, QWidget
 
 from ....gui_common.histogram import ChannelHistogram
 from ....gui_common.plate import PlateGrid
@@ -28,7 +28,9 @@ from .canvas import PREFIX
 
 NO_CELL, EMPTY, EXCLUDED, NO_HOLE, OK, FLAGGED = "#3a3f47", "#8a929c", "#20232a", "#b5473a", "#4caf6e", "#e0a030"
 LABEL_COLOURS = ["#4e79a7", "#f28e2b", "#e15759", "#76b7b2", "#59a14f", "#edc948", "#b07aa1", "#ff9da7", "#9c755f"]
-OVERLAYS = [("hole", "hole (yellow)"), ("hole cell", "hole cell (cyan)"), ("particle", "asked particle (white)")]
+OVERLAYS = [("hole", "hole"), ("hole cell", "hole cell"), ("particle", "particle")]
+OVERLAY_TIPS = {"hole": "the hole outline (yellow)", "hole cell": "the grown hole cell (cyan)",
+                "particle": "the particle a question asks about (white)"}
 
 
 def _section(text):
@@ -83,10 +85,12 @@ class ControlView(QWidget):
         v.addWidget(hint)
 
         v.addWidget(_section("Channels"))
+        body.setMinimumWidth(0)
         self.hist = ChannelHistogram(
             app.v, layers_fn=self._layers, name_fn=lambda c, L: self._V().name.get(c, c) if self._V() else c,
             color_fn=lambda c, L: self._V().color.get(c, "#ffffff") if self._V() else "#ffffff",
             auto_rule=auto_rule, set_color=self._set_color)
+        self.hist.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)     # follows the dock's width
         v.addWidget(self.hist)
 
         v.addWidget(_section("Overlays"))
@@ -94,6 +98,7 @@ class ControlView(QWidget):
         self.ov = {}
         for name, text in OVERLAYS:
             cb = QCheckBox(text)
+            cb.setToolTip(OVERLAY_TIPS[name])
             cb.setChecked(True)
             cb.toggled.connect(lambda on, name=name: self._set_vis(name, on))
             self.ov[name] = cb
@@ -104,6 +109,7 @@ class ControlView(QWidget):
         self.hue = QLabel("written by the first pass")
         self.hue.setProperty("role", "hint")
         self.hue.setAlignment(Qt.AlignCenter)
+        self.hue.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)   # the picture never widens the dock
         v.addWidget(self.hue)
         v.addStretch(1)
         self.names, self.colors, self.D = {}, {}, pd.DataFrame()
