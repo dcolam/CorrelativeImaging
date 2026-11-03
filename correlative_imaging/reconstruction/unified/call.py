@@ -62,7 +62,14 @@ def particle_signal(FP: pd.DataFrame, results, prefix_of: dict, colour: list) ->
     # (it gave holes its colour, e.g. a blue neighbour below the hole made the hole BFP+)
     if "share" in F:
         F = F[F.share >= 0.5]
-    rank = F.p_cell.fillna(0) * 1e6 + F.hsnr.fillna(0) if F.p_cell.notna().any() else F.hsnr.fillna(0)
+    # the hole's main object: the largest particle the particle model does not reject (P(cell) >= 0.2); before, the
+    # highest P(cell) won, so a small green streak (16 um2, P 0.99) beat the patched cell (35 um2, P 0.36) and gave the
+    # hole its colour (Olympus 21 % of the holes). Without P(cell): the brightest particle, as before
+    if F.p_cell.notna().any():
+        ok = F.p_cell.fillna(0) >= 0.2
+        rank = ok * 1e9 + F.in_um2.fillna(0) * ok * 1e3 + F.p_cell.fillna(0) * 1e2 + F.hsnr.fillna(0) / 1e3
+    else:
+        rank = F.hsnr.fillna(0)
     F = F.assign(_r=rank).sort_values("_r", ascending=False).drop_duplicates(["plate_id", "well_id"])
     out = F[["plate_id", "well_id"]].copy()
     out["part_p"] = F.p_cell.to_numpy()
