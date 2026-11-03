@@ -268,6 +268,12 @@ class LabelTab(QWidget):
                       "clean holes; answers to the questions stay")
         fb.clicked.connect(self.fresh)
         row.addWidget(fb)
+        row.addWidget(QLabel("order:"))
+        self.order = QComboBox()
+        self.order.addItems(["as suggested", "by label"])
+        self.order.setToolTip("by label: your labels grouped (in the order of the label buttons), not labelled yet last")
+        self.order.currentIndexChanged.connect(lambda _: self.fill())
+        row.addWidget(self.order)
         row.addStretch(1)
         self.counts = QLabel("")
         row.addWidget(self.counts)
@@ -303,6 +309,11 @@ class LabelTab(QWidget):
         items = R.assign(answer=R.your_label,
                          caption=[f"#{n} {'hole' if k == 'hole' else 'surrounding cell'} · {fp}"
                                   for n, k, fp in zip(R.number, R.kind, R.first_pass)])
+        if self.order.currentText() == "by label":
+            rank = {c: i for i, c in enumerate(self.labels + ["no cell", SKIP])}
+            items = items.assign(_g=[rank.get(a, len(rank)) if a else len(rank) + 1 for a in items.answer],
+                                 _n=pd.to_numeric(items.number, errors="coerce"))
+            items = items.sort_values(["_g", "answer", "_n"], kind="stable").drop(columns=["_g", "_n"])
         chan_state = {}
         for r in items.to_dict("records"):
             src = r["positive_channels"] if r["positive_channels"] else r["first_pass"]
@@ -314,7 +325,8 @@ class LabelTab(QWidget):
             chan_state[Asker._key(r)] = st
         self._fp = {Asker._key(r): r["first_pass"] for r in items.to_dict("records")}
         self.asker.set_items(items, self.labels + ["no cell", SKIP], self.on_answer, "",
-                             channels=list(names.items()), on_channels=self.on_channels, chan_state=chan_state)
+                             channels=list(names.items()), on_channels=self.on_channels, chan_state=chan_state,
+                             start_unanswered=self.order.currentText() != "by label")
         self.update_counts()
 
     def _write(self, r: dict, col: str, value: str):

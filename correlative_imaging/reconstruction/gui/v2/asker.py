@@ -124,7 +124,7 @@ class Asker(QWidget):
 
     # ------------------------------------------------------------------------------------------------- setup
     def set_items(self, items: pd.DataFrame, choices: list, on_answer, title: str = "", channels=None,
-                  on_channels=None, chan_state=None):
+                  on_channels=None, chan_state=None, start_unanswered: bool = True):
         self.items = items.reset_index(drop=True)
         if "answer" not in self.items:
             self.items["answer"] = ""
@@ -135,7 +135,7 @@ class Asker(QWidget):
         self._buttons()
         self.page, self.cur = 0, 0
         self.futs, self.pix = {}, {}
-        first = (self.items.answer == "").to_numpy().nonzero()[0]
+        first = (self.items.answer == "").to_numpy().nonzero()[0] if start_unanswered else []
         self.set_page(int(first[0]) // (COLS * ROWS) if len(first) else 0)
 
     def _clear_layout(self, lay):
@@ -250,12 +250,14 @@ class Asker(QWidget):
         if r is None:
             return
         k = self.page * COLS * ROWS + self.cur
+        before = str(self.items.answer.iloc[k] or "")
         self.items.loc[k, "answer"] = a
         if self.on_answer:
             self.on_answer(r, a)
         self.answered.emit()
-        # on to the next unanswered item
-        nxt = [j for j in range(k + 1, len(self.items)) if not self.items.answer.iloc[j]]
+        # a new answer: on to the next unanswered item; a changed answer (going through your labels): the next item
+        nxt = ([k + 1] if k + 1 < len(self.items) else []) if before else \
+            [j for j in range(k + 1, len(self.items)) if not self.items.answer.iloc[j]]
         if a and nxt:
             j = nxt[0]
             if j // (COLS * ROWS) != self.page:
