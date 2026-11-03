@@ -320,9 +320,11 @@ def fit(R: pd.DataFrame, H: pd.DataFrame, O: pd.DataFrame, F: dict, cal: dict, r
     # every label weighs the same, however many examples it has
     pri = np.full(len(np.unique(y)), 1 / len(np.unique(y)))
     lda = LinearDiscriminantAnalysis(solver="lsqr", shrinkage="auto", priors=pri)
-    cv = cross_val_predict(LinearDiscriminantAnalysis(solver="lsqr", shrinkage="auto", priors=pri), X, y,
-                           cv=LeaveOneOut())
+    # leave-one-out: each hand label predicted by a model trained on all the others (probabilities kept for ROCs)
+    cvp = cross_val_predict(LinearDiscriminantAnalysis(solver="lsqr", shrinkage="auto", priors=pri), X, y,
+                            cv=LeaveOneOut(), method="predict_proba")
     lda.fit(X, y)
+    cv = np.asarray(lda.classes_)[cvp.argmax(1)]
     info.update(used=True, n=int(len(y)), acc=float(np.mean(cv == y)),
                 acc_hole=float(np.mean(cv[kind == "hole"] == y[kind == "hole"])) if (kind == "hole").any() else np.nan,
                 confusion=pd.crosstab(pd.Series(y, name="hand label"), pd.Series(cv, name="predicted")),
@@ -334,7 +336,9 @@ def fit(R: pd.DataFrame, H: pd.DataFrame, O: pd.DataFrame, F: dict, cal: dict, r
     except Exception:                                                        # noqa: BLE001
         Z = np.full((len(y), 1), np.nan)
     Z = np.column_stack([Z, np.full((len(y), 2), np.nan)])[:, :2]
-    info["model_table"] = keys.assign(kind=kind, hand_label=y, ld1=Z[:, 0], ld2=Z[:, 1], loo_predicted=cv)
+    info["model_table"] = keys.assign(kind=kind, hand_label=y, ld1=Z[:, 0], ld2=Z[:, 1], loo_predicted=cv,
+                                      **{"loo_p_" + re.sub(r"\W+", "_", str(c)).strip("_"): cvp[:, j]
+                                         for j, c in enumerate(lda.classes_)})
     # step 2 on every hole the first pass calls a cell, and every surrounding cell; a hole you labelled "no cell"
     # keeps it (your label wins over the first pass)
     no_hand = (H.hand_label.astype(str) == NOT_CELL).to_numpy()

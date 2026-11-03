@@ -181,13 +181,26 @@ def open_questions(out: Path, n_items: int = 48) -> list[dict]:
         else:
             U = P[(P.p_cell >= 0.3) & (P.p_cell <= 0.7)]
             share = len(U) / max(len(P), 1)
-            Q.append(dict(id="particle", title="Is this object a cell? (one particle the shape model is unsure about)",
+            # plus the holes where every particle was thrown out (best P(cell) < 0.2): a dim real cell lands there and
+            # would never be asked about, so the model could not learn it (ROMK: most lost patched cells)
+            inside = P[P.share.fillna(0) >= 0.5] if "share" in P else P
+            best = inside.sort_values("p_cell", ascending=False).drop_duplicates(["plate_id", "well_id"])
+            Dr = best[best.p_cell < 0.2]
+            drk = set(zip(Dr.plate_id.astype(str), Dr.well_id.astype(str)))
+            n_dr = int(sum((str(p), str(w)) in drk for p, w in zip(a.plate_id, a.well_id))) if len(a) else 0
+            k = n_items // 2
+            pick = pd.concat([_sample(U, n_items - min(k, len(Dr))), _sample(Dr, min(k, len(Dr)), seed=1)])
+            Q.append(dict(id="particle", title="Is this object a cell? (one particle the shape model is unsure about, "
+                                               "or the best object of a hole it called empty)",
                           why=f"Shape model AUC {sh.get('auc', float('nan')):.2f}; {len(U)} particles "
-                              f"({100 * share:.0f} %) have P(cell) 0.3-0.7. About this one object only, not the "
-                              "whole hole.",
-                          choices=CHOICES["particle"], needed="20 answers", answered=len(a),
-                          state="open" if share >= 0.05 and len(a) < 20 else ("done" if len(a) >= 20 else "optional"),
-                          items=items(_sample(U, n_items), "particle", cap)))
+                              f"({100 * share:.0f} %) have P(cell) 0.3-0.7, and {len(Dr)} holes lost every object "
+                              "(P(cell) < 0.2). A dim cell among those is lost unless you say so. About this one "
+                              "object only, not the whole hole.",
+                          choices=CHOICES["particle"], needed=f"20 answers, 20 of them on emptied holes (now "
+                                                              f"{len(a)}, {n_dr})", answered=len(a),
+                          state="open" if (share >= 0.05 and len(a) < 20) or (len(Dr) and n_dr < 20)
+                          else "done",
+                          items=items(pick.sample(frac=1, random_state=0), "particle", cap)))
     # size of one cell
     fc = out / "cell_cores.parquet"
     Cc = pd.read_parquet(fc) if fc.exists() else pd.DataFrame()
