@@ -23,8 +23,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-W_ANSWER = 10.0     # one of your answers weighs like 10 automatic examples (empty wells, bright particles): a few dozen
-                    # answers must be able to move a model trained on ~1600 automatic examples
 BRIGHT = ["f_snr", "f_hsnr", "f_rel", "f_relmax", "f_field_pct", "f_rel_ctx", "f_oth_max", "f_oth_mean"]
 
 
@@ -51,7 +49,6 @@ def model(F: pd.DataFrame, H: pd.DataFrame, W: pd.DataFrame, own_cut: dict, revi
     y = np.full(len(F), np.nan)
     y[[k in empty or k in no for k in key]] = 0
     y[[k in yes for k in key]] = 1
-    wt = np.where([k in yes or (k in no and k not in empty) for k in key], W_ANSWER, 1.0)
     y[[(p, w, c) in bright and (p, w) not in empty and (p, w) not in no for p, w, c in zip(F.plate_id, F.well_id, F.ch)]] = 1
     n0, n1 = int((y == 0).sum()), int((y == 1).sum())
     info = dict(no_cell=n0, cell=n1, used=False, feats=feats)
@@ -71,7 +68,7 @@ def model(F: pd.DataFrame, H: pd.DataFrame, W: pd.DataFrame, own_cut: dict, revi
             continue
         m = HistGradientBoostingClassifier(max_iter=300, learning_rate=0.05, max_leaf_nodes=15, min_samples_leaf=20,
                                            l2_regularization=1.0, class_weight="balanced", random_state=0)
-        m.fit(X[tr], y[tr].astype(int), sample_weight=wt[tr])
+        m.fit(X[tr], y[tr].astype(int))
         te = (F.plate_id == pl).to_numpy()
         p[te] = m.predict_proba(X[te])[:, 1]
     F = F.assign(p_cell=p)
@@ -104,8 +101,6 @@ def particle_model(results: Path, prefix_of: dict, colour: list, W: pd.DataFrame
         y[bright] = 1
     y[yes & ~neg] = 1
     y = np.where(np.isfinite(a), a, y)      # your answers win
-    reviewed_hole = np.array([reviewed.get(k) in ("yes", "no") and k not in empty for k in key])
-    wt = np.where(np.isfinite(a) | reviewed_hole, W_ANSWER, 1.0)
     F["p_cell"] = np.nan
     info = dict(no_cell=int((y == 0).sum()), cell=int((y == 1).sum()), used=False, feats=feats,
                 answered=int(np.isfinite(a).sum()))
@@ -125,7 +120,7 @@ def particle_model(results: Path, prefix_of: dict, colour: list, W: pd.DataFrame
         leaf = int(np.clip(min((y[tr] == 0).sum(), (y[tr] == 1).sum()) // 5, 3, 20))
         m = HistGradientBoostingClassifier(max_iter=300, learning_rate=0.05, max_leaf_nodes=15, min_samples_leaf=leaf,
                                            l2_regularization=1.0, class_weight="balanced", random_state=0)
-        m.fit(X[tr], y[tr].astype(int), sample_weight=wt[tr])
+        m.fit(X[tr], y[tr].astype(int))
         te = (F.plate_id == pl).to_numpy()
         p[te] = m.predict_proba(X[te])[:, 1]
     F["p_cell"] = p
