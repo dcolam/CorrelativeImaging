@@ -126,7 +126,7 @@ def figures(H: pd.DataFrame, O: pd.DataFrame, e: dict) -> list:
     if "predicted_label" in V and (V.predicted_label.fillna("") != "").any():
         both = pd.concat([V[["hue", "purity", "predicted_label"]], Ol[["hue", "purity", "predicted_label"]]])
         both = both.rename(columns={"predicted_label": "lab"})
-        labs = [l for l in both.lab.fillna("").value_counts().index if l and l not in ("unsure", "not sure")][:len(STYLES)]
+        labs = [l for l in both.lab.fillna("").value_counts().index if l and " or " not in l and l not in ("unsure", "not sure")][:len(STYLES)]
         g = [(l, both.hue[both.lab == l].to_numpy(), both.purity[both.lab == l].to_numpy(), STYLES[i])
              for i, l in enumerate(labs)]
         out.append(("Per label (the label model's call, hole and surrounding cells)", figure(g, e)))

@@ -3,6 +3,12 @@
 MODEL_UNSURE = "not sure"     # the label model's verdict below 0.7 (older runs stored it as "unsure")
 
 
+def is_unsure(label) -> bool:
+    """The model's 'not sure' verdict, also in its two-candidate form ("excitatory or inhibitory")."""
+    s = str(label)
+    return s in ("unsure", "not sure") or " or " in s
+
+
 def shown(label) -> str:
     """A predicted label as shown (older runs stored the model's verdict as "unsure")."""
     return MODEL_UNSURE if label in ("unsure", "not sure") else str(label)
@@ -35,9 +41,10 @@ TERMS = [
                  "either fully on it or absent."),
     ("pattern (channel positivity)", "The channels a cell is positive in, named as in the run, e.g. 'FITC+ TX RED+'; "
      "'none' when no channel is. The first pass gives only this: no cell types, no priority between channels."),
-    ("not sure (predicted label)", "The label model's best guess for a cell has a probability below 0.7. Not something you "
-                         "have to fill in; labelling some of these cells (Learn: 'Label cells the model is not sure "
-                         "about') teaches the model where it is unsure."),
+    ("A or B (predicted label)", "The label model's best guess for a cell has a probability below 0.7; the two most "
+                         "likely labels are named, e.g. 'excitatory or inhibitory' (a neuron of unclear type). Not "
+                         "something you have to fill in; labelling some of these cells (Learn: 'Label cells the model is "
+                         "not sure about') teaches the model where it is unsure."),
     ("hand label / predicted label", "What a cell is, in your words (astrocyte, interneuron, ...), from the label sheet. "
      "An LDA learns your labels from the channel signals (relative to a typical positive cell of the same population) "
      "of the holes and "

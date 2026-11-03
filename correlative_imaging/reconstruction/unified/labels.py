@@ -264,8 +264,12 @@ def fit(R: pd.DataFrame, H: pd.DataFrame, O: pd.DataFrame, F: dict, cal: dict, r
     def design(D, a, b, p, field):
         # the type is a colour question: colour only (cell or not was decided before, by shape and size)
         # nothing grown in the hole = no own signal: 0, not missing (a hole valid by its particle alone is still a cell)
+        # plus the first pass's call per colour (positive or not, 0 or 2: the range of the log signals). Without it a
+        # dim but positive cell (e.g. an astrocyte with weak BFP) sat nearer the other type's average and was lost
+        pos = np.column_stack([D[f"pos_{c}"].fillna(False).astype(float).to_numpy() * 2.0 if f"pos_{c}" in D
+                               else np.zeros(len(D)) for c in colour])
         return np.nan_to_num(np.hstack([features(D, chans, a, ""), features(D, colour, b, ""),
-                                        features(D, colour, p, "")]), nan=0.0)
+                                        features(D, colour, p, ""), pos]), nan=0.0)
     info = dict(used=False, n=0, labels={}, why="")
     for D in (H, O):
         D["predicted_label"], D["predicted_p"], D["hand_label"] = "", np.nan, ""
@@ -342,13 +346,18 @@ def fit(R: pd.DataFrame, H: pd.DataFrame, O: pd.DataFrame, F: dict, cal: dict, r
             p = lda.predict_proba(Xd[good])
             cls = np.asarray(lda.classes_)
             lab = cls[p.argmax(1)]
+            # not sure: name the two candidates (alphabetical, so each pair is one category), e.g. "excitatory or
+            # inhibitory" = a neuron whose type is unclear
+            o = np.argsort(-p, axis=1)
+            two = np.array([" or ".join(sorted((str(cls[a]), str(cls[b])))) if len(cls) > 1 else NOT_SURE
+                            for a, b in zip(o[:, 0], o[:, min(1, len(cls) - 1)])], dtype=object)
             for j, c in enumerate(cls):             # every label's probability: curves of certainty vs calls
                 col = "p_" + re.sub(r"\W+", "_", str(c)).strip("_")
                 if col not in D:
                     D[col] = np.nan
                 D.loc[good, col] = p[:, j]
             D.loc[good, "predicted_p"] = p.max(1)
-            D.loc[good, "predicted_label"] = np.where(p.max(1) >= SURE, lab, NOT_SURE)
+            D.loc[good, "predicted_label"] = np.where(p.max(1) >= SURE, lab, two)
     H.loc[no_hand & (H.status_cell.astype(str) != "hole detection failed"), "predicted_label"] = NOT_CELL
     return info
 

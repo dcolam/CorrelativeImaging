@@ -435,7 +435,8 @@ class LearnTab(QWidget):
         if pl in H:
             c = H[pl].fillna("").replace("", "—").map(shown).value_counts()
             t += ("<p>Hole cells per predicted label: " + ", ".join(f"{e(str(k))} {v}" for k, v in c.items()) +
-                  ". <i>not sure</i>: the model's best guess is below 70 % (nothing you have to fill in).</p>")
+                  ". <i>A or B</i> (e.g. excitatory or inhibitory): the model's best guess is below 70 %, between these two "
+                  "(nothing you have to fill in).</p>")
             Hv = H[H.status_cell == "cell"] if "status_cell" in H else H
             ct = pd.crosstab(Hv.pattern, Hv[pl].fillna("").map(shown))
             t += ("<p>First-pass pattern × label:</p><table border='1' cellspacing='0' cellpadding='3'><tr><th></th>"
@@ -462,7 +463,8 @@ class LearnTab(QWidget):
         H = pd.read_csv(out / "hole_calls.csv", dtype={"plate_id": str, "well_id": str})
         pl = "predicted_label" if "predicted_label" in H else "bio_label"
         from ...unified.labels import clean
-        U = H[H.get(pl, pd.Series("", index=H.index)).fillna("").isin(["unsure", "not sure"]) & clean(H)]
+        from ...unified.vocab import is_unsure
+        U = H[H.get(pl, pd.Series("", index=H.index)).fillna("").map(is_unsure) & clean(H)]
         if not len(U):
             self.app.say("the model is sure about every hole cell")
             return

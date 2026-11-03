@@ -155,7 +155,7 @@ class ControlView(QWidget):
         W = W.fillna("")
         W["hand_label"] = W.hand_label.where(W.hand_label != "", W.your_label).replace("not a cell", "no cell")    # labelled since the last run too
         labs = [l for l in pd.concat([W.hand_label, W.predicted_label]).value_counts().index
-                if l and l not in ("unsure", "not sure", "not a cell", "no cell", "hole detection failed")]
+                if l and " or " not in l and l not in ("unsure", "not sure", "not a cell", "no cell", "hole detection failed")]
         self.label_colour = {l: LABEL_COLOURS[i % len(LABEL_COLOURS)] for i, l in enumerate(labs)}
         self.D = W
         self.plate.set(W, stage=f"first pass of {pd.Timestamp.fromtimestamp((out / 'summary.json').stat().st_mtime):%d.%m. %H:%M}"

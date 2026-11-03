@@ -319,7 +319,7 @@ def write(out: Path, T, P, W, F, C, size, H, cal, e, path_map, summary, linfo=No
             f"together. Each hand label predicted by a model trained on all the others (leave-one-out): "
             f"<b>{100 * li['acc']:.0f} %</b> right"
             + (f", on holes {100 * li['acc_hole']:.0f} %" if np.isfinite(li.get("acc_hole", np.nan)) else "")
-            + ". Every cell gets a predicted label when its probability is at least 0.7, otherwise 'not sure'. "
+            + ". Every cell gets a predicted label when its probability is at least 0.7, otherwise the two most likely labels, e.g. 'excitatory or inhibitory'. "
               "Two separate columns in hole_calls.csv and field_cells.parquet: <code>predicted_label</code> (with "
               "<code>predicted_p</code>) and <code>hand_label</code>.</p>")
         cf = li["confusion"]
@@ -352,7 +352,7 @@ def write(out: Path, T, P, W, F, C, size, H, cal, e, path_map, summary, linfo=No
         fo = O[O.learn].predicted_label.map(shown).value_counts()
         t.append("<p>Surrounding cells by predicted label: " + ", ".join(
             f"{html.escape(str(k))} {v} ({100 * v / fo.sum():.0f} %)" for k, v in fo.items()) + ".</p>")
-        for lab in [c for c in V.predicted_label.value_counts().index if c and c not in ("unsure", "not sure")][:6]:
+        for lab in [c for c in V.predicted_label.value_counts().index if c and " or " not in c and c not in ("unsure", "not sure")][:6]:
             sel = V[(V.predicted_label == lab)]
             imgs, labs = [], []
             for r in sel.iloc[RNG.choice(len(sel), min(8, len(sel)), replace=False)].itertuples():
