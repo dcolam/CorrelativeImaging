@@ -268,6 +268,15 @@ class LabelTab(QWidget):
                       "clean holes; answers to the questions stay")
         fb.clicked.connect(self.fresh)
         row.addWidget(fb)
+        self.add_edit = QLineEdit()
+        self.add_edit.setPlaceholderText("add holes: 18T39412 O06, 18T39412 O05 …")
+        self.add_edit.setToolTip("holes you want to label that the suggestions did not bring: plate and well, separated by "
+                                 "commas or new lines; added to the end of the sheet")
+        self.add_edit.returnPressed.connect(self.add_holes)
+        row.addWidget(self.add_edit, 1)
+        ab = QPushButton("Add")
+        ab.clicked.connect(self.add_holes)
+        row.addWidget(ab)
         row.addWidget(QLabel("order:"))
         self.order = QComboBox()
         self.order.addItems(["as suggested", "by label"])
@@ -372,6 +381,40 @@ class LabelTab(QWidget):
         self.labels = []
         self.more()
         self.app.refresh()
+
+    def add_holes(self):
+        """Holes typed as 'plate well' (commas or new lines between them) appended to the label sheet."""
+        import re as _re
+        txt = self.add_edit.text().strip()
+        if not txt or self.app.out is None:
+            return
+        H = pd.read_csv(self.app.out / "hole_calls.csv", dtype={"plate_id": str, "well_id": str})
+        known = {(p, w): r for p, w, r in zip(H.plate_id, H.well_id, H.to_dict("records"))}
+        R = self._read()
+        have = set(zip(R.kind, R.plate_id, R.well_id)) if len(R) else set()
+        n0 = int(pd.to_numeric(R.number, errors="coerce").max()) if len(R) else 0
+        new, bad = [], []
+        for tok in _re.split(r"[,;\n]+", txt):
+            m = _re.match(r"\s*(\S+)\s+([A-Pa-p])\s*0*(\d{1,2})\s*$", tok)
+            if not m:
+                if tok.strip():
+                    bad.append(tok.strip())
+                continue
+            key = (m.group(1), f"{m.group(2).upper()}{int(m.group(3)):02d}")
+            if key not in known:
+                bad.append(" ".join(key)); continue
+            if ("hole",) + key in have:
+                continue
+            r = known[key]
+            new.append(dict(number=str(n0 + len(new) + 1), kind="hole", plate_id=key[0], well_id=key[1],
+                            image_id=str(r.get("image_id", "")), obj="", first_pass=str(r.get("pattern", "")),
+                            your_label="", positive_channels=""))
+            have.add(("hole",) + key)
+        if new:
+            pd.concat([R, pd.DataFrame(new)]).to_csv(self._file(), index=False)
+            self.add_edit.clear()
+            self.fill()
+        self.app.say(f"{len(new)} holes added to the Label tab" + (f"; not found: {', '.join(bad)}" if bad else ""))
 
     def more(self):
         from ...unified import labels as L

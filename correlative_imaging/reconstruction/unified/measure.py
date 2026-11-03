@@ -132,6 +132,17 @@ def _one(job):
             tot = np.bincount(lab.ravel(), minlength=n + 1); ins = np.bincount(lab[hole], minlength=n + 1)
             seeds[c] = np.isin(lab, np.nonzero((ins / np.maximum(tot, 1) >= 0.5) & (np.arange(n + 1) > 0))[0])
         seeds_any = np.any([seeds[c] for c in colour], axis=0) if colour else np.zeros(hole.shape, bool)
+        # a marker helps only where no colour found anything: its particles >= 50 % inside the hole seed the outline
+        # (grown in the marker channel); it never decides the colour or the type
+        mark_seed = {}
+        if not seeds_any.any():
+            for c in [m for m in allc if m not in colour]:
+                lab, n = nd_label(own.get(c, np.zeros(hole.shape, bool)) & safety)
+                tot = np.bincount(lab.ravel(), minlength=n + 1); ins = np.bincount(lab[hole], minlength=n + 1)
+                mark_seed[c] = np.isin(lab, np.nonzero((ins / np.maximum(tot, 1) >= 0.5) & (np.arange(n + 1) > 0))[0])
+            if mark_seed:
+                seeds_any = np.any(list(mark_seed.values()), axis=0)
+        out["outline_from_marker"] = bool(seeds_any.any() and mark_seed)
         neigh = np.zeros(hole.shape, bool)
         for c in allc:
             near_obj[c] = np.zeros(hole.shape, bool)
@@ -152,7 +163,10 @@ def _one(job):
         for c in colour:
             st = grow(img[idx[c]], seeds[c] & allowed, bg[c] + K_NOISE * noise[c], allowed, UPHILL * noise[c])
             regions[c] = clean(st, seeds[c] & allowed, 2) if st.any() else st
-        cell = np.any([regions[c] for c in colour], axis=0) if colour else np.zeros(hole.shape, bool)
+        for c, sd in mark_seed.items():
+            st = grow(img[idx[c]], sd & allowed, bg[c] + K_NOISE * noise[c], allowed, UPHILL * noise[c])
+            regions[c] = clean(st, sd & allowed, 2) if st.any() else st
+        cell = np.any(list(regions.values()), axis=0) if regions else np.zeros(hole.shape, bool)
         out.update(hole_um2=hole.sum() * px ** 2, cell_um2=cell.sum() * px ** 2,
                    cell_in_hole=float((cell & hole).sum() / max(cell.sum(), 1)),
                    hole_cover=float((cell & hole).sum() / max(hole.sum(), 1)), sat_px_cell=int((cell & sat).sum()),
