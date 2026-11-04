@@ -82,6 +82,10 @@ class Views:
         top = self.S.get("display_top") or {}
         self.top_hole, self.top_field = top.get("hole", {}), top.get("field", {})
         self.white = top.get("field_max") or {}
+        # holes on one scale for the whole run (default): (signal - background) / noise against a typical bright
+        # positive hole cell of each channel (display_top.hole). Off: each hole stretched to its own brightest channel,
+        # which makes a faint colour in a dim hole look bright (labels were set on that view)
+        self.absolute = True
         self.chans = list(self.e["channels"])
         self.color = {c: v.get("color", "#ffffff") for c, v in self.e["channels"].items()}
         self.name = {c: v.get("name", c) for c, v in self.e["channels"].items()}
@@ -143,7 +147,11 @@ class Views:
         return {c: (P[c], L[c]) for c in P}
 
     def planes_hole(self, h: dict) -> dict:
-        """{channel: (H, W) in [0, 1]}, linear within the display range."""
+        """{channel: (H, W) in [0, 1]}, linear within the display range: one scale for the run (absolute) or the hole's
+        own stretch."""
+        if self.absolute and self.top_hole and all((self.top_hole.get(c) or 0) > 0 for c in h["names"]):
+            return {c: np.clip((h["img"][k] - h["bg"][k]) / max(float(h["noise"][k]), 1e-6) / float(self.top_hole[c]), 0, 1)
+                    for k, c in enumerate(h["names"])}
         return {c: np.clip((a - lo) / max(hi - lo, 1e-6), 0, 1) for c, (a, (lo, hi)) in self.raw_hole(h).items()}
 
     def whole(self, diag: str, well_raw: str) -> dict:

@@ -22,7 +22,7 @@ import numpy as np
 import pandas as pd
 from qtpy.QtCore import QObject, Qt, QUrl, Signal
 from qtpy.QtGui import QColor, QDesktopServices
-from qtpy.QtWidgets import (QColorDialog, QComboBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QInputDialog,
+from qtpy.QtWidgets import (QCheckBox, QColorDialog, QComboBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QInputDialog,
                             QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QStackedWidget,
                             QTableWidget, QTableWidgetItem, QTabWidget, QTextBrowser, QVBoxLayout, QWidget)
 
@@ -284,6 +284,13 @@ class LabelTab(QWidget):
         self.order.setToolTip("by label: your labels grouped (in the order of the label buttons), not labelled yet last")
         self.order.currentIndexChanged.connect(lambda _: self.fill())
         row.addWidget(self.order)
+        self.same_scale = QCheckBox("same brightness for all holes")
+        self.same_scale.setChecked(True)
+        self.same_scale.setToolTip("on: every hole on one scale for the run (a typical bright positive cell = full "
+                                   "colour), so a faint colour looks faint. Off: each hole stretched to its own brightest "
+                                   "channel, which makes a faint colour in a dim hole look bright")
+        self.same_scale.toggled.connect(self._scale_changed)
+        row.addWidget(self.same_scale)
         row.addStretch(1)
         self.counts = QLabel("")
         row.addWidget(self.counts)
@@ -295,6 +302,30 @@ class LabelTab(QWidget):
 
     def _file(self) -> Path:
         return self.app.out / "interventions" / "labels.csv"
+
+    def _scale_changed(self, on):
+        if getattr(self.app, "views", None) is not None:
+            self.app.views.absolute = bool(on)
+        self.fill()
+
+    def _measured(self, e) -> dict:
+        """{(plate, well): "GFP 0.2 · mCherry 1.4 · BFP 0.0"}: each colour's median over the cell outline (bleed-corrected),
+        relative to a typical positive hole cell of the run (1 = typical), as the type model sees it."""
+        f = self.app.out / "hole_calls.csv"
+        if not f.exists():
+            return {}
+        from ...unified.labels import _typical
+        H = pd.read_csv(f, dtype={"plate_id": str, "well_id": str})
+        ok = H.status_cell.astype(str) == "cell" if "status_cell" in H else pd.Series(True, index=H.index)
+        colour = [c for c, d in e["channels"].items() if d.get("role", "colour") != "marker" and f"own_{c}" in H]
+        typ = {c: _typical(H, f"own_{c}", f"pos_{c}", ok) for c in colour}
+        out = {}
+        for r in H.itertuples(index=False):
+            d = r._asdict()
+            parts = [f"{e['channels'][c].get('name', c)} {d[f'own_{c}'] / typ[c]:.1f}" for c in colour
+                     if typ[c] and d.get(f"own_{c}") == d.get(f"own_{c}")]
+            out[(str(r.plate_id), str(r.well_id))] = " · ".join(parts)
+        return out
 
     def _read(self) -> pd.DataFrame:
         return pd.read_csv(self._file(), dtype=str).fillna("") if self._file().exists() else pd.DataFrame()
@@ -317,12 +348,15 @@ class LabelTab(QWidget):
         self.labels = list(dict.fromkeys(self.labels + own))
         names = {c: d.get("name", c) for c, d in e["channels"].items()}
         by_name = {n: c for c, n in names.items()}
+        meas = self._measured(e)
         items = R.assign(answer=R.your_label,
                          caption=[f"#{n} {'hole' if k == 'hole' else 'surrounding cell'} · {fp}"
+                                  + (f" · cell: {meas[(p, w)]} × typical" if k == "hole" and meas.get((p, w)) else "")
                                   + (f" · model: {pr} ({wy})" if pr else "")
-                                  for n, k, fp, pr, wy in zip(R.number, R.kind, R.first_pass,
-                                                              R.get("proposed", pd.Series("", index=R.index)),
-                                                              R.get("why", pd.Series("", index=R.index)))])
+                                  for n, k, fp, pr, wy, p, w in zip(R.number, R.kind, R.first_pass,
+                                                                    R.get("proposed", pd.Series("", index=R.index)),
+                                                                    R.get("why", pd.Series("", index=R.index)),
+                                                                    R.plate_id, R.well_id)])
         if self.order.currentText() == "by label":
             rank = {c: i for i, c in enumerate(self.labels + ["no cell", SKIP, EXCLUDE_ANSWER])}
             items = items.assign(_g=[rank.get(a, len(rank)) if a else len(rank) + 1 for a in items.answer],

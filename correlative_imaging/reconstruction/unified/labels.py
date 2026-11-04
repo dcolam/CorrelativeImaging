@@ -33,6 +33,44 @@ EXCLUDE = "excluded"     # your answer "exclude": the cell is left out of the an
                          # not a type, not "no cell" (that would train the shape model), not "unsure" (that keeps the
                          # model's call)
 EXCLUDE_WORDS = ("exclude", "excluded", "exclude (leave out of the analysis)", "leave out")
+SOMA_MIN = 0.2           # a hole cell whose outline is smaller than this share of the hole: only a speck or a fragment
+                         # was outlined; it gets no type ("no colour") and never trains the type model
+NO_COLOUR = "no colour"
+
+
+def soma_sized(D: pd.DataFrame) -> pd.Series:
+    """Holes whose cell outline is at least SOMA_MIN of the hole (unknown size: kept)."""
+    if "cell_um2" not in D or "hole_um2" not in D:
+        return pd.Series(True, index=D.index)
+    rel = D.cell_um2.astype(float) / D.hole_um2.astype(float)
+    return ~(rel < SOMA_MIN)
+
+
+def design_names(F: dict, nm: dict) -> list:
+    """Names of the type model's features, in the order of design_rows."""
+    return ([f"marker {nm.get(m, m)}" for m in F["marker"]] + [f"cell outline {nm.get(c, c)}" for c in F["colour"]] +
+            [f"first pass + {nm.get(c, c)}" for c in F["colour"]])
+
+
+def design_rows(D: pd.DataFrame, H: pd.DataFrame, O: pd.DataFrame, F: dict, field: bool = False) -> np.ndarray:
+    """The type model's features for the rows of D (holes, or surrounding cells with field=True); H and O give the
+    typical positive cell each signal is taken relative to.
+    Colour = the median over the cell outline only (bleed-corrected own signal; 2026-11-04). The aperture mean and the
+    best particle were dropped: a bright speck lifts both (and is the particle), so a red cell with one green dot was
+    called inhibitory. Plus the first pass's call per colour (0 or 2: the range of the log signals; without it a dim but
+    positive cell sat nearer the other type's average) and the marker channel (ROMK) as it was.
+    Surrounding cells have one measure per colour (already corrected), used for the colour features."""
+    colour, marker = F["colour"], F["marker"]
+    hole_scale, field_scale = scales(H, O, F)
+    if field:
+        a, b = field_scale, {c: field_scale[c] for c in colour}
+    else:
+        a = hole_scale
+        b = {c: (f"own_{c}", _typical(H, f"own_{c}", f"pos_{c}", H.valid)) for c in colour}
+    pos = np.column_stack([D[f"pos_{c}"].fillna(False).astype(float).to_numpy() * 2.0 if f"pos_{c}" in D
+                           else np.zeros(len(D)) for c in colour]) if colour else np.zeros((len(D), 0))
+    # nothing grown in the hole = no own signal: 0, not missing
+    return np.nan_to_num(np.hstack([features(D, marker, a, ""), features(D, colour, b, ""), pos]), nan=0.0)
 
 
 def _norm(s) -> str:
@@ -256,27 +294,7 @@ def fit(R: pd.DataFrame, H: pd.DataFrame, O: pd.DataFrame, F: dict, cal: dict, r
     from sklearn.model_selection import LeaveOneOut, cross_val_predict
     colour, marker = F["colour"], F["marker"]
     chans = colour + marker
-    hole_scale, field_scale = scales(H, O, F)
-    # a second view of each colour: in holes the bleed-corrected own signal (sees a dim colour next to a bright one, e.g.
-    # FITC under bleed-through into TX RED); surrounding cells have one measure (already corrected), used for both
-    hole_own = {c: (f"own_{c}", _typical(H, f"own_{c}", f"pos_{c}", H.valid)) for c in colour}
-    field_own = {c: field_scale[c] for c in colour}
-    # a third view: the particle's colour (the object in the hole itself). The grown cell can follow a bright
-    # neighbour and lose the patched cell's colour (Olympus PNC: blue particle, grown cell red); the particle keeps it.
-    # Surrounding cells are particles already: their one measure again
-    hole_part = {c: (f"part_{c}", _typical(H, f"part_{c}", f"pos_{c}", H.valid)) if f"part_{c}" in H
-                 else hole_own[c] for c in colour}
-    field_part = {c: field_scale[c] for c in colour}
-
-    def design(D, a, b, p, field):
-        # the type is a colour question: colour only (cell or not was decided before, by shape and size)
-        # nothing grown in the hole = no own signal: 0, not missing (a hole valid by its particle alone is still a cell)
-        # plus the first pass's call per colour (positive or not, 0 or 2: the range of the log signals). Without it a
-        # dim but positive cell (e.g. an astrocyte with weak BFP) sat nearer the other type's average and was lost
-        pos = np.column_stack([D[f"pos_{c}"].fillna(False).astype(float).to_numpy() * 2.0 if f"pos_{c}" in D
-                               else np.zeros(len(D)) for c in colour])
-        return np.nan_to_num(np.hstack([features(D, chans, a, ""), features(D, colour, b, ""),
-                                        features(D, colour, p, ""), pos]), nan=0.0)
+    # the features: design_rows (cell-outline colour, first-pass call, marker)
     info = dict(used=False, n=0, labels={}, why="")
     for D in (H, O):
         D["predicted_label"], D["predicted_p"], D["hand_label"] = "", np.nan, ""
@@ -305,11 +323,13 @@ def fit(R: pd.DataFrame, H: pd.DataFrame, O: pd.DataFrame, F: dict, cal: dict, r
         H.assign(plate_id=H.plate_id.astype(str), well_id=H.well_id.astype(str)), on=["plate_id", "well_id"],
         how="inner", suffixes=("", "_h"))
     hk = hk[hk.status_cell.astype(str) != "hole detection failed"]
+    small = ~soma_sized(hk)                     # an outline that is only a speck or a fragment teaches nothing
+    info["small_outline_labels"] = int(small.sum())
+    hk = hk[~small]
     Oo = O.assign(obj=O.channel.astype(str) + ":" + O.label.astype(str), image_id=O.image_id.astype(str),
                   plate_id=O.plate_id.astype(str))
     fk = L[L.kind != "hole"].merge(Oo, on=["plate_id", "image_id", "obj"], how="inner", suffixes=("", "_o"))
-    X = np.vstack([design(hk, hole_scale, hole_own, hole_part, False),
-                   design(fk, field_scale, field_own, field_part, True)])
+    X = np.vstack([design_rows(hk, H, O, F, False), design_rows(fk, H, O, F, True)])
     y = np.concatenate([hk.your_label.to_numpy(), fk.your_label.to_numpy()])
     kind = np.array(["hole"] * len(hk) + ["surrounding"] * len(fk))
     keys = pd.concat([hk[["plate_id", "well_id"]].assign(image_id="", obj=""),
@@ -350,9 +370,9 @@ def fit(R: pd.DataFrame, H: pd.DataFrame, O: pd.DataFrame, F: dict, cal: dict, r
     # step 2 on every hole the first pass calls a cell, and every surrounding cell; a hole you labelled "no cell"
     # keeps it (your label wins over the first pass)
     no_hand = (H.hand_label.astype(str) == NOT_CELL).to_numpy()
-    for D, scale, own, part, sel, field in [(H, hole_scale, hole_own, hole_part, H.valid & ~no_hand, False),
-                                            (O, field_scale, field_own, field_part, O.learn, True)]:
-        Xd = design(D, scale, own, part, field)
+    soma = soma_sized(H).to_numpy()
+    for D, sel, field in [(H, H.valid & ~no_hand & soma, False), (O, O.learn, True)]:
+        Xd = design_rows(D, H, O, F, field)
         good = sel.to_numpy() & np.isfinite(Xd).all(1)
         if good.any():
             p = lda.predict_proba(Xd[good])
@@ -370,6 +390,8 @@ def fit(R: pd.DataFrame, H: pd.DataFrame, O: pd.DataFrame, F: dict, cal: dict, r
                 D.loc[good, col] = p[:, j]
             D.loc[good, "predicted_p"] = p.max(1)
             D.loc[good, "predicted_label"] = np.where(p.max(1) >= SURE, lab, two)
+    # a cell whose outline is only a speck or a fragment: no type
+    H.loc[H.valid.to_numpy() & ~no_hand & ~soma, "predicted_label"] = NO_COLOUR
     H.loc[no_hand & (H.status_cell.astype(str) != "hole detection failed"), "predicted_label"] = NOT_CELL
     _exclude(H, O)
     return info
