@@ -29,6 +29,10 @@ NOT_A_CELL = ("not a cell", "no cell", "halo", "plug", "debris", "no", "plug / h
 NOT_CELL = "no cell"     # one label for every hole without a cell: empty, or an object that is not a cell (plug, halo,
                          # debris); learnt like any cell type. The reason stays in status_cell
 UNSURE = ("unsure", "not sure", "?", "skip", "skip (not clean or can't tell)")
+EXCLUDE = "excluded"     # your answer "exclude": the cell is left out of the analysis (not reported) and trains nothing:
+                         # not a type, not "no cell" (that would train the shape model), not "unsure" (that keeps the
+                         # model's call)
+EXCLUDE_WORDS = ("exclude", "excluded", "exclude (leave out of the analysis)", "leave out")
 
 
 def _norm(s) -> str:
@@ -49,6 +53,7 @@ def tidy(labels: pd.Series) -> pd.Series:
     out = k.map(best)
     out[k.isin(NOT_A_CELL)] = NOT_CELL
     out[k.isin(UNSURE)] = "unsure"
+    out[k.isin(EXCLUDE_WORDS)] = EXCLUDE
     return out
 
 
@@ -89,6 +94,8 @@ def hole_marks(R: pd.DataFrame, chans: list = ()) -> tuple[dict, dict]:
         k = (r["plate_id"], r["well_id"])
         if r["not_cell"]:
             shape_m[k] = "no"
+        elif r["your_label"] == EXCLUDE:
+            continue
         elif r["your_label"] or r["positive"] is not None:
             shape_m[k] = "yes"
         if r["positive"] is not None and not r["not_cell"]:
@@ -281,10 +288,11 @@ def fit(R: pd.DataFrame, H: pd.DataFrame, O: pd.DataFrame, F: dict, cal: dict, r
     extra = _answers_not_cell(R, reviewed)
     R = pd.concat([R, extra], ignore_index=True) if len(extra) else R
     _hand(R, H, O)
+    _exclude(H, O)                         # also when no model can be fit below
     if not len(R):
         info["why"] = "no labels yet"
         return info
-    L = R[(R.your_label != "") & (R.your_label != "unsure")]                 # unsure is not a type
+    L = R[(R.your_label != "") & (R.your_label != "unsure") & (R.your_label != EXCLUDE)]   # neither is a type
     # two steps: cell or no cell is decided by the first pass (shape model and size, which your "no cell" labels and
     # answers train); the type only among cells, from your type labels. "no cell" is not a type: as one of the
     # classes it took every red, cell-like object to "not sure" (red debris looks like a red cell in colour)
@@ -363,7 +371,48 @@ def fit(R: pd.DataFrame, H: pd.DataFrame, O: pd.DataFrame, F: dict, cal: dict, r
             D.loc[good, "predicted_p"] = p.max(1)
             D.loc[good, "predicted_label"] = np.where(p.max(1) >= SURE, lab, two)
     H.loc[no_hand & (H.status_cell.astype(str) != "hole detection failed"), "predicted_label"] = NOT_CELL
+    _exclude(H, O)
     return info
+
+
+def _exclude(H: pd.DataFrame, O: pd.DataFrame) -> None:
+    """Cells you answered "exclude": predicted_label "excluded" (left out of every count and figure)."""
+    for D in (H, O):
+        if "hand_label" in D:
+            D.loc[D.hand_label.astype(str) == EXCLUDE, "predicted_label"] = EXCLUDE
+
+
+def suggest_unsure(H: pd.DataFrame, n: int = 20, seed: int = 0, colour: list | None = None) -> pd.DataFrame:
+    """Hole cells to check, with the model's proposed label: 1) the model is not sure (best p < 0.7, "A or B");
+    2) no colour channel positive in the first pass, but given a type anyway (the model has no "no colour" class, so
+    such a cell gets a confident type); 3) a type at 0.7 <= p < 0.9. Clean holes without a hand label only; up to n,
+    split over the groups that have cells (in this order). Answer with a type, "no cell", or "exclude" (left out of
+    the analysis)."""
+    from .vocab import is_unsure
+    rng = np.random.default_rng(seed)
+    ok = H.valid & clean(H) & (H.get("hand_label", pd.Series("", index=H.index)).fillna("").astype(str) == "")
+    lab = H.get("predicted_label", pd.Series("", index=H.index)).fillna("").astype(str)
+    p = pd.to_numeric(H.get("predicted_p", pd.Series(np.nan, index=H.index)), errors="coerce")
+    cols = [f"pos_{c}" for c in (colour or []) if f"pos_{c}" in H] or [c for c in H.columns if c.startswith("pos_")]
+    none = ~H[cols].fillna(False).astype(bool).any(axis=1) if cols else H.pattern.astype(str).eq("none")
+    typed = ~lab.map(is_unsure) & ~lab.isin(["", NOT_CELL, EXCLUDE, "hole detection failed"])
+    groups = [("model not sure", ok & lab.map(is_unsure)),
+              ("no colour positive", ok & none & typed),
+              ("p < 0.9", ok & typed & ~none & (p < 0.9))]
+    groups = [(g, m) for g, m in groups if m.any()]
+    if not groups:
+        return H.iloc[:0].assign(why="", proposed="")
+    k = max(1, n // len(groups))
+    parts, used = [], set()
+    for g, m in groups:
+        D = H[m & ~H.index.isin(used)]
+        D = D.sample(min(k, len(D)), random_state=int(rng.integers(1e9)))
+        used |= set(D.index)
+        parts.append(D.assign(why=g))
+    U = pd.concat(parts)
+    pp = pd.to_numeric(U.get("predicted_p"), errors="coerce")
+    U["proposed"] = [f"{l} ({q:.2f})" if q == q else str(l) for l, q in zip(U.predicted_label.astype(str), pp)]
+    return U
 
 
 def _hand(R: pd.DataFrame, H: pd.DataFrame, O: pd.DataFrame) -> None:

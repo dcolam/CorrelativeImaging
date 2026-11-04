@@ -32,6 +32,7 @@ from .control import ControlView
 from ...unified.vocab import shown
 
 SKIP = "skip (not clean or can't tell)"
+EXCLUDE_ANSWER = "exclude (leave out of the analysis)"   # labels.EXCLUDE: not reported, trains nothing
 
 STEPS = {"detect": "Detect", "first": "First pass", "label": "Label", "learn": "Learn", "report": "Report"}
 ACTIONS = {"detect": "Run Detect", "first": "Run first pass", "label": "Open Label", "learn": "Learn from my labels",
@@ -311,15 +312,19 @@ class LabelTab(QWidget):
             "label; then <b>Learn</b>. Only clean holes are shown (one cell, no clump, no neighbour of another type touching "
             "it). If one still is not clean, or you cannot tell: <i>skip</i> (left out of learning). The channel call needs no "
             "checking; only if it is clearly wrong, open <b>channels look wrong?</b>")
-        own = [x for x in R.your_label.unique() if x and x.lower() not in ("not a cell", "no cell", "unsure", SKIP)]
+        own = [x for x in R.your_label.unique()
+               if x and x.lower() not in ("not a cell", "no cell", "unsure", SKIP, EXCLUDE_ANSWER, "exclude", "excluded")]
         self.labels = list(dict.fromkeys(self.labels + own))
         names = {c: d.get("name", c) for c, d in e["channels"].items()}
         by_name = {n: c for c, n in names.items()}
         items = R.assign(answer=R.your_label,
                          caption=[f"#{n} {'hole' if k == 'hole' else 'surrounding cell'} · {fp}"
-                                  for n, k, fp in zip(R.number, R.kind, R.first_pass)])
+                                  + (f" · model: {pr} ({wy})" if pr else "")
+                                  for n, k, fp, pr, wy in zip(R.number, R.kind, R.first_pass,
+                                                              R.get("proposed", pd.Series("", index=R.index)),
+                                                              R.get("why", pd.Series("", index=R.index)))])
         if self.order.currentText() == "by label":
-            rank = {c: i for i, c in enumerate(self.labels + ["no cell", SKIP])}
+            rank = {c: i for i, c in enumerate(self.labels + ["no cell", SKIP, EXCLUDE_ANSWER])}
             items = items.assign(_g=[rank.get(a, len(rank)) if a else len(rank) + 1 for a in items.answer],
                                  _n=pd.to_numeric(items.number, errors="coerce"))
             items = items.sort_values(["_g", "answer", "_n"], kind="stable").drop(columns=["_g", "_n"])
@@ -333,7 +338,7 @@ class LabelTab(QWidget):
                         st.add(c)
             chan_state[Asker._key(r)] = st
         self._fp = {Asker._key(r): r["first_pass"] for r in items.to_dict("records")}
-        self.asker.set_items(items, self.labels + ["no cell", SKIP], self.on_answer, "",
+        self.asker.set_items(items, self.labels + ["no cell", SKIP, EXCLUDE_ANSWER], self.on_answer, "",
                              channels=list(names.items()), on_channels=self.on_channels, chan_state=chan_state,
                              start_unanswered=self.order.currentText() != "by label")
         self.update_counts()
@@ -358,7 +363,7 @@ class LabelTab(QWidget):
         if ok and t and t not in self.labels:
             self.labels.append(t)
             items = self.asker.items
-            self.asker.choices = self.labels + ["no cell", SKIP]
+            self.asker.choices = self.labels + ["no cell", SKIP, EXCLUDE_ANSWER]
             self.asker._buttons()
             self.asker.items = items
             self.asker._paint()
@@ -459,7 +464,9 @@ class LearnTab(QWidget):
         b.clicked.connect(lambda: app.run())
         row.addWidget(b)
         u = QPushButton("Label cells the model is not sure about")
-        u.setToolTip("adds 20 hole cells whose label the model is not sure about (probability < 0.7) to the Label tab")
+        u.setToolTip("adds 20 hole cells to check to the Label tab, each with the model's proposed label: cells the model "
+                     "is not sure about (p < 0.7), cells with no colour positive that still got a type, and cells at "
+                     "0.7 <= p < 0.9. Answer with the type, 'no cell', or 'exclude' (left out of the analysis)")
         u.clicked.connect(self.unsure)
         row.addWidget(u)
         row.addStretch(1)
@@ -517,22 +524,27 @@ class LearnTab(QWidget):
         out = self.app.out
         H = pd.read_csv(out / "hole_calls.csv", dtype={"plate_id": str, "well_id": str})
         pl = "predicted_label" if "predicted_label" in H else "bio_label"
-        from ...unified.labels import clean
-        from ...unified.vocab import is_unsure
-        U = H[H.get(pl, pd.Series("", index=H.index)).fillna("").map(is_unsure) & clean(H)]
-        if not len(U):
-            self.app.say("the model is sure about every hole cell")
-            return
+        from ...unified.labels import suggest_unsure
+        if pl != "predicted_label":
+            H = H.rename(columns={pl: "predicted_label"})
+        H["valid"] = H.status_cell == "cell"
+        e = self.app.experiment() or {}
         f = out / "interventions" / "labels.csv"
         R = pd.read_csv(f, dtype=str).fillna("") if f.exists() else pd.DataFrame()
         have = set(zip(R.plate_id, R.well_id)) if len(R) else set()
-        U = U[[(p, w) not in have for p, w in zip(U.plate_id, U.well_id)]].sample(min(20, len(U)), random_state=0)
+        H = H[[(p, w) not in have for p, w in zip(H.plate_id, H.well_id)]]
         n0 = int(R.number.astype(int).max()) if len(R) else 0
+        U = suggest_unsure(H, n=20, seed=n0, colour=[c for c, d in (e.get("channels") or {}).items()
+                                                     if d.get("role", "colour") != "marker"])
+        if not len(U):
+            self.app.say("nothing to check: the model is sure about every hole cell and every cell shows a colour")
+            return
         S = pd.DataFrame(dict(number=np.arange(n0 + 1, n0 + 1 + len(U)), kind="hole", plate_id=U.plate_id,
                               well_id=U.well_id, image_id=U.get("image_id", ""), obj="", first_pass=U.pattern,
-                              your_label="", positive_channels="")).astype(str)
+                              your_label="", positive_channels="", proposed=U.proposed, why=U.why)).astype(str)
         pd.concat([R, S]).to_csv(f, index=False)
-        self.app.say(f"{len(S)} hole cells the model is not sure about added to the Label tab")
+        self.app.say(f"{len(S)} hole cells to check added to the Label tab ("
+                     + ", ".join(f"{k} {v}" for k, v in S.why.value_counts().items()) + ")")
         self.app.tabs.setCurrentWidget(self.app.label_tab)
         self.app.label_tab.fill()
 
@@ -942,7 +954,8 @@ class AppV2:
                                outputs=["report.html", "hole_calls.csv"])
         R = pd.read_csv(inter / "labels.csv", dtype=str).fillna("") if inter and (inter / "labels.csv").exists() \
             else pd.DataFrame()
-        lab = R.your_label[(R.your_label != "") & ~R.your_label.str.lower().isin(["not a cell", "no cell", "unsure", SKIP])] \
+        lab = R.your_label[(R.your_label != "") & ~R.your_label.str.lower().isin(["not a cell", "no cell", "unsure", SKIP,
+                                                                                    EXCLUDE_ANSWER, "exclude", "excluded"])] \
             if len(R) else pd.Series(dtype=str)
         c = lab.value_counts()
         enough = int((c >= 3).sum()) >= 2
