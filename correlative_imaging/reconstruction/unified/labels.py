@@ -33,17 +33,57 @@ EXCLUDE = "excluded"     # your answer "exclude": the cell is left out of the an
                          # not a type, not "no cell" (that would train the shape model), not "unsure" (that keeps the
                          # model's call)
 EXCLUDE_WORDS = ("exclude", "excluded", "exclude (leave out of the analysis)", "leave out")
-SOMA_MIN = 0.2           # a hole cell whose outline is smaller than this share of the hole: only a speck or a fragment
-                         # was outlined; it gets no type ("no colour") and never trains the type model
+# A hole cell whose outline (the part inside the hole) is smaller than a cell body is only a speck or a fragment: it gets
+# no type ("no colour") and never trains the type model. The smallest cell body is learnt from the user (soma_cut), never
+# fixed: 1) the particle review (first-pass questions): the area that best separates the particles you answered "cell" /
+# "several cells" from those you answered "debris" (balanced accuracy); 2) else (fewer than SOMA_MIN_ANSWERS of either):
+# the SOMA_HAND_Q quantile of the outline area of the holes you labelled with a type; 3) else no cut.
+# (Until 2026-11-05 a fixed 20 % of the hole area, which was not data-derived and removed cells you had labelled.)
+SOMA_MIN_ANSWERS = 5
+SOMA_HAND_Q = 0.05
 NO_COLOUR = "no colour"
 
 
-def soma_sized(D: pd.DataFrame) -> pd.Series:
-    """Holes whose cell outline is at least SOMA_MIN of the hole (unknown size: kept)."""
-    if "cell_um2" not in D or "hole_um2" not in D:
+def outline_in_hole(D: pd.DataFrame) -> pd.Series:
+    """Cell-outline area inside the hole (um2): cell_um2 x cell_in_hole (the same measure as a particle's in_um2)."""
+    a = D.cell_um2.astype(float)
+    if "cell_in_hole" in D:
+        a = a * D.cell_in_hole.astype(float).fillna(1.0)
+    return a
+
+
+def soma_cut(FP: pd.DataFrame, answers: pd.DataFrame | None) -> dict:
+    """The smallest cell body (um2 inside the hole), from your particle review: the area that best separates your "cell"
+    from your "debris" answers. {cut_um2, source, n_cell, n_debris}; cut_um2 None when there are too few answers (the
+    label step then uses your type labels, see fit)."""
+    out = dict(cut_um2=None, source="", n_cell=0, n_debris=0)
+    if answers is None or not len(answers) or FP is None or "in_um2" not in FP:
+        return out
+    a = answers.copy()
+    o = a.obj.astype(str).str.split("|", expand=True)
+    if o.shape[1] < 3:
+        return out
+    a = a.assign(ch=o[0], level=o[1], lab=pd.to_numeric(o[2], errors="coerce"), plate_id=a.plate_id.astype(str))
+    P = FP.assign(plate_id=FP.plate_id.astype(str), level=FP.level.astype(str), lab=FP.lab.astype(float))
+    m = a.merge(P[["plate_id", "well_id", "ch", "level", "lab", "in_um2"]], on=["plate_id", "well_id", "ch", "level", "lab"])
+    cell = m.in_um2[m.answer.isin(["cell", "several cells"])].dropna().to_numpy(float)
+    deb = m.in_um2[m.answer == "debris"].dropna().to_numpy(float)
+    out.update(n_cell=int(len(cell)), n_debris=int(len(deb)))
+    if len(cell) < SOMA_MIN_ANSWERS or len(deb) < SOMA_MIN_ANSWERS:
+        return out
+    t = np.unique(np.concatenate([cell, deb]))
+    ba = np.array([(np.mean(cell >= x) + np.mean(deb < x)) / 2 for x in t])
+    best = t[ba == ba.max()]
+    out.update(cut_um2=float(best.min()), source=f"particle review ({len(cell)} cell, {len(deb)} debris answers; "
+                                                  f"balanced accuracy {ba.max():.2f})")
+    return out
+
+
+def soma_sized(D: pd.DataFrame, cut_um2: float | None) -> pd.Series:
+    """Holes whose cell outline inside the hole is at least cut_um2 (unknown size or no cut: kept)."""
+    if not cut_um2 or "cell_um2" not in D:
         return pd.Series(True, index=D.index)
-    rel = D.cell_um2.astype(float) / D.hole_um2.astype(float)
-    return ~(rel < SOMA_MIN)
+    return ~(outline_in_hole(D) < cut_um2)
 
 
 def design_names(F: dict, nm: dict) -> list:
@@ -284,7 +324,8 @@ def _answers_not_cell(R: pd.DataFrame, reviewed: dict) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def fit(R: pd.DataFrame, H: pd.DataFrame, O: pd.DataFrame, F: dict, cal: dict, reviewed: dict | None = None) -> dict:
+def fit(R: pd.DataFrame, H: pd.DataFrame, O: pd.DataFrame, F: dict, cal: dict, reviewed: dict | None = None,
+        soma: dict | None = None) -> dict:
     """The label model, in two steps. 1) cell or no cell: the first pass (shape model and size; your "no cell" labels
     and answers train the shape model). 2) the type, among cells only: LDA on the colours, learnt from your type labels
     ("no cell" is not a type). Adds predicted_label / predicted_p / hand_label to H and O; every hole gets a
@@ -295,7 +336,7 @@ def fit(R: pd.DataFrame, H: pd.DataFrame, O: pd.DataFrame, F: dict, cal: dict, r
     colour, marker = F["colour"], F["marker"]
     chans = colour + marker
     # the features: design_rows (cell-outline colour, first-pass call, marker)
-    info = dict(used=False, n=0, labels={}, why="")
+    info = dict(used=False, n=0, labels={}, why="", soma=dict(soma or soma_cut(None, None)))
     for D in (H, O):
         D["predicted_label"], D["predicted_p"], D["hand_label"] = "", np.nan, ""
     # holes with nothing to classify get their state as the label: never an empty cell
@@ -323,7 +364,15 @@ def fit(R: pd.DataFrame, H: pd.DataFrame, O: pd.DataFrame, F: dict, cal: dict, r
         H.assign(plate_id=H.plate_id.astype(str), well_id=H.well_id.astype(str)), on=["plate_id", "well_id"],
         how="inner", suffixes=("", "_h"))
     hk = hk[hk.status_cell.astype(str) != "hole detection failed"]
-    small = ~soma_sized(hk)                     # an outline that is only a speck or a fragment teaches nothing
+    if info["soma"].get("cut_um2") is None:     # too few particle answers: the smallest outline you gave a type
+        typed = outline_in_hole(hk).dropna()
+        typed = typed[typed > 0]
+        if len(typed) >= SOMA_MIN_ANSWERS:
+            info["soma"].update(cut_um2=float(np.quantile(typed, SOMA_HAND_Q)),
+                                source=f"{int(SOMA_HAND_Q * 100)}th percentile of the {len(typed)} outlines you labelled")
+        else:
+            info["soma"].update(source="no cut (too few particle answers and type labels)")
+    small = ~soma_sized(hk, info["soma"]["cut_um2"])   # an outline that is only a speck or a fragment teaches nothing
     info["small_outline_labels"] = int(small.sum())
     hk = hk[~small]
     Oo = O.assign(obj=O.channel.astype(str) + ":" + O.label.astype(str), image_id=O.image_id.astype(str),
@@ -370,7 +419,7 @@ def fit(R: pd.DataFrame, H: pd.DataFrame, O: pd.DataFrame, F: dict, cal: dict, r
     # step 2 on every hole the first pass calls a cell, and every surrounding cell; a hole you labelled "no cell"
     # keeps it (your label wins over the first pass)
     no_hand = (H.hand_label.astype(str) == NOT_CELL).to_numpy()
-    soma = soma_sized(H).to_numpy()
+    soma = soma_sized(H, info["soma"]["cut_um2"]).to_numpy()
     for D, sel, field in [(H, H.valid & ~no_hand & soma, False), (O, O.learn, True)]:
         Xd = design_rows(D, H, O, F, field)
         good = sel.to_numpy() & np.isfinite(Xd).all(1)

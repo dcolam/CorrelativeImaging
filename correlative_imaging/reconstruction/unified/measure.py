@@ -11,8 +11,9 @@ and noise the residual was computed with (run database). Nothing is written next
              region so far, never more than 2 noise uphill (so the glow of a neighbour is not climbed), at most hole +
              10 um; thin bridges (< ~2 um) cut. Every colour channel grows from its own seeds (growing every channel from
              all seeds, tried 2026-11-04, let a channel climb into a neighbour's glow: the red of a red neighbour became
-             the cell's red; reverted. An outline that is only a speck is handled by the type step instead: < 20 % of the
-             hole gets no type); the cell = the union
+             the cell's red; reverted. An outline that is only a speck is handled by the type step instead:
+             smaller than the smallest cell body learnt from the particle review (labels.soma_cut) gets no type);
+             the cell = the union
   signal     per channel: median signal-to-noise over the cell ((value - band background) / noise), the own signal
              = median of the ChannelRelation residual over the cell inside the hole (what is left after removing the
              copies of the other channels), saturated pixels left out
