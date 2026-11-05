@@ -146,9 +146,10 @@ def run(results, out=None, workers: int = 8, log=print) -> Path:
             f"examples (AUC {sinfo['auc']:.2f}); {sinfo['dropped']} particles are not seeds")
     else:
         log("   particles: no 'no cell' examples, every particle can seed (see report)")
-    # "s4": every colour grows from all colours' seeds (measure.py, 2026-11-04); "s3": + a marker seeds the outline where
-    # no colour does (2026-11-03); "s2": seeds dropped per channel; a new tag re-measures instead of reusing old results
-    tag = f"s4-{sinfo.get('no_cell', 0)}-{sinfo.get('cell', 0)}-{sinfo.get('dropped', 0)}"
+    # "s5": each colour grows from its own seeds again (the all-seeds growth of "s4", 2026-11-04, climbed into
+    # neighbours' glow; reverted); "s3": + a marker seeds the outline where no colour does (2026-11-03); "s2": seeds
+    # dropped per channel; a new tag re-measures instead of reusing old results
+    tag = f"s5-{sinfo.get('no_cell', 0)}-{sinfo.get('cell', 0)}-{sinfo.get('dropped', 0)}"
     mf, mt = out / "measurements.parquet", out / "measurements.tag"
     if mf.exists() and mt.exists() and mt.read_text(encoding="utf-8") == tag:
         M = pd.read_parquet(mf)

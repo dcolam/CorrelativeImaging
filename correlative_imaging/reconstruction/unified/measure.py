@@ -9,9 +9,10 @@ and noise the residual was computed with (run database). Nothing is written next
   barriers   objects lying mostly outside the hole (neighbours), and the pixel next to them
   grow       from the seeds while a pixel is above both the band background + 3 noise and half of the median of the
              region so far, never more than 2 noise uphill (so the glow of a neighbour is not climbed), at most hole +
-             10 um; thin bridges (< ~2 um) cut. Every colour channel grows from the seeds of ALL colour channels (a cell
-             dim in one colour has no particle of that colour; grown only from its own seeds, a red-weak cell with a
-             green dot got an outline that was only the dot); the cell = the union
+             10 um; thin bridges (< ~2 um) cut. Every colour channel grows from its own seeds (growing every channel from
+             all seeds, tried 2026-11-04, let a channel climb into a neighbour's glow: the red of a red neighbour became
+             the cell's red; reverted. An outline that is only a speck is handled by the type step instead: < 20 % of the
+             hole gets no type); the cell = the union
   signal     per channel: median signal-to-noise over the cell ((value - band background) / noise), the own signal
              = median of the ChannelRelation residual over the cell inside the hole (what is left after removing the
              copies of the other channels), saturated pixels left out
@@ -163,10 +164,8 @@ def _one(job):
         allowed = safety & ~(binary_dilation(neigh, CROSS) & ~seeds_any)
         regions = {}
         for c in colour:
-            # from every colour's seeds (2026-11-04): the seed pixels stay in the region even where this channel is
-            # dark, so a channel without signal adds nothing but the seeds themselves to the union
-            st = grow(img[idx[c]], seeds_any & allowed, bg[c] + K_NOISE * noise[c], allowed, UPHILL * noise[c])
-            regions[c] = clean(st, seeds_any & allowed, 2) if st.any() else st
+            st = grow(img[idx[c]], seeds[c] & allowed, bg[c] + K_NOISE * noise[c], allowed, UPHILL * noise[c])
+            regions[c] = clean(st, seeds[c] & allowed, 2) if st.any() else st
         for c, sd in mark_seed.items():
             st = grow(img[idx[c]], sd & allowed, bg[c] + K_NOISE * noise[c], allowed, UPHILL * noise[c])
             regions[c] = clean(st, sd & allowed, 2) if st.any() else st
