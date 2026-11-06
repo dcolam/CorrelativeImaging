@@ -23,9 +23,10 @@ supply the bleed-through check, the cell size and the neighbours.
                through the shape model, i.e. after you give "no cell" examples
   dim          a hole with no colour above its cut, whose strongest colour reaches half its cut and at least twice the
                next colour (or is above the cut but no brighter than an empty hole): "FITC? (dim)" etc., for review
-  your marks   the channels you saw positive in holes (labels.csv, positive_channels) set each channel's cut: the point
-               that best separates the holes where you saw it from those where you did not or saw no cell (5 of each;
-               the cut can move between 0.3x and 3x the learnt one)
+  your marks   the channels you saw positive in holes (labels.csv, positive_channels, and the channel question) set each
+               channel's measurement and cut whenever they separate better than the learnt one: the point that best
+               separates the holes where you saw it from those where you did not (5 of each; the cut can move between
+               0.3x and 3x the learnt one)
 """
 from __future__ import annotations
 
@@ -79,7 +80,6 @@ def particle_signal(FP: pd.DataFrame, results, prefix_of: dict, colour: list) ->
     return out
 
 
-MARKS_MIN_ACC = 0.75     # your channel marks move a cut only when they separate this well (balanced accuracy)
 
 
 def call(M: pd.DataFrame, W: pd.DataFrame, F: dict, cell_size: dict, nb: pd.DataFrame, e: dict, results=None,
@@ -187,9 +187,10 @@ def call(M: pd.DataFrame, W: pd.DataFrame, F: dict, cell_size: dict, nb: pd.Data
         acc, k, t = best
         info = dict(measure=k, factor=round(t, 2), balanced_accuracy=round(acc, 2), before=round(float(now), 2),
                     measure_before=cal[c].get("measure", ""))
-        # used only where your marks clearly separate and better than the learnt call; otherwise the measurements cannot
-        # see what you see, and moving the cut would only shift the error
-        if acc >= MARKS_MIN_ACC and acc - now >= 0.05:
+        # your marks decide whenever they separate better than the learnt call (no fixed bar: until 2026-11-06 they
+        # had to reach 0.75 and beat it by 0.05, and the ROMK 488 nm cut flipped between runs on a separation of 1.97
+        # vs 2.00 while your marks, at 0.74, were ignored); a tie keeps the learnt call
+        if acc > now:
             r = measures[c][k]
             xk = r["v"] / (r["cut"] * t)
             x = np.where(r["ok"], xk, x)
