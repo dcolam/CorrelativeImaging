@@ -29,6 +29,9 @@ the learnt hole gate (call.py) uses. From the exploration of 2026-11-06 (figures
 Remaining hand-set constants of the regularized outline (px units of the run): smoothing 2 px (cut) and 3 px (seeds),
 inner hole = hole eroded by 2 px, seeds >= 3 px apart (at most 6), neighbour barriers >= 4 um2 and < 50 % in the hole,
 background markers > 4 px outside the hole, a region kept when >= 50 % of it lies in the hole.
+Measurement in the outline (new first pass): the pixels of ruled-out particles (your particle answers plug / halo,
+debris, neighbour; the particle model's P < 0.2) are left out of every channel's measure (own signal, hole signal,
+signal-to-noise, saturation), so a plug or a speck of debris inside the outline adds no colour (2026-11-06).
 """
 from __future__ import annotations
 
@@ -82,7 +85,8 @@ def regular_outline(img: np.ndarray, hole: np.ndarray, neigh: np.ndarray, bg: np
     neighbours (objects mostly outside the hole, >= 4 um2, holding no seed) and the background; in each seed's basin the
     cell is cut at Otsu's threshold of that basin's own pixels; the regions mostly inside the hole, merged, filled,
     opened; the part with the most area in the hole. It does not decide whether a cell is there (an empty hole's glow
-    gets an outline too): the hole gate does."""
+    gets an outline too): the hole gate does. Ruled-out particles (plug, debris, ...) are not handled here but left
+    out of the measurement inside the outline (_one)."""
     from scipy import ndimage as ndi
     from skimage import measure as skm, morphology as skmo, segmentation
     from skimage.feature import peak_local_max
@@ -299,8 +303,11 @@ def _one(job):
                    cell_in_hole=float((cell & hole).sum() / max(cell.sum(), 1)),
                    hole_cover=float((cell & hole).sum() / max(hole.sum(), 1)), sat_px_cell=int((cell & sat).sum()),
                    n_seed_px=int(seeds_any.sum()), px_um=px)
-        use = cell & ~sat
-        inh = cell & hole & ~sat
+        # new first pass: the ruled-out particles (plug, debris, neighbour; notcell) are not measured, in any channel
+        excl = notcell if job.get("new") else np.zeros(hole.shape, bool)
+        use = cell & ~sat & ~excl
+        inh = cell & hole & ~sat & ~excl
+        out["excluded_px"] = int((cell & excl).sum())
         # the hole's own background: hole pixels outside every object of every channel and outside the cell (the
         # aperture can glow; the band outside the hole does not see that). Too few free pixels: the band
         anyobj = np.zeros(hole.shape, bool)

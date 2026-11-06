@@ -65,7 +65,7 @@ def main(argv=None):
     u.add_argument("--out", help="output folder (default <results>/unified)")
     u.add_argument("--workers", type=int, default=8)
     u.add_argument("--new", action="store_true",
-                   help="the new first pass: your answers are final, plugs empty their hole, regularized cell "
+                   help="the new first pass: your answers are final, ruled-out particles (plug, debris, neighbour) are not measured, regularized cell "
                         "outline, hole gate learnt from your verdicts, clumps flagged; writes <results>/unified_new "
                         "(copies your inputs from unified/)")
     s_ = sub.add_parser("status", help="where a results folder stands in the workflow (the GUI's strip, as text)")

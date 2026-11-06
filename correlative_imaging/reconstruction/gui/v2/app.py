@@ -92,8 +92,8 @@ class FirstPassTab(QWidget):
         row.addWidget(self.run_b)
         # the new first pass (unified/run.py, new=True): own output folder, so the old results stay to compare
         self.new_cb = QCheckBox("new")
-        self.new_cb.setToolTip("New first pass: your answers are final for the particle / hole you answered, a hole "
-                               "with a plug answer has no cell, the regularized cell outline, the hole gate learnt from "
+        self.new_cb.setToolTip("New first pass: your answers are final for the particle / hole you answered, a particle "
+                               "you ruled out (plug, debris, neighbour) is left out of the colour measurement, the regularized cell outline, the hole gate learnt from "
                                "your verdicts and the empty wells, clumps flagged (the type is kept). Writes <results>/unified_new (starts from a copy "
                                "of your answers and labels in unified/); untick to go back to unified/.")
         self.new_cb.setChecked(QSettings("CorrelativeImaging", "reconstruct_v2").value("new_first_pass", False, bool))

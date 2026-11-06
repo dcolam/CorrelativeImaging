@@ -54,7 +54,8 @@ def _plug_holes(A, reviewed: dict, chan_marks: dict) -> dict:
 def _verdicts(A, R: pd.DataFrame, reviewed: dict, chan_marks: dict, W: pd.DataFrame) -> dict:
     """New first pass: your verdict per hole for the learnt hole gate, {(plate, well): 1 cell / 0 no cell}.
     cell: a type label, a channel answer positive / negative, a particle answered cell, clump "one cell".
-    no cell: a "no cell" label or answer, a plug hole (_plug_holes), every hole of a well you called empty.
+    no cell: a "no cell" label or answer, every hole of a well you called empty (a plug answer is about one particle:
+    it is cut out of the outline, not a verdict on the hole).
     No verdict: "several cells" (a clump is no call), skip / unsure / exclude, the surrounding-cell size answers;
     a hole with both is left out."""
     from .labels import EXCLUDE_WORDS
@@ -105,11 +106,8 @@ def _interventions(out: Path, e: dict, W: pd.DataFrame, new: bool = False):
     for k, v in questions.clumps(A).items():
         if v in ("not a cell", "no cell"):
             reviewed[k] = "no"
-    if new:
-        pl = _plug_holes(A, reviewed, chan_marks)
-        reviewed.update(pl)
-        if pl:
-            applied.append(f"{len(pl)} holes with a particle you called plug / halo: no cell")
+    # (a plug answer is about one particle, not the hole: it is cut out of the cell outline (measure.regular_outline),
+    # the hole gate decides whether a cell is there; until 2026-11-06 it emptied the whole hole)
     n = len(A.df)
     if n:
         applied.append(f"{n} answers to the first pass's questions")
@@ -154,8 +152,8 @@ def _display_top(F: dict, H: pd.DataFrame, colour: list, marker: list) -> dict:
 
 
 def run(results, out=None, workers: int = 8, log=print, new: bool = False) -> Path:
-    """new=True: the new first pass. Your answers are final for the particle / hole you answered; a plug answer empties
-    its hole; the regularized cell outline (measure.regular_outline); the hole gate learnt from your verdicts and the
+    """new=True: the new first pass. Your answers are final for the particle / hole you answered; the pixels of a particle
+    ruled out (plug / halo, debris, neighbour) are left out of the colour measurement inside the outline; the regularized cell outline (measure.regular_outline); the hole gate learnt from your verdicts and the
     Empty wells (call.learnt_gate) instead of the shape gate; clumps learnt from the whole-image particles and your
     clump answers, flagged only (the type is kept). Writes to <results>/unified_new unless --out says otherwise;
     starts from the old run's inputs."""
@@ -168,7 +166,7 @@ def run(results, out=None, workers: int = 8, log=print, new: bool = False) -> Pa
     out = Path(out) if out else results / (NEW_OUT if new else "unified")
     out.mkdir(parents=True, exist_ok=True)
     if new:
-        log("new first pass: your answers are final, plugs empty their hole, regularized outline, learnt hole gate, clumps flagged")
+        log("new first pass: your answers are final, ruled-out particles not measured, regularized outline, learnt hole gate, clumps flagged")
         prepare_new(results, out, log)
     rj = json.loads((results / "run.json").read_text(encoding="utf-8"))
     path_map = (rj.get("config") or {}).get("path_map") or {}
@@ -220,7 +218,7 @@ def run(results, out=None, workers: int = 8, log=print, new: bool = False) -> Pa
     # "s5": each colour grows from its own seeds again (the all-seeds growth of "s4", 2026-11-04, climbed into
     # neighbours' glow; reverted); "s3": + a marker seeds the outline where no colour does (2026-11-03); "s2": seeds
     # dropped per channel; a new tag re-measures instead of reusing old results
-    tag = f"s5-{sinfo.get('no_cell', 0)}-{sinfo.get('cell', 0)}-{sinfo.get('dropped', 0)}" + ("-new3" if new else "")
+    tag = f"s5-{sinfo.get('no_cell', 0)}-{sinfo.get('cell', 0)}-{sinfo.get('dropped', 0)}" + ("-new5" if new else "")
     mf, mt = out / "measurements.parquet", out / "measurements.tag"
     if mf.exists() and mt.exists() and mt.read_text(encoding="utf-8") == tag:
         M = pd.read_parquet(mf)
