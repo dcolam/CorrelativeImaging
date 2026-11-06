@@ -172,6 +172,7 @@ def hole_features(img: np.ndarray, hole: np.ndarray, cell: np.ndarray, neigh: np
         f[f"{c}_ring_med"] = np.median(x[ring]) if ring.any() else np.nan
         f[f"{c}_cell_med"] = np.median(x[cell]) if cell.any() else np.nan
         f[f"{c}_cell_p90"] = np.percentile(x[cell], 90) if cell.any() else np.nan
+        f[f"{c}_cell_frac3"] = float(np.mean(x[cell] > 3)) if cell.any() else np.nan
         lg = ndi.gaussian_laplace(x, 1.0)
         f[f"{c}_tex_hole"] = np.std(lg[hole])
         f[f"{c}_tex_ring"] = np.std(lg[ring]) if ring.any() else np.nan

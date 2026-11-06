@@ -220,7 +220,7 @@ def run(results, out=None, workers: int = 8, log=print, new: bool = False) -> Pa
     # "s5": each colour grows from its own seeds again (the all-seeds growth of "s4", 2026-11-04, climbed into
     # neighbours' glow; reverted); "s3": + a marker seeds the outline where no colour does (2026-11-03); "s2": seeds
     # dropped per channel; a new tag re-measures instead of reusing old results
-    tag = f"s5-{sinfo.get('no_cell', 0)}-{sinfo.get('cell', 0)}-{sinfo.get('dropped', 0)}" + ("-new2" if new else "")
+    tag = f"s5-{sinfo.get('no_cell', 0)}-{sinfo.get('cell', 0)}-{sinfo.get('dropped', 0)}" + ("-new3" if new else "")
     mf, mt = out / "measurements.parquet", out / "measurements.tag"
     if mf.exists() and mt.exists() and mt.read_text(encoding="utf-8") == tag:
         M = pd.read_parquet(mf)
@@ -242,12 +242,15 @@ def run(results, out=None, workers: int = 8, log=print, new: bool = False) -> Pa
         H.loc[k, "cls"] = "no cell (hand label)"
     log("5/5 your labels and the report")
     soma = labels.soma_cut(FP, A.get("particle"))          # the smallest cell body, from your particle review
-    linfo = labels.fit(R, H, F["O"], F, cal, reviewed, soma)
+    linfo = labels.fit(R, H, F["O"], F, cal, reviewed, soma, new=new)
     sm = linfo.get("soma") or {}
     log(f"   smallest cell outline: {sm['cut_um2']:.1f} um2 ({sm['source']})" if sm.get("cut_um2") else
         f"   smallest cell outline: {sm.get('source') or 'no cut'}")
     if linfo["used"]:
         log(f"   label model from {linfo['n']} labels {linfo['labels']}: leave-one-out accuracy {linfo['acc']:.2f}")
+        if new:
+            log(f"   type step: per-plate calibration against each plate's no-cell holes {linfo.get('calibration_reference')}; "
+                f"type colours from your labels {linfo.get('type_colours')}; holes with a colour on {linfo.get('colour_on')}")
     else:
         log(f"   no label model: {linfo['why']}")
     cinfo = None
@@ -276,7 +279,8 @@ def run(results, out=None, workers: int = 8, log=print, new: bool = False) -> Pa
         [f"shape_only_{c}" for c in colour if f"shape_only_{c}" in H] + \
         ["nb_nearest_um", "nb_nearest_cls", "p_shape", "part_p", "part_um2", "predicted_label", "predicted_p", "hand_label", "cell_um2_old"] + [f"part_{c}" for c in colour] + \
         [f"x_{c}" for c in colour] + ["hue", "purity", "strength", "mix"] + \
-        [c for c in H.columns if c.startswith("p_") and c != "p_shape"]
+        [c for c in H.columns if c.startswith("p_") and c != "p_shape"] + \
+        [c for c in H.columns if c.startswith(("g_", "on_"))]           # new first pass: the type step's measures
     H[[k for k in keep if k in H]].to_csv(out / "hole_calls.csv", index=False)
     O = F["O"]
     O.drop(columns=[c for c in O.columns if c.startswith(("med_", "ring_"))]).to_parquet(out / "field_cells.parquet",
