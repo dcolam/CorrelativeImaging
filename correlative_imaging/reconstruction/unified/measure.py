@@ -92,7 +92,7 @@ def regular_outline(img: np.ndarray, hole: np.ndarray, neigh: np.ndarray, bg: np
     s0 = snr.sum(axis=0)
     s = np.log1p(ndi.gaussian_filter(s0, 2.0))
     sb = ndi.gaussian_filter(s0, 3.0)
-    inner = skmo.binary_erosion(hole, skmo.disk(2))
+    inner = ndi.binary_erosion(hole, skmo.disk(2), border_value=1)
     if not inner.any():
         inner = hole
     pk = peak_local_max(np.where(inner, sb, 0), min_distance=3, num_peaks=6, exclude_border=False)
@@ -105,7 +105,7 @@ def regular_outline(img: np.ndarray, hole: np.ndarray, neigh: np.ndarray, bg: np
         m = nl == rp.label
         if rp.area * px * px >= 4 and (m & hole).sum() < 0.5 * m.sum() and not any(m[p] for p in pk):
             markers[m] = 2
-    far = ~skmo.binary_dilation(hole, skmo.disk(4))
+    far = ~ndi.binary_dilation(hole, skmo.disk(4))
     if far.any():
         markers[far & (s < np.median(s[far])) & (markers == 0)] = 3
     for i, (y, x) in enumerate(pk):
@@ -116,7 +116,7 @@ def regular_outline(img: np.ndarray, hole: np.ndarray, neigh: np.ndarray, bg: np
         basin = ws == 10 + i
         if not basin.any():
             continue
-        ctx = skmo.binary_dilation(basin, skmo.disk(4))
+        ctx = ndi.binary_dilation(basin, skmo.disk(4))
         try:
             cut = threshold_otsu(s[ctx])
         except ValueError:
@@ -124,7 +124,8 @@ def regular_outline(img: np.ndarray, hole: np.ndarray, neigh: np.ndarray, bg: np
         r = basin & (s >= cut)
         if r.sum() and (r & hole).sum() >= 0.5 * r.sum():
             cell |= r
-    cell = skmo.binary_opening(ndi.binary_fill_holes(cell), skmo.disk(1))
+    d1 = skmo.disk(1)                                    # opening as skimage did it (erosion with the border True)
+    cell = ndi.binary_dilation(ndi.binary_erosion(ndi.binary_fill_holes(cell), d1, border_value=1), d1)
     lab = skm.label(cell)
     if lab.max() > 1:
         best = max(range(1, lab.max() + 1), key=lambda k: ((lab == k) & hole).sum())
@@ -140,7 +141,7 @@ def hole_features(img: np.ndarray, hole: np.ndarray, cell: np.ndarray, neigh: np
     from skimage import measure as skm, morphology as skmo
     snr = (img - bg[:, None, None]) / np.maximum(noise[:, None, None], 1e-6)
     f = {}
-    ring = skmo.binary_dilation(hole, skmo.disk(max(1, int(round(4 / px))))) & ~hole
+    ring = ndi.binary_dilation(hole, skmo.disk(max(1, int(round(4 / px))))) & ~hole
     a_um = px * px
     f["cell_frac_hole"] = (cell & hole).sum() / max(hole.sum(), 1)
     if cell.any():
@@ -159,7 +160,7 @@ def hole_features(img: np.ndarray, hole: np.ndarray, cell: np.ndarray, neigh: np
     f["neigh_n_specks"] = int((sizes < 5).sum())
     f["neigh_n_big"] = int((sizes >= 20).sum())
     if cell.any():
-        f["outline_touch_neigh"] = (skmo.binary_dilation(cell) & nb).sum() / max(skm.perimeter(cell), 1)
+        f["outline_touch_neigh"] = (ndi.binary_dilation(cell) & nb).sum() / max(skm.perimeter(cell), 1)
         dist = ndi.distance_transform_edt(~nb) * px if nb.any() else np.full(cell.shape, 99.0)
         f["neigh_min_dist_um"] = float(dist[cell].min())
     else:

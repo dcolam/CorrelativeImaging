@@ -65,8 +65,9 @@ def main(argv=None):
     u.add_argument("--out", help="output folder (default <results>/unified)")
     u.add_argument("--workers", type=int, default=8)
     u.add_argument("--new", action="store_true",
-                   help="the new first pass: your answers are final, plugs empty their hole, clumps from the "
-                        "whole-image particles; writes <results>/unified_new (copies your inputs from unified/)")
+                   help="the new first pass: your answers are final, plugs empty their hole, regularized cell "
+                        "outline, hole gate learnt from your verdicts, clumps flagged; writes <results>/unified_new "
+                        "(copies your inputs from unified/)")
     s_ = sub.add_parser("status", help="where a results folder stands in the workflow (the GUI's strip, as text)")
     s_.add_argument("--out", required=True); s_.add_argument("--labels"); s_.add_argument("--model")
     cm = sub.add_parser("commands", help="the command lines that make these results again (provenance.py)")
