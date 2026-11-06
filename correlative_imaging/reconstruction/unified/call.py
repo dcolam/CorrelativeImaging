@@ -263,11 +263,16 @@ def call(M: pd.DataFrame, W: pd.DataFrame, F: dict, cell_size: dict, nb: pd.Data
         H["p_gate"], ginfo = gate
         yours = np.array([gate_y.get(k) == 1 or reviewed.get(k) not in (None, "no") for k in zip(H.plate_id, H.well_id)])
         off = H.valid & (H.p_gate < ginfo["cut"]) & ~yours
+        # removed only when the shape gate agrees: on PNC (few no-cell verdicts, no empty wells) the learnt gate alone
+        # removed real cells (2026-11-06 galleries: v2/explore/out/o_*_gate_removed.png); ROMK keeps its gains
+        if shape_info.get("used"):
+            off &= H.p_shape < 0.5
         H.loc[off, "valid"] = False
         H.loc[off, "status_cell"] = "no cell (gate)"
         for c in colour:
             H[f"pos_{c}"] = H[f"pos_{c}"] & H.valid
-        ginfo["gate"] = f"{int(off.sum())} holes are no cell by the learnt gate (p < {ginfo['cut']:.2f})"
+        ginfo["gate"] = (f"{int(off.sum())} holes are no cell by the learnt gate (p < {ginfo['cut']:.2f})"
+                         + (" and the shape gate" if shape_info.get("used") else ""))
         shape_info["learnt_gate"] = ginfo
     elif shape_info.get("used"):
         if gate is not None:

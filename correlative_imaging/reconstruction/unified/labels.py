@@ -113,69 +113,33 @@ def design_rows(D: pd.DataFrame, H: pd.DataFrame, O: pd.DataFrame, F: dict, fiel
     return np.nan_to_num(np.hstack([features(D, marker, a, ""), features(D, colour, b, ""), pos]), nan=0.0)
 
 
-# ---------------------------------------------------------------------------------- the new type step (run(new=True))
-# Tested offline on ROMK 2026-11-06 (figures/v2/explore/typemodel2.py, colouron.py, platecal.py): intensity within the
-# regularized outline, calibrated per plate against that plate's holes without a cell (its glow floor; the standard
-# per-plate normalization of image-based profiling), shrinkage LDA on your hole type labels, most likely type; a type
-# needs one of its colours "on" (q < 0.05 against the plate's no-cell holes), else "no colour". Texture, shape and
-# context did not improve the plate-held-out accuracy on your labels and are left out.
-NEW_STATS = ("cell_med", "cell_p90", "cell_frac3")
-NEW_MIN_REF = 20          # fewer no-cell holes on a plate: that plate is referenced to all plates' no-cell holes
-
-
-def new_names(F: dict, nm: dict) -> list:
-    return [f"{nm.get(c, c)} {s}" for c in F["colour"] + F["marker"] for s in NEW_STATS + ("own",)]
-
-
-def _new_cols(F: dict) -> list:
-    return [col for c in F["colour"] + F["marker"] for col in [f"g_{c}_{s}" for s in NEW_STATS] + [f"own_{c}"]]
-
-
-def _reference(H: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, dict]:
-    """(no-cell reference mask, plate per row, {plate: n reference holes or 'all plates'})."""
-    st = H.status_cell.astype(str)
-    ref = (st != "cell") & (st != "hole detection failed")
-    pl = H.plate_id.astype(str).to_numpy()
-    info = {}
-    for g in np.unique(pl):
-        n = int((ref.to_numpy() & (pl == g)).sum())
-        info[g] = n if n >= NEW_MIN_REF else f"{n} (too few: all plates)"
-    return ref.to_numpy(), pl, info
-
-
-def _per_plate(v: np.ndarray, ref: np.ndarray, pl: np.ndarray) -> np.ndarray:
-    """(v - median) / MAD of the plate's no-cell holes."""
-    out = np.full(len(v), np.nan)
-    allr = v[ref & np.isfinite(v)]
-    for g in np.unique(pl):
-        r = v[ref & (pl == g) & np.isfinite(v)]
-        if len(r) < NEW_MIN_REF:
-            r = allr
-        if not len(r):
-            continue
-        med = np.median(r); mad = np.median(np.abs(r - med)) * 1.4826
-        out[pl == g] = (v[pl == g] - med) / (mad if mad > 0 else 1.0)
-    return out
-
-
-def design_new(H: pd.DataFrame, F: dict) -> np.ndarray:
-    """The new type step's features for every row of H (holes of the new first pass)."""
-    ref, pl, _ = _reference(H)
-    cols = _new_cols(F)
-    X = np.column_stack([_per_plate(H[c].to_numpy(float) if c in H else np.full(len(H), np.nan), ref, pl)
-                         for c in cols])
-    return np.nan_to_num(np.clip(X, -30, 30), nan=0.0)
+# ------------------------------------------------------------------------------ "no colour" (the new first pass)
+# The type step itself is unchanged (design_rows, hole + surrounding labels). The new first pass adds one rule: a type
+# needs one of its colours "on". Colour on = the bleed-corrected own signal above the plate's own noise: the signal is
+# background-subtracted per image, so a cell without that colour scatters around 0, and the plate's negative values give
+# its noise (mirrored). No empty or rejected holes are needed, so it holds for any plate setup. Tested offline
+# 2026-11-06 on ROMK and both PNC runs (figures/v2/explore/allcells_cal.py): per-plate normalization of the type
+# features and a reference of no-cell holes were tried and dropped (they broke PNC, whose no-cell holes are halos).
+MIN_NEG = 10              # fewer negative values on a plate: that plate takes the noise of all plates
 
 
 def colour_on(H: pd.DataFrame, F: dict, alpha: float = 0.05) -> dict:
-    """{colour channel: bool per hole}: the bleed-corrected own signal above the plate's no-cell holes, q < alpha
-    (one-sided, Benjamini-Hochberg over the holes with a cell)."""
+    """{colour channel: bool per hole}: own signal above the plate's mirrored noise, q < alpha (one-sided,
+    Benjamini-Hochberg over the holes with a cell)."""
     from scipy.stats import norm
-    ref, pl, _ = _reference(H)
     cell = (H.status_cell.astype(str) == "cell").to_numpy()
+    pl = H.plate_id.astype(str).to_numpy()
     out = {}
     for c in F["colour"]:
-        z = _per_plate(H[f"own_{c}"].to_numpy(float), ref, pl)
+        v = H[f"own_{c}"].to_numpy(float) if f"own_{c}" in H else np.full(len(H), np.nan)
+        allneg = v[cell & np.isfinite(v) & (v < 0)]
+        sd_all = np.median(-allneg) / 0.6745 if len(allneg) else np.nan
+        z = np.full(len(H), np.nan)
+        for g in np.unique(pl):
+            m = pl == g
+            neg = v[m & cell & np.isfinite(v) & (v < 0)]
+            sd = np.median(-neg) / 0.6745 if len(neg) >= MIN_NEG else sd_all
+            z[m] = v[m] / sd if sd and np.isfinite(sd) and sd > 0 else np.nan
         p = np.where(cell & np.isfinite(z), norm.sf(z), np.nan)
         n = int(np.isfinite(p).sum()); q = np.full(len(p), np.nan)
         if n:
@@ -184,6 +148,28 @@ def colour_on(H: pd.DataFrame, F: dict, alpha: float = 0.05) -> dict:
             q[o] = np.minimum.accumulate(r[::-1])[::-1].clip(0, 1)
         out[c] = np.nan_to_num(q, nan=1.0) < alpha
     return out
+
+
+def apply_no_colour(H: pd.DataFrame, F: dict, info: dict) -> None:
+    """A typed hole keeps its type only when one of the type's colours is on; else "no colour". A type's colours: those
+    on in most of the holes you labelled with that type; a type you gave to colourless cells keeps every call."""
+    on = colour_on(H, F)
+    hand = H.hand_label.astype(str).to_numpy() if "hand_label" in H else np.full(len(H), "")
+    lab = H.predicted_label.astype(str).to_numpy()
+    tc = {}
+    for t in info.get("classes", []):
+        rows = hand == str(t)
+        tc[t] = [c for c in F["colour"] if rows.any() and np.mean(on[c][rows]) > 0.5]
+    off = np.zeros(len(H), bool)
+    for t, cs in tc.items():
+        if cs:
+            off |= (lab == str(t)) & ~np.any([on[c] for c in cs], axis=0)
+    H.loc[off, "predicted_label"] = NO_COLOUR
+    for c in F["colour"]:
+        H[f"on_{c}"] = on[c]
+    nm = F.get("nm", {})
+    info["type_colours"] = {str(t): [nm.get(c, c) for c in cs] for t, cs in tc.items()}
+    info["no_colour_rule"] = int(off.sum())
 
 
 def _norm(s) -> str:
@@ -451,15 +437,7 @@ def fit(R: pd.DataFrame, H: pd.DataFrame, O: pd.DataFrame, F: dict, cal: dict, r
     Oo = O.assign(obj=O.channel.astype(str) + ":" + O.label.astype(str), image_id=O.image_id.astype(str),
                   plate_id=O.plate_id.astype(str))
     fk = L[L.kind != "hole"].merge(Oo, on=["plate_id", "image_id", "obj"], how="inner", suffixes=("", "_o"))
-    if new:                     # the new type step: hole labels only (surrounding cells have no outline measures)
-        fk = fk.iloc[:0]
-        Xall = design_new(H, F)
-        idx = pd.Series(np.arange(len(H)), index=pd.MultiIndex.from_arrays([H.plate_id.astype(str), H.well_id.astype(str)]))
-        idx = idx[~idx.index.duplicated()]
-        X = Xall[idx.reindex(list(zip(hk.plate_id, hk.well_id))).to_numpy(int)] if len(hk) else np.zeros((0, Xall.shape[1]))
-        _, _, info["calibration_reference"] = _reference(H)
-    else:
-        X = np.vstack([design_rows(hk, H, O, F, False), design_rows(fk, H, O, F, True)])
+    X = np.vstack([design_rows(hk, H, O, F, False), design_rows(fk, H, O, F, True)])
     y = np.concatenate([hk.your_label.to_numpy(), fk.your_label.to_numpy()])
     kind = np.array(["hole"] * len(hk) + ["surrounding"] * len(fk))
     keys = pd.concat([hk[["plate_id", "well_id"]].assign(image_id="", obj=""),
@@ -501,12 +479,6 @@ def fit(R: pd.DataFrame, H: pd.DataFrame, O: pd.DataFrame, F: dict, cal: dict, r
     # keeps it (your label wins over the first pass)
     no_hand = (H.hand_label.astype(str) == NOT_CELL).to_numpy()
     soma = soma_sized(H, info["soma"]["cut_um2"]).to_numpy()
-    if new:
-        _predict_new(H, F, lda, y, X, info, ~no_hand & soma)
-        H.loc[H.valid.to_numpy() & ~no_hand & ~soma, "predicted_label"] = NO_COLOUR
-        H.loc[no_hand & (H.status_cell.astype(str) != "hole detection failed"), "predicted_label"] = NOT_CELL
-        _exclude(H, O)
-        return info
     for D, sel, field in [(H, H.valid & ~no_hand & soma, False), (O, O.learn, True)]:
         Xd = design_rows(D, H, O, F, field)
         good = sel.to_numpy() & np.isfinite(Xd).all(1)
@@ -528,44 +500,11 @@ def fit(R: pd.DataFrame, H: pd.DataFrame, O: pd.DataFrame, F: dict, cal: dict, r
             D.loc[good, "predicted_label"] = np.where(p.max(1) >= SURE, lab, two)
     # a cell whose outline is only a speck or a fragment: no type
     H.loc[H.valid.to_numpy() & ~no_hand & ~soma, "predicted_label"] = NO_COLOUR
+    if new:                                  # the new first pass: a type needs one of its colours on
+        apply_no_colour(H, F, info)
     H.loc[no_hand & (H.status_cell.astype(str) != "hole detection failed"), "predicted_label"] = NOT_CELL
     _exclude(H, O)
     return info
-
-
-def _predict_new(H: pd.DataFrame, F: dict, lda, y: np.ndarray, X: np.ndarray, info: dict, sel: np.ndarray) -> None:
-    """The new type step on every hole with a cell: the most likely type (no probability cut), kept only when one of
-    the type's colours is on; else "no colour". A type's colours: those on in most of the holes you gave that type."""
-    Xd = design_new(H, F)
-    good = H.valid.to_numpy() & sel
-    on = colour_on(H, F)
-    lab_on = {}
-    for t in np.unique(y):
-        # your labelled holes of type t: which colours are on in most of them
-        rows = [i for i, (p, w) in enumerate(zip(H.plate_id.astype(str), H.well_id.astype(str)))
-                if H.hand_label.iat[i] == t]
-        lab_on[t] = [c for c in F["colour"] if len(rows) and np.mean(on[c][rows]) > 0.5]
-    info["type_colours"] = {t: [F.get("nm", {}).get(c, c) for c in v] for t, v in lab_on.items()}
-    info["colour_on"] = {c: int((on[c] & good).sum()) for c in F["colour"]}
-    if not good.any():
-        return
-    p = lda.predict_proba(Xd[good])
-    cls = np.asarray(lda.classes_)
-    lab = cls[p.argmax(1)].astype(object)
-    gi = np.nonzero(good)[0]
-    for k, t in enumerate(lab):
-        cs = lab_on.get(t, [])
-        if cs and not any(on[c][gi[k]] for c in cs):   # a type you only gave to colourless cells keeps its call
-            lab[k] = NO_COLOUR
-    for j, c in enumerate(cls):
-        col = "p_" + re.sub(r"\W+", "_", str(c)).strip("_")
-        if col not in H:
-            H[col] = np.nan
-        H.loc[good, col] = p[:, j]
-    for c in F["colour"]:
-        H[f"on_{c}"] = on[c]
-    H.loc[good, "predicted_p"] = p.max(1)
-    H.loc[good, "predicted_label"] = lab
 
 
 def _exclude(H: pd.DataFrame, O: pd.DataFrame) -> None:

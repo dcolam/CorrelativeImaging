@@ -249,8 +249,8 @@ def run(results, out=None, workers: int = 8, log=print, new: bool = False) -> Pa
     if linfo["used"]:
         log(f"   label model from {linfo['n']} labels {linfo['labels']}: leave-one-out accuracy {linfo['acc']:.2f}")
         if new:
-            log(f"   type step: per-plate calibration against each plate's no-cell holes {linfo.get('calibration_reference')}; "
-                f"type colours from your labels {linfo.get('type_colours')}; holes with a colour on {linfo.get('colour_on')}")
+            log(f"   no colour: a type needs one of its colours on (own signal above the plate's noise); type colours from "
+                f"your labels {linfo.get('type_colours')}; {linfo.get('no_colour_rule', 0)} typed holes set to no colour")
     else:
         log(f"   no label model: {linfo['why']}")
     cinfo = None
