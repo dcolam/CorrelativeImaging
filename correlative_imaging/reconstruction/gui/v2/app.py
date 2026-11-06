@@ -20,7 +20,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
-from qtpy.QtCore import QObject, Qt, QUrl, Signal
+from qtpy.QtCore import QObject, QSettings, Qt, QUrl, Signal
 from qtpy.QtGui import QColor, QDesktopServices
 from qtpy.QtWidgets import (QCheckBox, QColorDialog, QComboBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QInputDialog,
                             QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QStackedWidget,
@@ -90,6 +90,15 @@ class FirstPassTab(QWidget):
         self.run_b.setProperty("accent", True)
         self.run_b.clicked.connect(lambda: app.run())
         row.addWidget(self.run_b)
+        # the new first pass (unified/run.py, new=True): own output folder, so the old results stay to compare
+        self.new_cb = QCheckBox("new")
+        self.new_cb.setToolTip("New first pass: your answers are final for the particle / hole you answered, a hole "
+                               "with a plug answer has no cell, clumps are learnt from the whole-image particles and "
+                               "your clump answers ('clump (no call)'). Writes <results>/unified_new (starts from a copy "
+                               "of your answers and labels in unified/); untick to go back to unified/.")
+        self.new_cb.setChecked(QSettings("CorrelativeImaging", "reconstruct_v2").value("new_first_pass", False, bool))
+        self.new_cb.toggled.connect(app.set_new)
+        row.addWidget(self.new_cb)
         self.last = QLabel("")
         self.last.setProperty("role", "hint")
         row.addWidget(self.last, 1)
@@ -816,10 +825,29 @@ class AppV2:
                                 "it after a pipeline run ('Then detect particles…'), or the classic ci reconstruct.")
             return
         self.results = results
-        self.out = local(out) if out else results / "unified"
+        self._out_given = out is not None
+        self.out = local(out) if out else results / self._default_out()
         self.out.mkdir(parents=True, exist_ok=True)
+        if self.new_first_pass():
+            from ...unified.run import prepare_new
+            prepare_new(results, self.out, log=lambda m: self.say(m.strip()))
         self.where.setText(f"Detect results: {results}\noutput: {self.out}")
         self.refresh()
+
+    def new_first_pass(self) -> bool:
+        return bool(getattr(self.first_tab, "new_cb", None) and self.first_tab.new_cb.isChecked())
+
+    def _default_out(self) -> str:
+        from ...unified.run import NEW_OUT
+        return NEW_OUT if self.new_first_pass() else "unified"
+
+    def set_new(self, on: bool):
+        """The 'new' tick: remembered, and switches between unified/ and unified_new/ (unless --out was given)."""
+        QSettings("CorrelativeImaging", "reconstruct_v2").setValue("new_first_pass", bool(on))
+        if self.results is not None and not getattr(self, "_out_given", False) and not self.busy:
+            self._S = self._V = None
+            self.open(self.results)
+            self.say(f"output: {self.out}" + (" (new first pass)" if on else ""))
 
     def summary(self) -> dict | None:
         f = self.out / "summary.json" if self.out else None
@@ -940,9 +968,10 @@ class AppV2:
         self.say("running … (the first run reads every hole image once: 15-40 min; later runs 2-6 min; with new "
                  "'cell or not' answers the holes are measured again)")
         res, out, workers, log = str(self.results), str(self.out), self.workers, self.bus.log.emit
+        new = self.new_first_pass()
 
         def job():
-            return run_unified(res, out, workers, log=log)
+            return run_unified(res, out, workers, log=log, new=new)
         w = create_worker(job)
 
         def done(*_):

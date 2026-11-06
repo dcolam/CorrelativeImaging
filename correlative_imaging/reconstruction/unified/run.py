@@ -19,7 +19,39 @@ from . import call as call_mod
 from . import data, experiment, field, labels, measure, qc, questions, report
 
 
-def _interventions(out: Path, e: dict, W: pd.DataFrame):
+NEW_OUT = "unified_new"          # the new first pass writes here by default, next to the old unified/
+
+
+def prepare_new(results: Path, out: Path, log=print) -> None:
+    """The new first pass starts from your inputs of the old one: copies (never moves) experiment.json and
+    interventions/ from <results>/unified when <out> has none yet. Answers given later go to <out> only."""
+    import shutil
+    old = Path(results) / "unified"
+    out = Path(out)
+    if old.resolve() == out.resolve() or not old.exists():
+        return
+    out.mkdir(parents=True, exist_ok=True)
+    if (old / "experiment.json").exists() and not (out / "experiment.json").exists():
+        shutil.copy2(old / "experiment.json", out / "experiment.json")
+        log(f"   copied experiment.json from {old}")
+    if (old / "interventions").exists() and not (out / "interventions" / "answers.csv").exists():
+        shutil.copytree(old / "interventions", out / "interventions", dirs_exist_ok=True)
+        log(f"   copied your answers and labels (interventions/) from {old}")
+
+
+def _plug_holes(A, reviewed: dict, chan_marks: dict) -> dict:
+    """New first pass: a hole with a particle you answered "plug / halo" has no cell, unless you said there is a
+    cell in it (a particle answered cell / several cells, a channel answer, clump "one cell" or a type label)."""
+    P = A.get("particle")
+    plug = {(r["plate_id"], r["well_id"]) for r in P.to_dict("records") if r["answer"] == "plug / halo"}
+    cell = {(r["plate_id"], r["well_id"]) for r in P.to_dict("records") if r["answer"] in ("cell", "several cells")}
+    cell |= set(chan_marks) | {k for k, v in reviewed.items() if v == "yes"}
+    cell |= {(r["plate_id"], r["well_id"]) for r in A.get("clump").to_dict("records")
+             if r["answer"] in ("one cell", "several cells")}
+    return {k: "no" for k in plug - cell}
+
+
+def _interventions(out: Path, e: dict, W: pd.DataFrame, new: bool = False):
     """Apply what the user filled in interventions/*.csv."""
     d = out / "interventions"
     applied = []
@@ -48,6 +80,11 @@ def _interventions(out: Path, e: dict, W: pd.DataFrame):
     for k, v in questions.clumps(A).items():
         if v in ("not a cell", "no cell"):
             reviewed[k] = "no"
+    if new:
+        pl = _plug_holes(A, reviewed, chan_marks)
+        reviewed.update(pl)
+        if pl:
+            applied.append(f"{len(pl)} holes with a particle you called plug / halo: no cell")
     n = len(A.df)
     if n:
         applied.append(f"{n} answers to the first pass's questions")
@@ -91,15 +128,20 @@ def _display_top(F: dict, H: pd.DataFrame, colour: list, marker: list) -> dict:
     return dict(field=field_, hole=hole, field_max=field_max)
 
 
-def run(results, out=None, workers: int = 8, log=print) -> Path:
+def run(results, out=None, workers: int = 8, log=print, new: bool = False) -> Path:
+    """new=True: the new first pass (your answers are final for the particle / hole you answered, a plug answer
+    empties its hole, clumps learnt from the whole-image particles and your clump answers). Writes to <results>/unified_new unless --out says otherwise; starts from the old run's inputs."""
     t0 = time.time()
     results = Path(results)
     if not ((results / "run.json").exists() and (results / "particles.parquet").exists()):
         raise SystemExit(f"{results} holds no Detect results (run.json, particles.parquet). Run Detect first: tick "
                          "'Then detect particles for Cell reconstruction' in ci gui, or Detect in ci reconstruct, and "
                          "point --results at its reconstruction_<run tag> folder.")
-    out = Path(out) if out else results / "unified"
+    out = Path(out) if out else results / (NEW_OUT if new else "unified")
     out.mkdir(parents=True, exist_ok=True)
+    if new:
+        log("new first pass: your answers are final, plugs empty their hole, clumps from the whole-image particles")
+        prepare_new(results, out, log)
     rj = json.loads((results / "run.json").read_text(encoding="utf-8"))
     path_map = (rj.get("config") or {}).get("path_map") or {}
     src = rj["source"]
@@ -110,7 +152,7 @@ def run(results, out=None, workers: int = 8, log=print) -> Path:
     T = data.load_run(root, src["run_tag"], out / "cache", log)
     P = data.signals(T, colour, marker)
     W = qc.check(T, P, e)
-    applied, reviewed, chan_marks, R, A = _interventions(out, e, W)
+    applied, reviewed, chan_marks, R, A = _interventions(out, e, W, new)
     if applied:
         W = qc.check(T, P, e)
     log(f"   checks: " + ", ".join(f"{k} {v}" for k, v in W.status.value_counts().items()))
@@ -133,23 +175,24 @@ def run(results, out=None, workers: int = 8, log=print) -> Path:
     log("3/5 hole cells")
     from . import shape
     prefix_of = measure.cache_prefix(T["images"][["plate_id", "plate_dir"]].drop_duplicates(), results / "cache")
-    FP, sinfo = shape.particle_model(results, prefix_of, colour, W, reviewed, questions.particles(A))
+    FP, sinfo = shape.particle_model(results, prefix_of, colour, W, reviewed, questions.particles(A), new=new)
     keepP = [c for c in ["plate_id", "well_id", "ch", "level", "lab", "p_cell", "hsnr", "in_um2", "cy", "cx", "share"]
              if c in FP]
     FP[keepP].assign(level=FP.level.astype(str)).to_parquet(out / "hole_particles.parquet", index=False)
     drop = {}
-    if sinfo["used"]:
+    if sinfo["used"] or (new and FP.p_cell.notna().any()):
         d = FP[FP.p_cell < 0.2]                     # only clearly not a cell; uncertain particles may still seed
         for r in d.itertuples():
             drop.setdefault((r.plate_id, r.well_id), {}).setdefault(r.ch, {}).setdefault(r.level, []).append(int(r.lab))
         log(f"   particles: cell or not by shape, learnt from {sinfo['no_cell']} no-cell and {sinfo['cell']} cell "
-            f"examples (AUC {sinfo['auc']:.2f}); {sinfo['dropped']} particles are not seeds")
+            f"examples (AUC {sinfo.get('auc', float('nan')):.2f}); {sinfo['dropped']} particles are not seeds"
+            + (" (your particle answers are final)" if new else ""))
     else:
         log("   particles: no 'no cell' examples, every particle can seed (see report)")
     # "s5": each colour grows from its own seeds again (the all-seeds growth of "s4", 2026-11-04, climbed into
     # neighbours' glow; reverted); "s3": + a marker seeds the outline where no colour does (2026-11-03); "s2": seeds
     # dropped per channel; a new tag re-measures instead of reusing old results
-    tag = f"s5-{sinfo.get('no_cell', 0)}-{sinfo.get('cell', 0)}-{sinfo.get('dropped', 0)}"
+    tag = f"s5-{sinfo.get('no_cell', 0)}-{sinfo.get('cell', 0)}-{sinfo.get('dropped', 0)}" + ("-new" if new else "")
     mf, mt = out / "measurements.parquet", out / "measurements.tag"
     if mf.exists() and mt.exists() and mt.read_text(encoding="utf-8") == tag:
         M = pd.read_parquet(mf)
@@ -173,6 +216,24 @@ def run(results, out=None, workers: int = 8, log=print) -> Path:
         log(f"   label model from {linfo['n']} labels {linfo['labels']}: leave-one-out accuracy {linfo['acc']:.2f}")
     else:
         log(f"   no label model: {linfo['why']}")
+    cinfo = None
+    if new:                                               # clumps: whole-image particles + your clump answers
+        from . import clumps
+        isc, cinfo = clumps.rule(FP, H, clumps.answers(A, R))
+        ans = clumps.answers(A)
+        typed = ~H.predicted_label.astype(str).isin(["no cell", labels.NOT_CELL, "hole detection failed", labels.EXCLUDE, ""])
+        own = H.hand_label.fillna("").astype(str) != "" if "hand_label" in H else pd.Series(False, index=H.index)
+        hit = isc & typed & ~own                          # a type label you gave yourself stays
+        why = ["clump (your answer)" if ans.get(k) == 1 else "clump (whole image)" for k in zip(H.plate_id, H.well_id)]
+        H.loc[isc, "flags"] = [(f + "; " if isinstance(f, str) and f else "") + w
+                               for f, w in zip(H.loc[isc, "flags"], np.array(why)[isc.to_numpy()])]
+        H.loc[hit, "predicted_label"] = "clump (no call)"
+        cinfo["no_call"] = int(hit.sum())
+        log(f"   clumps: {cinfo['n_clump']} holes ({cinfo['no_call']} would have had a type: now 'clump (no call)')"
+            + (f"; rule learnt from {cinfo['several']} several / {cinfo['one']} one-cell answers, "
+               f"{cinfo['validation']} balanced accuracy {cinfo['balanced_accuracy']:.2f}" if cinfo["used"]
+               else f"; no rule: {cinfo.get('why', '')}"))
+        applied.append(f"clumps: {cinfo['n_clump']} holes, {cinfo['no_call']} no call")
     from . import hue
     hue.add(H, F["O"], F, e)                              # each cell's colour as seen on screen
     keep = ["plate_id", "well_id", "image_id", "cls", "pattern", "confidence", "flags", "status_cell", "cell_um2", "cells_in_body",
@@ -197,6 +258,7 @@ def run(results, out=None, workers: int = 8, log=print) -> Path:
                    shape={k: v for k, v in cal['_shape'].items() if k != 'feats'}, cuts=F["cuts"], how=F["how"],
                    bleed={f"{F['nm'][a]}->{F['nm'][b]}": float(F["K"][i, j]) for i, a in enumerate(colour)
                           for j, b in enumerate(colour) if i != j})
+    summary["new"] = dict(on=bool(new), clumps=cinfo)
     summary["labels"] = {k: v for k, v in linfo.items() if k not in ("X", "y", "confusion", "model_table")}
     if linfo.get("model_table") is not None:
         linfo["model_table"].to_csv(out / "label_model.csv", index=False)       # the label model as a picture

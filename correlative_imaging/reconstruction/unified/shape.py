@@ -79,9 +79,11 @@ def model(F: pd.DataFrame, H: pd.DataFrame, W: pd.DataFrame, own_cut: dict, revi
 
 
 def particle_model(results: Path, prefix_of: dict, colour: list, W: pd.DataFrame, reviewed: dict,
-                   answers: dict | None = None) -> tuple:
+                   answers: dict | None = None, new: bool = False) -> tuple:
     """Every hole particle with an out-of-fold P(cell) (by plate). (particles, info); P is NaN when there are too few
-    examples."""
+    examples. new=True (the new first pass): a particle you answered keeps your answer as its P (1 cell, 0 not).
+    Brightness stays out also then: the unanswered "cell" examples are picked by brightness, so the model would relearn
+    that cut and drop dim real cells (tried and taken out 2026-11-06)."""
     F = particles(results, prefix_of, colour)
     feats = [c for c in F.columns if c.startswith("f_") and c not in BRIGHT and F[c].notna().any()]
     empty = set(zip(W.plate_id[W.user_empty], W.well_id[W.user_empty]))
@@ -105,6 +107,9 @@ def particle_model(results: Path, prefix_of: dict, colour: list, W: pd.DataFrame
     info = dict(no_cell=int((y == 0).sum()), cell=int((y == 1).sum()), used=False, feats=feats,
                 answered=int(np.isfinite(a).sum()))
     if info["no_cell"] < 15 or info["cell"] < 15:
+        if new and np.isfinite(a).any():
+            F["p_cell"] = a
+            info.update(dropped=int((a == 0).sum()))
         return F, info
     from sklearn.ensemble import HistGradientBoostingClassifier
     from sklearn.metrics import roc_auc_score
@@ -123,8 +128,10 @@ def particle_model(results: Path, prefix_of: dict, colour: list, W: pd.DataFrame
         m.fit(X[tr], y[tr].astype(int))
         te = (F.plate_id == pl).to_numpy()
         p[te] = m.predict_proba(X[te])[:, 1]
-    F["p_cell"] = p
     k = lab & np.isfinite(p)
-    info.update(used=True, auc=float(roc_auc_score(y[k], p[k])) if len(np.unique(y[k])) == 2 else np.nan,
-                dropped=int((F.p_cell < 0.2).sum()))
+    info.update(used=True, auc=float(roc_auc_score(y[k], p[k])) if len(np.unique(y[k])) == 2 else np.nan)
+    if new:                                 # your answer on a particle wins over the model's guess for it
+        p = np.where(np.isfinite(a), a, p)
+    F["p_cell"] = p
+    info["dropped"] = int((F.p_cell < 0.2).sum())
     return F, info

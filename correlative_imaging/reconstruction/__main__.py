@@ -11,7 +11,7 @@
   python -m correlative_imaging.reconstruction freeze-test-wells --out <dir> --labels new.db [--from old.db]
   python -m correlative_imaging.reconstruction compare --out <dir> --labels ci_labels.db --models preview a.joblib ...
         [--plate-map map.csv --check Condition=Empty]
-  python -m correlative_imaging.reconstruction unified --results <dir> [--out <dir>]   (unified/README.md)
+  python -m correlative_imaging.reconstruction unified --results <dir> [--out <dir>] [--new]   (unified/README.md)
   python -m correlative_imaging.reconstruction status --out <dir> [--labels ci_labels.db] [--model <file.joblib>]
   python -m correlative_imaging.reconstruction commands --out <dir> [--write]     (how to make the results again)
   python -m correlative_imaging.reconstruction methods --out <dir>                (a methods text from the results)
@@ -64,6 +64,9 @@ def main(argv=None):
     u.add_argument("--results", required=True, help="the Detect results folder")
     u.add_argument("--out", help="output folder (default <results>/unified)")
     u.add_argument("--workers", type=int, default=8)
+    u.add_argument("--new", action="store_true",
+                   help="the new first pass: your answers are final, plugs empty their hole, clumps from the "
+                        "whole-image particles; writes <results>/unified_new (copies your inputs from unified/)")
     s_ = sub.add_parser("status", help="where a results folder stands in the workflow (the GUI's strip, as text)")
     s_.add_argument("--out", required=True); s_.add_argument("--labels"); s_.add_argument("--model")
     cm = sub.add_parser("commands", help="the command lines that make these results again (provenance.py)")
@@ -79,7 +82,7 @@ def main(argv=None):
 
     if a.cmd == "unified":
         from .unified.run import run as run_unified
-        run_unified(a.results, a.out, a.workers)
+        run_unified(a.results, a.out, a.workers, new=a.new)
         return
     if a.cmd == "gui":
         if a.v2:
