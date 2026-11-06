@@ -51,6 +51,31 @@ def _plug_holes(A, reviewed: dict, chan_marks: dict) -> dict:
     return {k: "no" for k in plug - cell}
 
 
+def _verdicts(A, R: pd.DataFrame, reviewed: dict, chan_marks: dict, W: pd.DataFrame) -> dict:
+    """New first pass: your verdict per hole for the learnt hole gate, {(plate, well): 1 cell / 0 no cell}.
+    cell: a type label, a channel answer positive / negative, a particle answered cell, clump "one cell".
+    no cell: a "no cell" label or answer, a plug hole (_plug_holes), every hole of a well you called empty.
+    No verdict: "several cells" (a clump is no call), skip / unsure / exclude, the surrounding-cell size answers;
+    a hole with both is left out."""
+    from .labels import EXCLUDE_WORDS
+    yes, no = set(), set()
+    if len(R):
+        lab = R.your_label.fillna("").astype(str)
+        T = R[(R.kind == "hole") & (lab != "") & ~R.not_cell & ~lab.str.lower().str.startswith(("skip", "unsure"))
+              & ~lab.str.lower().isin(EXCLUDE_WORDS)]
+        yes |= set(zip(T.plate_id.astype(str), T.well_id.astype(str)))
+    yes |= set(chan_marks)
+    yes |= {(r["plate_id"], r["well_id"]) for r in A.get("particle").to_dict("records") if r["answer"] == "cell"}
+    yes |= {(r["plate_id"], r["well_id"]) for r in A.get("clump").to_dict("records") if r["answer"] == "one cell"}
+    no |= {k for k, v in reviewed.items() if v == "no"}
+    no |= set(zip(W.plate_id[W.user_empty], W.well_id[W.user_empty]))
+    sev = {(r["plate_id"], r["well_id"]) for q in ("clump", "particle") for r in A.get(q).to_dict("records")
+           if r["answer"] == "several cells"}
+    out = {k: 1 for k in yes - no - sev}
+    out.update({k: 0 for k in no - yes - sev})
+    return out
+
+
 def _interventions(out: Path, e: dict, W: pd.DataFrame, new: bool = False):
     """Apply what the user filled in interventions/*.csv."""
     d = out / "interventions"
@@ -129,8 +154,11 @@ def _display_top(F: dict, H: pd.DataFrame, colour: list, marker: list) -> dict:
 
 
 def run(results, out=None, workers: int = 8, log=print, new: bool = False) -> Path:
-    """new=True: the new first pass (your answers are final for the particle / hole you answered, a plug answer
-    empties its hole, clumps learnt from the whole-image particles and your clump answers). Writes to <results>/unified_new unless --out says otherwise; starts from the old run's inputs."""
+    """new=True: the new first pass. Your answers are final for the particle / hole you answered; a plug answer empties
+    its hole; the regularized cell outline (measure.regular_outline); the hole gate learnt from your verdicts and the
+    Empty wells (call.learnt_gate) instead of the shape gate; clumps learnt from the whole-image particles and your
+    clump answers, flagged only (the type is kept). Writes to <results>/unified_new unless --out says otherwise;
+    starts from the old run's inputs."""
     t0 = time.time()
     results = Path(results)
     if not ((results / "run.json").exists() and (results / "particles.parquet").exists()):
@@ -140,7 +168,7 @@ def run(results, out=None, workers: int = 8, log=print, new: bool = False) -> Pa
     out = Path(out) if out else results / (NEW_OUT if new else "unified")
     out.mkdir(parents=True, exist_ok=True)
     if new:
-        log("new first pass: your answers are final, plugs empty their hole, clumps from the whole-image particles")
+        log("new first pass: your answers are final, plugs empty their hole, regularized outline, learnt hole gate, clumps flagged")
         prepare_new(results, out, log)
     rj = json.loads((results / "run.json").read_text(encoding="utf-8"))
     path_map = (rj.get("config") or {}).get("path_map") or {}
@@ -192,17 +220,23 @@ def run(results, out=None, workers: int = 8, log=print, new: bool = False) -> Pa
     # "s5": each colour grows from its own seeds again (the all-seeds growth of "s4", 2026-11-04, climbed into
     # neighbours' glow; reverted); "s3": + a marker seeds the outline where no colour does (2026-11-03); "s2": seeds
     # dropped per channel; a new tag re-measures instead of reusing old results
-    tag = f"s5-{sinfo.get('no_cell', 0)}-{sinfo.get('cell', 0)}-{sinfo.get('dropped', 0)}" + ("-new" if new else "")
+    tag = f"s5-{sinfo.get('no_cell', 0)}-{sinfo.get('cell', 0)}-{sinfo.get('dropped', 0)}" + ("-new2" if new else "")
     mf, mt = out / "measurements.parquet", out / "measurements.tag"
     if mf.exists() and mt.exists() and mt.read_text(encoding="utf-8") == tag:
         M = pd.read_parquet(mf)
     else:
-        M = measure.measure(T, W, e, results, out, path_map, workers, log, drop)
+        M = measure.measure(T, W, e, results, out, path_map, workers, log, drop, new=new)
         M.to_parquet(mf, index=False)
         mt.write_text(encoding="utf-8", data=tag)
     log(f"   measured {int((M.error == '').sum())} holes, errors {int((M.error != '').sum())}")
     log("4/5 calls")
-    H, cal = call_mod.call(M, W, F, size, nb, e, results, prefix_of, reviewed, FP, chan_marks, questions.clumps(A))
+    gate_y = _verdicts(A, R, reviewed, chan_marks, W) if new else None
+    H, cal = call_mod.call(M, W, F, size, nb, e, results, prefix_of, reviewed, FP, chan_marks, questions.clumps(A),
+                           gate_y=gate_y)
+    if new:
+        g = cal["_shape"].get("learnt_gate", {})
+        log(f"   hole gate learnt from {g.get('cell', 0)} cell / {g.get('no_cell', 0)} no-cell verdicts: "
+            + (f"AUC {g['auc']:.2f}, cut {g['cut']:.2f}; {g['gate']}" if g.get("used") else f"not used ({g.get('why', '')}), shape gate kept"))
     if reviewed:
         k = [reviewed.get((p, w)) == "no" for p, w in zip(H.plate_id, H.well_id)]
         H.loc[k, "cls"] = "no cell (hand label)"
@@ -227,20 +261,20 @@ def run(results, out=None, workers: int = 8, log=print, new: bool = False) -> Pa
         why = ["clump (your answer)" if ans.get(k) == 1 else "clump (whole image)" for k in zip(H.plate_id, H.well_id)]
         H.loc[isc, "flags"] = [(f + "; " if isinstance(f, str) and f else "") + w
                                for f, w in zip(H.loc[isc, "flags"], np.array(why)[isc.to_numpy()])]
-        H.loc[hit, "predicted_label"] = "clump (no call)"
-        cinfo["no_call"] = int(hit.sum())
-        log(f"   clumps: {cinfo['n_clump']} holes ({cinfo['no_call']} would have had a type: now 'clump (no call)')"
+        # flagged only: the type stays (sensitivity first); a figure can leave the flagged holes out
+        cinfo["typed"] = int(hit.sum())
+        log(f"   clumps: {cinfo['n_clump']} holes flagged ({cinfo['typed']} of them typed; the type is kept)"
             + (f"; rule learnt from {cinfo['several']} several / {cinfo['one']} one-cell answers, "
                f"{cinfo['validation']} balanced accuracy {cinfo['balanced_accuracy']:.2f}" if cinfo["used"]
                else f"; no rule: {cinfo.get('why', '')}"))
-        applied.append(f"clumps: {cinfo['n_clump']} holes, {cinfo['no_call']} no call")
+        applied.append(f"clumps: {cinfo['n_clump']} holes flagged")
     from . import hue
     hue.add(H, F["O"], F, e)                              # each cell's colour as seen on screen
     keep = ["plate_id", "well_id", "image_id", "cls", "pattern", "confidence", "flags", "status_cell", "cell_um2", "cells_in_body",
             "cell_in_hole", "hole_um2"] + [f"{p}_{c}" for c in colour + marker for p in ("own", "snr")] + \
         [f"q_{c}" for c in colour] + [f"pos_{c}" for c in colour + marker if f"pos_{c}" in H] + \
         [f"shape_only_{c}" for c in colour if f"shape_only_{c}" in H] + \
-        ["nb_nearest_um", "nb_nearest_cls", "p_shape", "part_p", "part_um2", "predicted_label", "predicted_p", "hand_label"] + [f"part_{c}" for c in colour] + \
+        ["nb_nearest_um", "nb_nearest_cls", "p_shape", "part_p", "part_um2", "predicted_label", "predicted_p", "hand_label", "cell_um2_old"] + [f"part_{c}" for c in colour] + \
         [f"x_{c}" for c in colour] + ["hue", "purity", "strength", "mix"] + \
         [c for c in H.columns if c.startswith("p_") and c != "p_shape"]
     H[[k for k in keep if k in H]].to_csv(out / "hole_calls.csv", index=False)

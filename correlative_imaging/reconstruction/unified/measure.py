@@ -22,6 +22,13 @@ and noise the residual was computed with (run database). Nothing is written next
   glow       per channel: the part of the cell near (< 3 um) a bright neighbour of that channel vs far (> 6 um) from it;
              near > 3 and far < half of near = the signal comes from the neighbour's glow
   neighbour  nearest object of each channel outside the hole: distance and brightness
+
+New first pass (run(new=True), job["new"]): the cell outline is the regularized one (regular_outline; the grown one
+above is kept as cell_old in wells/*.npz for comparison) and every hole gets the measures of hole_features (g_*), which
+the learnt hole gate (call.py) uses. From the exploration of 2026-11-06 (figures/v2/explore/outline.py, features.py).
+Remaining hand-set constants of the regularized outline (px units of the run): smoothing 2 px (cut) and 3 px (seeds),
+inner hole = hole eroded by 2 px, seeds >= 3 px apart (at most 6), neighbour barriers >= 4 um2 and < 50 % in the hole,
+background markers > 4 px outside the hole, a region kept when >= 50 % of it lies in the hole.
 """
 from __future__ import annotations
 
@@ -65,6 +72,110 @@ def clean(region, seeds, r):
     lab, _ = nd_label(opened)
     keep = np.unique(lab[seeds & opened]); keep = keep[keep > 0]
     return np.isin(lab, keep)
+
+
+def regular_outline(img: np.ndarray, hole: np.ndarray, neigh: np.ndarray, bg: np.ndarray, noise: np.ndarray,
+                    px: float) -> np.ndarray:
+    """The regularized outline: the channels' signal-to-noise summed (clipped at 0, so a channel without signal adds
+    only its noise), smoothed and log-scaled; seeds at the local maxima inside the hole on a coarser smoothing (a broad
+    cell wins over a speck; several seeds, so a dim cell made of patches is one cell); a watershed from the seeds, the
+    neighbours (objects mostly outside the hole, >= 4 um2, holding no seed) and the background; in each seed's basin the
+    cell is cut at Otsu's threshold of that basin's own pixels; the regions mostly inside the hole, merged, filled,
+    opened; the part with the most area in the hole. It does not decide whether a cell is there (an empty hole's glow
+    gets an outline too): the hole gate does."""
+    from scipy import ndimage as ndi
+    from skimage import measure as skm, morphology as skmo, segmentation
+    from skimage.feature import peak_local_max
+    from skimage.filters import threshold_otsu
+    snr = np.maximum((img - bg[:, None, None]) / np.maximum(noise[:, None, None], 1e-6), 0)
+    snr = np.nan_to_num(snr)
+    s0 = snr.sum(axis=0)
+    s = np.log1p(ndi.gaussian_filter(s0, 2.0))
+    sb = ndi.gaussian_filter(s0, 3.0)
+    inner = skmo.binary_erosion(hole, skmo.disk(2))
+    if not inner.any():
+        inner = hole
+    pk = peak_local_max(np.where(inner, sb, 0), min_distance=3, num_peaks=6, exclude_border=False)
+    pk = [tuple(p) for p in pk if inner[tuple(p)]]
+    if not pk:
+        pk = [np.unravel_index(np.argmax(np.where(inner, sb, -np.inf)), s.shape)]
+    markers = np.zeros(s.shape, int)
+    nl = skm.label(neigh)
+    for rp in skm.regionprops(nl):
+        m = nl == rp.label
+        if rp.area * px * px >= 4 and (m & hole).sum() < 0.5 * m.sum() and not any(m[p] for p in pk):
+            markers[m] = 2
+    far = ~skmo.binary_dilation(hole, skmo.disk(4))
+    if far.any():
+        markers[far & (s < np.median(s[far])) & (markers == 0)] = 3
+    for i, (y, x) in enumerate(pk):
+        markers[max(y - 1, 0):y + 2, max(x - 1, 0):x + 2] = 10 + i
+    ws = segmentation.watershed(-s, markers)
+    cell = np.zeros(hole.shape, bool)
+    for i in range(len(pk)):
+        basin = ws == 10 + i
+        if not basin.any():
+            continue
+        ctx = skmo.binary_dilation(basin, skmo.disk(4))
+        try:
+            cut = threshold_otsu(s[ctx])
+        except ValueError:
+            continue
+        r = basin & (s >= cut)
+        if r.sum() and (r & hole).sum() >= 0.5 * r.sum():
+            cell |= r
+    cell = skmo.binary_opening(ndi.binary_fill_holes(cell), skmo.disk(1))
+    lab = skm.label(cell)
+    if lab.max() > 1:
+        best = max(range(1, lab.max() + 1), key=lambda k: ((lab == k) & hole).sum())
+        cell = lab == best
+    return cell
+
+
+def hole_features(img: np.ndarray, hole: np.ndarray, cell: np.ndarray, neigh: np.ndarray, bg: np.ndarray,
+                  noise: np.ndarray, px: float, names: list) -> dict:
+    """Measures of a hole for the learnt hole gate (g_*): outline shape, per channel the signal and texture in the
+    hole, the outline and the ring around the hole, and the context (neighbour / barrier specks)."""
+    from scipy import ndimage as ndi
+    from skimage import measure as skm, morphology as skmo
+    snr = (img - bg[:, None, None]) / np.maximum(noise[:, None, None], 1e-6)
+    f = {}
+    ring = skmo.binary_dilation(hole, skmo.disk(max(1, int(round(4 / px))))) & ~hole
+    a_um = px * px
+    f["cell_frac_hole"] = (cell & hole).sum() / max(hole.sum(), 1)
+    if cell.any():
+        lab = skm.label(cell)
+        f["cell_parts"] = lab.max()
+        rp = max(skm.regionprops(lab), key=lambda r: r.area)
+        f["solidity"], f["eccentricity"] = rp.solidity, rp.eccentricity
+        f["jagged"] = skm.perimeter(cell) ** 2 / (4 * np.pi * cell.sum())
+    else:
+        f.update(cell_parts=0, solidity=np.nan, eccentricity=np.nan, jagged=np.nan)
+    nb = neigh & ~cell
+    f["neigh_frac_crop"] = nb.mean()
+    f["neigh_frac_ring"] = (nb & ring).sum() / max(ring.sum(), 1)
+    lab = skm.label(nb)
+    sizes = np.bincount(lab.ravel())[1:] * a_um if lab.max() else np.array([])
+    f["neigh_n_specks"] = int((sizes < 5).sum())
+    f["neigh_n_big"] = int((sizes >= 20).sum())
+    if cell.any():
+        f["outline_touch_neigh"] = (skmo.binary_dilation(cell) & nb).sum() / max(skm.perimeter(cell), 1)
+        dist = ndi.distance_transform_edt(~nb) * px if nb.any() else np.full(cell.shape, 99.0)
+        f["neigh_min_dist_um"] = float(dist[cell].min())
+    else:
+        f["outline_touch_neigh"] = f["neigh_min_dist_um"] = np.nan
+    rest = ~hole & ~neigh
+    for k, c in enumerate(names):
+        x = snr[k]
+        f[f"{c}_hole_med"], f[f"{c}_hole_p90"] = np.median(x[hole]), np.percentile(x[hole], 90)
+        f[f"{c}_ring_med"] = np.median(x[ring]) if ring.any() else np.nan
+        f[f"{c}_cell_med"] = np.median(x[cell]) if cell.any() else np.nan
+        f[f"{c}_cell_p90"] = np.percentile(x[cell], 90) if cell.any() else np.nan
+        lg = ndi.gaussian_laplace(x, 1.0)
+        f[f"{c}_tex_hole"] = np.std(lg[hole])
+        f[f"{c}_tex_ring"] = np.std(lg[ring]) if ring.any() else np.nan
+        f[f"{c}_bg_noise_crop"] = np.median(np.abs(x[rest])) if rest.any() else np.nan
+    return {f"g_{k}": float(v) for k, v in f.items()}
 
 
 def cache_prefix(plates: pd.DataFrame, cache_dir: Path) -> dict:
@@ -171,6 +282,17 @@ def _one(job):
             st = grow(img[idx[c]], sd & allowed, bg[c] + K_NOISE * noise[c], allowed, UPHILL * noise[c])
             regions[c] = clean(st, sd & allowed, 2) if st.any() else st
         cell = np.any(list(regions.values()), axis=0) if regions else np.zeros(hole.shape, bool)
+        ys, xs = np.nonzero(hole); pad = um(8)
+        sl = (slice(max(ys.min() - pad, 0), ys.max() + pad), slice(max(xs.min() - pad, 0), xs.max() + pad))
+        bga, nsa = np.array([bg[c] for c in names], float), np.array([noise[c] for c in names], float)
+        cell_old = cell
+        if job.get("new"):                         # the regularized outline, on the hole crop (as in the exploration)
+            k_ = [idx[c] for c in allc]
+            reg = regular_outline(img[k_][:, sl[0], sl[1]], hole[sl], neigh[sl], bga[k_], nsa[k_], px)
+            cell = np.zeros(hole.shape, bool)
+            cell[sl] = reg
+            out.update(hole_features(img[:, sl[0], sl[1]], hole[sl], cell[sl], neigh[sl], bga, nsa, px, names))
+            out["cell_um2_old"] = cell_old.sum() * px ** 2
         out.update(hole_um2=hole.sum() * px ** 2, cell_um2=cell.sum() * px ** 2,
                    cell_in_hole=float((cell & hole).sum() / max(cell.sum(), 1)),
                    hole_cover=float((cell & hole).sum() / max(hole.sum(), 1)), sat_px_cell=int((cell & sat).sum()),
@@ -210,10 +332,9 @@ def _one(job):
                 out[f"nb_dist_um_{c}"], out[f"nb_snr_{c}"] = np.nan, np.nan
             if c in colour:
                 out[f"region_um2_{c}"] = regions[c].sum() * px ** 2
-        ys, xs = np.nonzero(hole); pad = um(8)
-        sl = (slice(max(ys.min() - pad, 0), ys.max() + pad), slice(max(xs.min() - pad, 0), xs.max() + pad))
         np.savez_compressed(Path(job["wells_dir"]) / f"{job['plate_id']}_{job['well_id']}.npz",
                             img=img[:, sl[0], sl[1]], cell=cell[sl], hole=hole[sl], neigh=neigh[sl],
+                            cell_old=cell_old[sl],
                             names=np.array(names), bg=np.array([bg[c] for c in names]),
                             noise=np.array([noise[c] for c in names]), px=px)
     except Exception as ex:                                                  # noqa: BLE001
@@ -222,7 +343,7 @@ def _one(job):
 
 
 def measure(T: dict, W: pd.DataFrame, e: dict, results: Path, out: Path, path_map: dict, workers: int = 8,
-            log=print, drop: dict | None = None) -> pd.DataFrame:
+            log=print, drop: dict | None = None, new: bool = False) -> pd.DataFrame:
     from .data import local_path
     from .experiment import colour_channels, marker_channels
     wells_dir = Path(out) / "wells"
@@ -243,7 +364,7 @@ def measure(T: dict, W: pd.DataFrame, e: dict, results: Path, out: Path, path_ma
         jobs.append(dict(plate_id=r.plate_id, well_id=r.well_id, image_id=r.image_id, well_raw=r.well_raw,
                          diag=str(local_path(r.diag, path_map)), cache=str(cf), bg=bgd.get((r.plate_id, r.image_id), {}),
                          colour=colour_channels(e), marker=marker_channels(e), wells_dir=str(wells_dir),
-                         drop=(drop or {}).get((r.plate_id, r.well_id), {})))
+                         drop=(drop or {}).get((r.plate_id, r.well_id), {}), new=new))
     log(f"  measuring {len(jobs)} holes")
     rows = []
     workers = max(1, min(int(workers), 61 if os.name == "nt" else 256, len(jobs) or 1))   # Windows allows at most 61

@@ -82,8 +82,50 @@ def particle_signal(FP: pd.DataFrame, results, prefix_of: dict, colour: list) ->
 
 
 
+GATE_TOOL = ["p_shape", "part_p", "part_um2", "cells_in_body", "cell_in_hole"]
+
+
+def learnt_gate(H: pd.DataFrame, y_: dict) -> tuple:
+    """Cell or not per hole, learnt from your verdicts (y_: {(plate, well): 1 cell / 0 no cell}, the Empty wells' holes
+    included as no cell): gradient-boosted trees on the hole measures (g_*, measure.hole_features) and the tool's
+    scores, each plate predicted by a model that did not see it; the cut is where those predictions separate your
+    verdicts best (balanced accuracy). (P per hole, info); needs >= 15 of each."""
+    from sklearn.ensemble import HistGradientBoostingClassifier
+    from sklearn.metrics import roc_auc_score
+    feats = [c for c in H.columns if c.startswith("g_")] + [c for c in GATE_TOOL if c in H]
+    y = np.array([y_.get(k, -1) for k in zip(H.plate_id, H.well_id)])
+    lab = y >= 0
+    info = dict(used=False, cell=int((y == 1).sum()), no_cell=int((y == 0).sum()), n_feats=len(feats))
+    p = pd.Series(np.nan, index=H.index)
+    if not any(c.startswith("g_") for c in feats) or info["cell"] < 15 or info["no_cell"] < 15:
+        info["why"] = "needs the hole measures of the new first pass and >= 15 cell and 15 no-cell verdicts"
+        return p, info
+    X = H[feats].to_numpy(float)
+    pr = np.full(len(H), np.nan)
+    pl = H.plate_id.to_numpy()
+    for g in np.unique(pl):
+        tr, te = lab & (pl != g), pl == g
+        if len(np.unique(y[tr])) < 2:
+            continue
+        leaf = int(np.clip(min((y[tr] == 0).sum(), (y[tr] == 1).sum()) // 5, 3, 20))
+        m = HistGradientBoostingClassifier(max_iter=300, learning_rate=0.05, max_leaf_nodes=15, min_samples_leaf=leaf,
+                                           l2_regularization=1.0, class_weight="balanced", random_state=0)
+        pr[te] = m.fit(X[tr], y[tr]).predict_proba(X[te])[:, 1]
+    k = lab & np.isfinite(pr)
+    if len(np.unique(y[k])) < 2:
+        info["why"] = "verdicts from one plate only"
+        return p, info
+    cand = np.unique(pr[k])
+    bal = [(np.mean(pr[k & (y == 1)] >= t) + np.mean(pr[k & (y == 0)] < t)) / 2 for t in cand]
+    cut = float(cand[int(np.argmax(bal))])
+    p[:] = np.nan_to_num(pr, nan=1.0)            # a plate without a model keeps its holes
+    info.update(used=True, cut=cut, balanced_accuracy=float(max(bal)), auc=float(roc_auc_score(y[k], pr[k])),
+                validation="leave-one-plate-out")
+    return p, info
+
+
 def call(M: pd.DataFrame, W: pd.DataFrame, F: dict, cell_size: dict, nb: pd.DataFrame, e: dict, results=None,
-         prefix_of=None, reviewed=None, FP=None, chan_marks=None, clump_marks=None) -> tuple:
+         prefix_of=None, reviewed=None, FP=None, chan_marks=None, clump_marks=None, gate_y=None) -> tuple:
     colour, marker, nm, K = F["colour"], F["marker"], F["nm"], F["K"]
     H = M[M.error == ""].copy()
     H = H.merge(W[["plate_id", "image_id", "status"]], on=["plate_id", "image_id"], how="left")
@@ -215,7 +257,21 @@ def call(M: pd.DataFrame, W: pd.DataFrame, F: dict, cell_size: dict, nb: pd.Data
     # one path for every experiment, with or without empty wells: the shape model (learnt from every "no cell" example:
     # hand labels, answers, and the holes of empty wells where there are any) decides whether the hole holds a cell.
     # Empty wells only add examples; their brightness gates nothing (one stray cell in an "empty" well would set the bar)
-    if shape_info.get("used"):
+    gate = learnt_gate(H, gate_y) if gate_y is not None else None
+    if gate is not None and gate[1].get("used"):
+        # new first pass: the hole gate learnt from your verdicts (+ the Empty wells' holes), replaces the shape gate
+        H["p_gate"], ginfo = gate
+        yours = np.array([gate_y.get(k) == 1 or reviewed.get(k) not in (None, "no") for k in zip(H.plate_id, H.well_id)])
+        off = H.valid & (H.p_gate < ginfo["cut"]) & ~yours
+        H.loc[off, "valid"] = False
+        H.loc[off, "status_cell"] = "no cell (gate)"
+        for c in colour:
+            H[f"pos_{c}"] = H[f"pos_{c}"] & H.valid
+        ginfo["gate"] = f"{int(off.sum())} holes are no cell by the learnt gate (p < {ginfo['cut']:.2f})"
+        shape_info["learnt_gate"] = ginfo
+    elif shape_info.get("used"):
+        if gate is not None:
+            shape_info["learnt_gate"] = gate[1]
         yours = np.array([reviewed.get(k) not in (None, "no") for k in zip(H.plate_id, H.well_id)])
         off = H.valid & (H.p_shape < 0.5) & ~yours            # a hole you called a cell stays a cell
         H.loc[off, "valid"] = False
